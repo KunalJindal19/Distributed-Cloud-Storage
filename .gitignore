@@ -1,0 +1,30 @@
+# --- Project specification documents (kept locally, never versioned) ---
+Implementation_Spec_v2.pdf
+Project_Flow_Architecture_v2.pdf
+Mini_Distributed_Cloud_Object_Store.pdf
+
+# --- Build output ---
+target/
+*.class
+*.log
+dependency-reduced-pom.xml
+
+# --- Demo / scratch data created by demo.sh and the CLI ---
+.demo/
+/data/
+
+# --- Local environment overrides ---
+.env
+
+# --- IDE / editor ---
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+.factorypath
+
+# --- OS ---
+.DS_Store
+Thumbs.db

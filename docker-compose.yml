@@ -1,0 +1,148 @@
+# Mini Distributed Cloud Object Store
+#
+#   1 controller  - the only service published to the host (port 8000)
+#   4 workers     - reachable only inside the private network, one persistent volume each
+#   1 client      - a ready-to-use CLI container (curl, jq and the oscli command)
+#
+# Start:  docker compose up --build -d        (or: make up)
+# Stop:   docker compose down                 (data is kept; add -v to wipe it)
+
+name: objectstore
+
+# Everything the four workers have in common. No shared "image:" name on purpose: the services
+# are built in parallel, and four builds exporting to one tag race with each other. Each service
+# gets its own tag instead (objectstore-worker1 ...); the layers are identical and built once.
+x-worker: &worker
+  build:
+    context: .
+    target: worker
+  depends_on:
+    controller:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health > /dev/null || exit 1"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+    start_period: 20s
+  stop_grace_period: 10s
+  networks: [objectstore-net]
+
+x-worker-environment: &worker-environment
+  CONTROLLER_URL: http://controller:8000
+  DATA_DIR: /data
+  HEARTBEAT_INTERVAL: "2"
+  CHUNK_SIZE: "1048576"
+  LOG_LEVEL: INFO
+
+services:
+  controller:
+    build:
+      context: .
+      target: controller
+    image: objectstore-controller:1.0.0
+    container_name: controller
+    hostname: controller
+    ports:
+      - "${CONTROLLER_PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+      DB_PATH: /data/meta.db
+      CHUNK_SIZE: "1048576"        # 1 MB chunks
+      REPLICATION_FACTOR: "2"      # two copies of every chunk
+      HEARTBEAT_TIMEOUT: "6"       # a worker is DEAD after 6 s of silence
+      HEALTH_INTERVAL: "1"
+      STARTUP_GRACE: "20"          # after a controller start, wait this long before declaring anyone dead
+      REPAIR_INTERVAL: "10"
+      SCRUB_INTERVAL: "15"
+      WORKER_TIMEOUT_S: "10"
+      REPAIR_CONCURRENCY: "4"
+      LOG_LEVEL: INFO
+    volumes:
+      - controller_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health > /dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    stop_grace_period: 10s
+    networks: [objectstore-net]
+
+  # The four workers are identical; only the id, the port and the volume differ.
+  # container_name is fixed so that "docker stop worker2" / "docker start worker2" work as written.
+  worker1:
+    <<: *worker
+    container_name: worker1
+    hostname: worker1
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker1
+      PORT: "8001"
+    volumes:
+      - worker1_data:/data
+
+  worker2:
+    <<: *worker
+    container_name: worker2
+    hostname: worker2
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker2
+      PORT: "8002"
+    volumes:
+      - worker2_data:/data
+
+  worker3:
+    <<: *worker
+    container_name: worker3
+    hostname: worker3
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker3
+      PORT: "8003"
+    volumes:
+      - worker3_data:/data
+
+  worker4:
+    <<: *worker
+    container_name: worker4
+    hostname: worker4
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker4
+      PORT: "8004"
+    volumes:
+      - worker4_data:/data
+
+  # A client inside the network. It only knows the controller's address.
+  # The project directory is mounted at /work so files can be uploaded from / downloaded to it.
+  client:
+    build:
+      context: .
+      target: client
+    image: objectstore-client:1.0.0
+    container_name: client
+    hostname: client
+    init: true
+    depends_on:
+      controller:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://controller:8000
+    volumes:
+      - .:/work
+    working_dir: /work
+    stop_grace_period: 2s
+    networks: [objectstore-net]
+
+volumes:
+  controller_data: {}
+  worker1_data: {}
+  worker2_data: {}
+  worker3_data: {}
+  worker4_data: {}
+
+networks:
+  objectstore-net:
+    driver: bridge
