@@ -1,0 +1,14 @@
+# Keep the build context small and the images free of anything that is not source code.
+.git
+.gitignore
+.idea
+.vscode
+.demo
+**/target
+*.pdf
+*.md
+Makefile
+demo.sh
+oscli
+docker-compose.yml
+samples

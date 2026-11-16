@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# oscli - command-line client for the object store.
+#
+#   ./oscli upload report.pdf --meta owner=alice
+#   ./oscli download <object-id> out.pdf
+#   ./oscli where <object-id>
+#   ./oscli help
+#
+# How it runs (OSCLI_MODE):
+#   docker  inside the "client" container started by docker compose. Needs nothing but Docker.
+#           The project directory is mounted there at /work, so file arguments must be paths
+#           inside the project directory (relative paths work as you would expect).
+#   local   with the JVM on this machine: java -jar client/target/client.jar (after "mvn package").
+#           Any path works. The controller address is $BASE_URL (default http://localhost:8000).
+#   auto    (default) docker if the client container is running, otherwise local.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+JAR="$ROOT/client/target/client.jar"
+MODE="${OSCLI_MODE:-auto}"
+
+client_container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' client 2>/dev/null || true)" = "true" ]
+}
+
+run_in_container() {
+    local here
+    here="$(pwd -P)"
+    case "$here/" in
+        "$ROOT"/*) ;;
+        *)
+            echo "oscli: in docker mode, run this from inside $ROOT (that directory is what the client" >&2
+            echo "       container can see), or use OSCLI_MODE=local." >&2
+            exit 64
+            ;;
+    esac
+    # Run as the calling user so downloaded files belong to them, not to the container's user.
+    exec docker exec -i --user "$(id -u):$(id -g)" --workdir "/work${here#"$ROOT"}" client oscli "$@"
+}
+
+run_locally() {
+    if [ ! -f "$JAR" ]; then
+        echo "oscli: $JAR not found. Build it with 'mvn -q -pl client -am package -DskipTests'," >&2
+        echo "       or start the stack with 'make up' to use the client container instead." >&2
+        exit 64
+    fi
+    exec java -jar "$JAR" "$@"
+}
+
+case "$MODE" in
+    docker) run_in_container "$@" ;;
+    local) run_locally "$@" ;;
+    auto)
+        if command -v docker > /dev/null 2>&1 && client_container_running; then
+            run_in_container "$@"
+        else
+            run_locally "$@"
+        fi
+        ;;
+    *)
+        echo "oscli: OSCLI_MODE must be auto, docker or local (got '$MODE')" >&2
+        exit 64
+        ;;
+esac
