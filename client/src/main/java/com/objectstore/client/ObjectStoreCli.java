@@ -49,8 +49,10 @@ public final class ObjectStoreCli {
     private static final String USAGE = """
             Usage: oscli [--base URL] <command> [arguments]
 
-              upload PATH [--name NAME] [--type MIME] [--meta key=value ...]
-                                        store a file; prints the new object's description
+              upload PATH [--name NAME] [--type MIME] [--key KEY] [--meta key=value ...]
+                                        store a file; prints the new object's description.
+                                        Every upload carries an Idempotency-Key (random unless
+                                        --key is given), so a retried upload never duplicates.
               download ID OUT_PATH      fetch an object and verify it against its checksum
               meta ID                   show system + custom metadata and chunk locations
               patch ID [key=value ...] [--remove key ...]
@@ -61,6 +63,8 @@ public final class ObjectStoreCli {
               status                    cluster overview (workers, replication health, repairs)
 
             The controller address comes from --base, else $BASE_URL, else http://localhost:8000.
+            Connection errors and 503 answers (safe mode, too few workers, ...) are retried with
+            back-off for up to $OSCLI_RETRY_SECONDS seconds (default 60).
             """;
 
     private final PrintStream out;
@@ -72,16 +76,26 @@ public final class ObjectStoreCli {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
+    private static final double[] BACKOFF_SECONDS = {0.5, 1, 2, 4, 5};
+
     private String baseUrl;
+    private final double retrySeconds;
 
     ObjectStoreCli(PrintStream out, PrintStream err, String environmentBaseUrl) {
+        this(out, err, environmentBaseUrl, 60);
+    }
+
+    ObjectStoreCli(PrintStream out, PrintStream err, String environmentBaseUrl, double retrySeconds) {
         this.out = out;
         this.err = err;
         this.environmentBaseUrl = environmentBaseUrl;
+        this.retrySeconds = retrySeconds;
     }
 
     public static void main(String[] args) {
-        int exitCode = new ObjectStoreCli(System.out, System.err, System.getenv("BASE_URL")).run(args);
+        String retry = System.getenv("OSCLI_RETRY_SECONDS");
+        double retrySeconds = retry == null || retry.isBlank() ? 60 : Double.parseDouble(retry.trim());
+        int exitCode = new ObjectStoreCli(System.out, System.err, System.getenv("BASE_URL"), retrySeconds).run(args);
         System.out.flush();
         System.exit(exitCode);
     }
@@ -126,8 +140,8 @@ public final class ObjectStoreCli {
     // ---- commands -----------------------------------------------------------------------------
 
     private int upload(List<String> args) throws IOException, InterruptedException {
-        Arguments arguments = Arguments.parse(args, Set.of("--name", "--type"), Set.of("--meta"));
-        Path file = Path.of(onlyPositional(arguments, "upload PATH [--name NAME] [--type MIME] [--meta key=value ...]"));
+        Arguments arguments = Arguments.parse(args, Set.of("--name", "--type", "--key"), Set.of("--meta"));
+        Path file = Path.of(onlyPositional(arguments, "upload PATH [--name NAME] [--type MIME] [--key KEY] [--meta key=value ...]"));
         if (!Files.isRegularFile(file) || !Files.isReadable(file)) {
             throw new CliException(EXIT_USAGE, "'" + file + "' is not a readable file");
         }
@@ -151,15 +165,26 @@ public final class ObjectStoreCli {
                 .append("Content-Type: ").append(type).append("\r\n\r\n");
         String tail = "\r\n--" + boundary + "--\r\n";
 
-        // The file is streamed from disk; it is never loaded into memory as a whole.
-        HttpRequest request = HttpRequest.newBuilder(uri("/api/v1/objects"))
-                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-                .POST(BodyPublishers.concat(
-                        BodyPublishers.ofByteArray(head.toString().getBytes(StandardCharsets.UTF_8)),
-                        BodyPublishers.ofFile(file),
-                        BodyPublishers.ofByteArray(tail.getBytes(StandardCharsets.UTF_8))))
-                .build();
-        out.println(pretty(expect(http.send(request, BodyHandlers.ofString()), 201)));
+        String key = arguments.option("--key") != null ? arguments.option("--key") : UUID.randomUUID().toString();
+        // The file is streamed from disk; it is never loaded into memory as a whole. The same
+        // Idempotency-Key is sent on every attempt, so a retry after a lost response returns
+        // the object the first attempt created.
+        HttpResponse<String> response = withRetries("upload", () -> http.send(
+                HttpRequest.newBuilder(uri("/api/v1/objects"))
+                        .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                        .header("Idempotency-Key", key)
+                        .POST(BodyPublishers.concat(
+                                BodyPublishers.ofByteArray(head.toString().getBytes(StandardCharsets.UTF_8)),
+                                BodyPublishers.ofFile(file),
+                                BodyPublishers.ofByteArray(tail.getBytes(StandardCharsets.UTF_8))))
+                        .build(),
+                BodyHandlers.ofString()));
+        if (response.statusCode() == 200 && response.headers().firstValue("Idempotent-Replay").isPresent()) {
+            err.println("note: an earlier attempt already stored this upload (Idempotency-Key " + key + ")");
+            out.println(pretty(response.body()));
+            return EXIT_OK;
+        }
+        out.println(pretty(expect(response, 201)));
         return EXIT_OK;
     }
 
@@ -172,28 +197,44 @@ public final class ObjectStoreCli {
         Path target = Path.of(arguments.positionals().get(1)).toAbsolutePath();
         Path partial = target.resolveSibling(target.getFileName() + ".part");
 
-        HttpResponse<InputStream> response = http.send(
-                HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).GET().build(), BodyHandlers.ofInputStream());
-        if (response.statusCode() != 200) {
-            try (InputStream body = response.body()) {
-                throw new CliException(EXIT_HTTP_ERROR, pretty(new String(body.readAllBytes(), StandardCharsets.UTF_8)));
+        long deadline = System.nanoTime() + (long) (retrySeconds * 1e9);
+        int attempt = 0;
+        HttpResponse<InputStream> response;
+        MessageDigest digest;
+        long bytes;
+        while (true) {
+            response = withRetries("download", () -> http.send(
+                    HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).GET().build(), BodyHandlers.ofInputStream()));
+            if (response.statusCode() != 200) {
+                try (InputStream body = response.body()) {
+                    throw new CliException(EXIT_HTTP_ERROR, pretty(new String(body.readAllBytes(), StandardCharsets.UTF_8)));
+                }
             }
-        }
-
-        MessageDigest digest = sha256();
-        long bytes = 0;
-        try (InputStream in = response.body(); OutputStream file = Files.newOutputStream(partial)) {
-            byte[] buffer = new byte[64 * 1024];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                digest.update(buffer, 0, read);
-                file.write(buffer, 0, read);
-                bytes += read;
+            digest = sha256();
+            bytes = 0;
+            long expected = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+            try (InputStream in = response.body(); OutputStream file = Files.newOutputStream(partial)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    digest.update(buffer, 0, read);
+                    file.write(buffer, 0, read);
+                    bytes += read;
+                }
+                if (expected >= 0 && bytes != expected) {
+                    throw new IOException("received " + bytes + " of " + expected + " bytes");
+                }
+                break;
+            } catch (IOException e) {
+                // A transfer cut off mid-stream (a chunk became unreadable, the controller died, ...).
+                Files.deleteIfExists(partial);
+                if (System.nanoTime() > deadline) {
+                    throw new CliException(EXIT_CONNECTION, errorJson("download_incomplete",
+                            "the transfer broke off after " + bytes + " bytes: " + describe(e)));
+                }
+                err.println("note: download incomplete (" + describe(e) + "); retrying");
+                pause(attempt++);
             }
-        } catch (IOException e) {
-            Files.deleteIfExists(partial);
-            throw new CliException(EXIT_CONNECTION, errorJson("download_incomplete",
-                    "the transfer broke off after " + bytes + " bytes: " + describe(e)));
         }
         Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING);
 
@@ -232,11 +273,14 @@ public final class ObjectStoreCli {
         for (String key : arguments.options("--remove")) {
             changes.putNull(key);
         }
-        HttpRequest request = HttpRequest.newBuilder(uri("/api/v1/objects/" + positionals.get(0) + "/metadata"))
-                .header("Content-Type", "application/json")
-                .method("PATCH", BodyPublishers.ofString(json.writeValueAsString(changes)))
-                .build();
-        out.println(pretty(expect(http.send(request, BodyHandlers.ofString()), 200)));
+        String body = json.writeValueAsString(changes);
+        HttpResponse<String> response = withRetries("patch", () -> http.send(
+                HttpRequest.newBuilder(uri("/api/v1/objects/" + positionals.get(0) + "/metadata"))
+                        .header("Content-Type", "application/json")
+                        .method("PATCH", BodyPublishers.ofString(body))
+                        .build(),
+                BodyHandlers.ofString()));
+        out.println(pretty(expect(response, 200)));
         return EXIT_OK;
     }
 
@@ -258,9 +302,25 @@ public final class ObjectStoreCli {
 
     private int delete(List<String> args) throws IOException, InterruptedException {
         String objectId = onlyPositional(Arguments.parse(args, Set.of(), Set.of()), "delete ID");
-        HttpRequest request = HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).DELETE().build();
-        expect(http.send(request, BodyHandlers.ofString()), 204);
+        boolean[] retried = {false};
+        HttpResponse<String> response = withRetries("delete", () -> {
+            try {
+                return http.send(HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).DELETE().build(),
+                        BodyHandlers.ofString());
+            } catch (IOException e) {
+                retried[0] = true;
+                throw e;
+            }
+        });
         ObjectNode result = json.createObjectNode();
+        if (response.statusCode() == 404 && retried[0]) {
+            // An earlier attempt reached the controller but its answer was lost.
+            result.put("deleted", objectId);
+            result.put("note", "already deleted by an earlier attempt");
+            out.println(pretty(result));
+            return EXIT_OK;
+        }
+        expect(response, 204);
         result.put("deleted", objectId);
         out.println(pretty(result));
         return EXIT_OK;
@@ -333,7 +393,50 @@ public final class ObjectStoreCli {
     }
 
     private HttpResponse<String> get(String path) throws IOException, InterruptedException {
-        return http.send(HttpRequest.newBuilder(uri(path)).GET().build(), BodyHandlers.ofString());
+        return withRetries("request", () -> http.send(HttpRequest.newBuilder(uri(path)).GET().build(), BodyHandlers.ofString()));
+    }
+
+    @FunctionalInterface
+    private interface Call<T> {
+        HttpResponse<T> send() throws IOException, InterruptedException;
+    }
+
+    /**
+     * Sends a request, retrying connection errors and 503 answers (safe mode, too few workers,
+     * a chunk temporarily without a readable copy, ...) with back-off 0.5, 1, 2, 4, 5, 5, ... s
+     * for up to {@code retrySeconds}. Any other answer is returned as it is.
+     */
+    private <T> HttpResponse<T> withRetries(String what, Call<T> call) throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + (long) (retrySeconds * 1e9);
+        int attempt = 0;
+        while (true) {
+            HttpResponse<T> response;
+            try {
+                response = call.send();
+            } catch (IOException e) {
+                if (System.nanoTime() > deadline) {
+                    throw e;
+                }
+                err.println("note: " + what + " failed (" + describe(e) + "); retrying");
+                pause(attempt++);
+                continue;
+            }
+            if (response.statusCode() != 503 || System.nanoTime() > deadline) {
+                return response;
+            }
+            String retryAfter = response.headers().firstValue("Retry-After").orElse("");
+            err.println("note: " + what + " answered 503" + (retryAfter.isEmpty() ? "" : " (Retry-After " + retryAfter + ")")
+                    + "; retrying");
+            if (response.body() instanceof InputStream stream) {
+                stream.close();
+            }
+            pause(attempt++);
+        }
+    }
+
+    private static void pause(int attempt) throws InterruptedException {
+        double seconds = BACKOFF_SECONDS[Math.min(attempt, BACKOFF_SECONDS.length - 1)];
+        Thread.sleep((long) (seconds * 1000));
     }
 
     /** Returns the body if the status is the expected one; otherwise fails with the server's error. */

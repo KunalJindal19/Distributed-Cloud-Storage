@@ -84,6 +84,7 @@ public class ObjectRepository {
                             .params(idempotencyKey, object.objectId(), object.size(), createdAt)
                             .update();
                 }
+                jdbc.sql("DELETE FROM upload_intents WHERE object_id = ?").param(object.objectId()).update();
             });
         } catch (DuplicateKeyException e) {
             throw new IdempotencyConflictException(idempotencyKey);
@@ -170,8 +171,36 @@ public class ObjectRepository {
         });
     }
 
-    /** Deletes the object; metadata, chunks and idempotency keys go with it (ON DELETE CASCADE). */
-    public boolean delete(String objectId) {
-        return jdbc.sql("DELETE FROM objects WHERE object_id = ?").param(objectId).update() > 0;
+    /**
+     * Deletes the object (metadata, chunks and idempotency keys go with it, ON DELETE CASCADE) and
+     * leaves a tombstone, in one transaction.
+     */
+    public boolean delete(String objectId, Instant now) {
+        return Boolean.TRUE.equals(tx.execute(status -> {
+            if (jdbc.sql("DELETE FROM objects WHERE object_id = ?").param(objectId).update() == 0) {
+                return false;
+            }
+            jdbc.sql("INSERT OR IGNORE INTO deleted_objects (object_id, deleted_at) VALUES (?, ?)")
+                    .params(objectId, now.toEpochMilli())
+                    .update();
+            return true;
+        }));
+    }
+
+    /** Records that an upload is about to write chunks for {@code objectId}. Removed when it commits. */
+    public void recordUploadIntent(String objectId, Instant now) {
+        jdbc.sql("INSERT INTO upload_intents (object_id, started_at) VALUES (?, ?)")
+                .params(objectId, now.toEpochMilli())
+                .update();
+    }
+
+    /**
+     * Object ids whose chunks are certainly garbage: uploads that never committed, and deleted
+     * objects. Read at start-up, when no upload is in progress.
+     */
+    public List<String> garbageObjectIds() {
+        return jdbc.sql("SELECT object_id FROM upload_intents UNION SELECT object_id FROM deleted_objects")
+                .query(String.class)
+                .list();
     }
 }

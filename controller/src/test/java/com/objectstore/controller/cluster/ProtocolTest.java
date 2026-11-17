@@ -186,6 +186,27 @@ class ProtocolTest {
     }
 
     @Test
+    void chunksOfFailedUploadsAndDeletedObjectsAreCollectedEvenInBulk() throws InterruptedException {
+        TestSupport delayed = new TestSupport(TestSupport.properties(5, 10, 0.1));
+        Thread.sleep(150);
+        String failedUpload = "aaaaaaaa-7d0e-4c1b-9a54-1f2e3d4c5b6a";
+        String unknown = "bbbbbbbb-7d0e-4c1b-9a54-1f2e3d4c5b6a";
+        delayed.cluster.locked(() -> delayed.cluster.addGarbage(failedUpload));
+        String[] reported = java.util.stream.Stream.concat(
+                        java.util.stream.IntStream.range(0, 10).mapToObj(i -> "%s-%05d".formatted(failedUpload, i)),
+                        java.util.stream.IntStream.range(0, 20).mapToObj(i -> "%s-%05d".formatted(unknown, i)))
+                .toArray(String[]::new);
+
+        delayed.join("worker1", reported);
+
+        // All 10 known-garbage chunks are deleted; the 20 unaccountable ones (2/3 > 1/2) trip the valve.
+        assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
+                .hasSize(10)
+                .allSatisfy(c -> assertThat(c.chunkId()).startsWith(failedUpload));
+        assertThat(delayed.cluster.counter("orphan_gc_refused")).isEqualTo(1);
+    }
+
+    @Test
     void incrementalReportsAddDeleteAndFlagCopies() {
         t.knowChunk(chunk(0));
         t.knowChunk(chunk(1));
