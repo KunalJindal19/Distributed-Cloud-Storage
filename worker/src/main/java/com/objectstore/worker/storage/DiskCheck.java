@@ -38,7 +38,11 @@ public class DiskCheck implements Runnable {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (!probeOnce()) {
+            boolean healthy = probeOnce();
+            if (Thread.currentThread().isInterrupted()) {
+                return; // shutting down: an interrupted probe says nothing about the disk
+            }
+            if (!healthy) {
                 log.error("[diskcheck] CRITICAL volume {} failed the write/read probe; exiting so the "
                         + "controller repairs this worker's chunks elsewhere", properties.dataDir());
                 Runtime.getRuntime().halt(1);
@@ -54,6 +58,9 @@ public class DiskCheck implements Runnable {
             byte[] back = Files.readAllBytes(probe);
             Files.delete(probe);
             return Arrays.equals(payload, back);
+        } catch (java.nio.channels.ClosedByInterruptException e) {
+            Thread.currentThread().interrupt(); // the worker is shutting down, not the disk failing
+            return true;
         } catch (IOException e) {
             log.error("[diskcheck] probe failed: {}", e.toString());
             return false;
