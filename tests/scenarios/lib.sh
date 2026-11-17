@@ -54,7 +54,7 @@ healthy() {
 # Start the stack if needed and wait until it is healthy.
 ensure_up() {
     if ! curl -fsS -m 2 "$BASE_URL/health" > /dev/null 2>&1; then
-        docker compose up -d --wait > /dev/null
+        docker compose up -d --wait > /dev/null 2>&1
     fi
     for w in controller worker1 worker2 worker3 worker4; do
         [ "$(docker inspect -f '{{.State.Running}}' "$w" 2>/dev/null)" = "true" ] || docker start "$w" > /dev/null
@@ -66,7 +66,7 @@ ensure_up() {
 # A fresh, empty cluster.
 fresh_cluster() {
     docker compose down -v > /dev/null 2>&1
-    docker compose up -d --wait > /dev/null
+    docker compose up -d --wait > /dev/null 2>&1
     wait_for 120 healthy || { echo "the cluster did not become healthy" >&2; exit 2; }
 }
 

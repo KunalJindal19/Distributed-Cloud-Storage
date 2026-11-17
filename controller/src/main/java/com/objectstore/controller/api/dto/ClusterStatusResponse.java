@@ -1,5 +1,6 @@
 package com.objectstore.controller.api.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.objectstore.common.dto.WorkerStats;
 import java.util.List;
 import java.util.Map;
@@ -43,7 +44,8 @@ public record ClusterStatusResponse(
             String bootId,
             boolean hasReported,
             String lastSeen,
-            double lastSeenSAgo,
+            // Named explicitly: the snake_case strategy would render "lastSeenSAgo" as "last_seen_sago".
+            @JsonProperty("last_seen_s_ago") double lastSeenSAgo,
             int chunkCount,
             int queuedCommands,
             int pendingAsSource,

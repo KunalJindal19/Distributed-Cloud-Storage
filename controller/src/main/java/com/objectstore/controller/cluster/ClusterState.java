@@ -122,6 +122,7 @@ public class ClusterState {
     private final Deque<RepairEvent> events = new ArrayDeque<>(EVENT_CAPACITY);
     private final Map<String, AtomicLong> counters = new ConcurrentHashMap<>();
     private volatile boolean safeMode = true;
+    private volatile int blockedLastTick;
     private long safeModeThresholdReachedAt;        // monotonic nanos; 0 = not reached
 
     public ClusterState(ControllerProperties properties, Clock clock) {
@@ -177,6 +178,15 @@ public class ClusterState {
 
     public void setClusterId(String clusterId) {
         this.clusterId = clusterId;
+    }
+
+    /** Chunks that needed a copy in the last monitor tick but had no usable source or target. */
+    public int blockedLastTick() {
+        return blockedLastTick;
+    }
+
+    public void setBlockedLastTick(int blocked) {
+        this.blockedLastTick = blocked;
     }
 
     public boolean isSafeMode() {
@@ -353,7 +363,69 @@ public class ClusterState {
         if (set != null) {
             set.remove(chunkId);
         }
+        if (removed != null) {
+            protect(chunkId);
+        }
         return removed;
+    }
+
+    /** Marks a copy CORRUPT (it stays on disk as a last resort until a replacement exists). */
+    public boolean markCorrupt(String chunkId, String workerId) {
+        Replica replica = replica(chunkId, workerId);
+        if (replica == null || replica.state == ReplicaState.CORRUPT) {
+            return false;
+        }
+        replica.state = ReplicaState.CORRUPT;
+        protect(chunkId);
+        return true;
+    }
+
+    /**
+     * Keeps invariant I6 true at every instant: if a chunk has fewer than RF live copies, every
+     * DELETE for it (other than object/orphan deletions) that has not been handed to a worker yet
+     * is cancelled, and an EXCESS copy whose DELETE was cancelled counts as OK again. A DELETE
+     * that was already delivered cannot be called back (invariant I5).
+     *
+     * @return number of EXCESS copies turned back to OK
+     */
+    public int protect(String chunkId) {
+        if (!chunks.containsKey(chunkId) || live(chunkId).size() >= properties.replicationFactor()) {
+            return 0;
+        }
+        int restored = 0;
+        for (Map.Entry<String, Replica> entry : replicasOf(chunkId).entrySet()) {
+            Replica replica = entry.getValue();
+            if (replica.deleteDelivered || replica.deleteQueuedAt == 0) {
+                continue;
+            }
+            if (replica.deleteCmdId != null) {
+                cancelCommand(entry.getKey(), replica.deleteCmdId);
+            }
+            replica.deleteCmdId = null;
+            replica.deleteQueuedAt = 0;
+            if (replica.state == ReplicaState.EXCESS) {
+                replica.state = ReplicaState.OK;
+                restored++;
+                record("restored", chunkId, entry.getKey(), null,
+                        "a live copy was lost; the surplus copy's undelivered DELETE was cancelled");
+            }
+        }
+        return restored;
+    }
+
+    /** Queues a DELETE for a surplus or corrupt copy and remembers when, for the retry rule. */
+    public void sendDelete(String workerId, String chunkId, String reason) {
+        Replica replica = replica(chunkId, workerId);
+        if (replica == null) {
+            return;
+        }
+        Command command = queueCommand(workerId, InternalApi.COMMAND_DELETE, chunkId, null, null, reason);
+        if (command == null) {
+            return;
+        }
+        replica.deleteCmdId = command.cmdId();
+        replica.deleteQueuedAt = now();
+        // delete_delivered stays true once true: a delivered DELETE may still run (I5).
     }
 
     /** Forgets every copy on a worker (it is DEAD: nothing it holds can be counted on). */
@@ -590,7 +662,7 @@ public class ClusterState {
         String line = "[monitor] {} chunk={} src={} dst={} ({})";
         if ("unrecoverable".equals(event) || "timeout".equals(event)) {
             log.warn(line, event, chunkId, dash(source), dash(target), reason);
-        } else {
+        } else if (!"replicate".equals(event)) { // the planner logs its own REPLICATE line
             log.info(line, event, chunkId, dash(source), dash(target), reason);
         }
     }
@@ -703,7 +775,7 @@ public class ClusterState {
                     }
                     List<String> live = live(command.chunkId());
                     int liveAfter = live.size() - (replica.state == ReplicaState.OK && live.contains(worker.workerId) ? 1 : 0);
-                    if (liveAfter < rf && replica.state != ReplicaState.CORRUPT) {
+                    if (liveAfter < rf) {
                         violations.add("I6: DELETE (" + command.reason() + ") queued on " + worker.workerId + " for "
                                 + command.chunkId() + " would leave " + liveAfter + " live copies");
                     }
@@ -717,6 +789,15 @@ public class ClusterState {
             counters.computeIfAbsent("invariant_violations", k -> new AtomicLong()).addAndGet(violations.size());
         }
         return violations;
+    }
+
+    /** For log lines and the status page: a short form of the replica's state. */
+    public static String letter(ReplicaState state) {
+        return switch (state) {
+            case OK -> "OK";
+            case CORRUPT -> "C";
+            case EXCESS -> "E";
+        };
     }
 
     private static String dash(String value) {

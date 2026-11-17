@@ -174,7 +174,7 @@ public class DownloadService {
                     || replica.state != ReplicaState.OK) {
                 return;
             }
-            replica.state = ReplicaState.CORRUPT;
+            cluster.markCorrupt(chunkId, candidate.workerId());
             log.warn("[integrity] chunk={} worker={} -> CORRUPT ({})", chunkId, candidate.workerId(), reason);
         });
     }

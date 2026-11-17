@@ -92,7 +92,12 @@ public class Reports {
                                 chunk.checksum(), known.checksum());
                         corrupt++;
                     }
-                    cluster.addReplica(chunkId, workerId, true, ReplicaState.CORRUPT, null);
+                    if (existing == null) {
+                        cluster.addReplica(chunkId, workerId, true, ReplicaState.CORRUPT, null);
+                    } else {
+                        existing.confirmed = true;
+                        cluster.markCorrupt(chunkId, workerId);
+                    }
                 } else if (existing == null) {
                     cluster.addReplica(chunkId, workerId, true, ReplicaState.OK, null);
                     added++;
@@ -167,7 +172,11 @@ public class Reports {
                 if (!matches) {
                     log.warn("[ibr] chunk={} on {} CORRUPT (received {} expected {})", chunkId, workerId,
                             chunk.checksum(), known.checksum());
-                    cluster.addReplica(chunkId, workerId, true, ReplicaState.CORRUPT, null);
+                    if (cluster.replica(chunkId, workerId) == null) {
+                        cluster.addReplica(chunkId, workerId, true, ReplicaState.CORRUPT, null);
+                    } else {
+                        cluster.markCorrupt(chunkId, workerId);
+                    }
                 } else {
                     Replica existing = cluster.replica(chunkId, workerId);
                     if (existing == null) {
@@ -196,8 +205,7 @@ public class Reports {
             }
             for (String chunkId : nullSafeIds(request.bad())) {
                 Replica replica = cluster.replica(chunkId, workerId);
-                if (replica != null && replica.state != ReplicaState.CORRUPT) {
-                    replica.state = ReplicaState.CORRUPT;
+                if (replica != null && cluster.markCorrupt(chunkId, workerId)) {
                     log.warn("[integrity] chunk={} on {} CORRUPT (reported by worker)", chunkId, workerId);
                 }
             }

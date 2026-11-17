@@ -23,6 +23,8 @@ public final class TestSupport {
     public final ClusterState cluster;
     public final Registry registry;
     public final Reports reports;
+    public final com.objectstore.controller.objects.PlacementPolicy placement;
+    public final com.objectstore.controller.replication.ReplicationPlanner planner;
     private final long[] seq = new long[16];
 
     public TestSupport() {
@@ -34,6 +36,8 @@ public final class TestSupport {
         this.cluster = new ClusterState(properties, Clock.systemUTC());
         this.registry = new Registry(cluster, properties);
         this.reports = new Reports(cluster, registry, properties);
+        this.placement = new com.objectstore.controller.objects.PlacementPolicy(cluster, properties);
+        this.planner = new com.objectstore.controller.replication.ReplicationPlanner(cluster, placement, properties);
         cluster.setClusterId("cluster-1");
         cluster.setSafeMode(false);
     }
@@ -74,6 +78,21 @@ public final class TestSupport {
     public void ibr(String workerId, String boot, List<String> received, List<String> deleted, List<String> bad) {
         reports.ibr(new IncrementalReportRequest(workerId, boot, nextSeq(workerId), InternalApi.nowSeconds(),
                 received.stream().map(c -> new ChunkInfo(c, 10, SUM)).toList(), deleted, bad));
+    }
+
+    /** One planning pass, as the monitor runs it. */
+    public void plan() {
+        cluster.locked(() -> {
+            planner.plan();
+            assertNoViolations();
+        });
+    }
+
+    public void assertNoViolations() {
+        java.util.List<String> violations = cluster.locked(cluster::checkInvariants);
+        if (!violations.isEmpty()) {
+            throw new AssertionError("invariant violations: " + violations);
+        }
     }
 
     public void heartbeat(String workerId, String boot, long hbSeq) {

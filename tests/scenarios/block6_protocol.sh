@@ -15,17 +15,20 @@ random_file "$WORK/a.bin" $((3 * MIB))
 OBJ=$(upload "$WORK/a.bin")
 
 section "AC-6.2 docker stop worker2: STALE at 6-8 s, DEAD at 12-14 s; start: back within 3 s"
-docker stop worker2 > /dev/null
-t0=$(now); stale_at=""; dead_at=""
+t0=$(now); docker stop worker2 > /dev/null   # t=0: the worker stops heartbeating as it shuts down
+stale_at=""; dead_at=""; stale_silence=0; dead_silence=0
 while [ -z "$dead_at" ] && [ "$(python3 -c "print(int($(since "$t0")))")" -lt 30 ]; do
-    st=$(worker_field worker2 state)
-    [ "$st" = "STALE" ] && [ -z "$stale_at" ] && stale_at=$(since "$t0")
-    [ "$st" = "DEAD" ] && dead_at=$(since "$t0")
+    w=$(status | jq -c '.workers[] | select(.worker_id=="worker2")')
+    st=$(echo "$w" | jq -r .state); ago=$(echo "$w" | jq -r .last_seen_s_ago)
+    [ "$st" = "STALE" ] && [ -z "$stale_at" ] && stale_at=$(since "$t0") && stale_silence=$ago
+    [ "$st" = "DEAD" ] && dead_at=$(since "$t0") && dead_silence=$ago
     sleep 0.25
 done
-say "  STALE after ${stale_at:-never} s, DEAD after ${dead_at:-never} s (docker stop itself takes ~1 s)"
-check "STALE between 6 and 9 s" python3 -c "import sys; sys.exit(0 if 5.5 <= float('${stale_at:-0}') <= 9 else 1)"
-check "DEAD between 12 and 15 s" python3 -c "import sys; sys.exit(0 if 11.5 <= float('${dead_at:-0}') <= 15 else 1)"
+say "  after docker stop: STALE ${stale_at:-never} s, DEAD ${dead_at:-never} s"
+say "  silence since the last heartbeat when declared: STALE ${stale_silence} s, DEAD ${dead_silence} s"
+# The last heartbeat came 0-2 s before "docker stop": judge by the silence the controller measured.
+check "STALE after 6-8 s of silence" python3 -c "import sys; sys.exit(0 if 6 <= float('$stale_silence') <= 8 else 1)"
+check "DEAD after 12-14 s of silence" python3 -c "import sys; sys.exit(0 if 12 <= float('$dead_silence') <= 14 else 1)"
 check "the log reports the replicas removed" sh -c "docker logs controller 2>&1 | grep -q 'worker2 DEAD after .* replicas removed'"
 docker start worker2 > /dev/null
 t0=$(now)
