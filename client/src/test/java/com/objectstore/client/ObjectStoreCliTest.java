@@ -48,6 +48,9 @@ class ObjectStoreCliTest {
     private final AtomicReference<String> lastContentType = new AtomicReference<>();
     private volatile byte[] downloadBody = "hello object store".getBytes(StandardCharsets.UTF_8);
     private volatile String downloadEtag;
+    private volatile double retrySeconds = 0;
+    private final java.util.concurrent.atomic.AtomicInteger unavailableAnswers = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.List<String> idempotencyKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     @BeforeEach
     void startStubController() throws IOException {
@@ -80,6 +83,36 @@ class ObjectStoreCliTest {
         assertThat(sent).contains("name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n");
         assertThat(sent).contains(new String(content, StandardCharsets.ISO_8859_1));
         assertThat(stdout.toString()).contains("\"object_id\" : \"" + ID + "\"");
+    }
+
+    @Test
+    void anUploadIsRetriedThroughSafeModeWithTheSameIdempotencyKey() throws Exception {
+        Path file = Files.write(dir.resolve("a.bin"), new byte[] {1, 2, 3});
+        retrySeconds = 10;
+        unavailableAnswers.set(2);
+
+        int exit = run("upload", file.toString());
+
+        assertThat(exit).isZero();
+        assertThat(idempotencyKeys).hasSize(3).allMatch(k -> k.equals(idempotencyKeys.get(0)));
+        assertThat(stderr.toString()).contains("answered 503 (Retry-After 5); retrying");
+    }
+
+    @Test
+    void anExplicitIdempotencyKeyIsSent() throws Exception {
+        Path file = Files.write(dir.resolve("a.bin"), new byte[] {1});
+
+        assertThat(run("upload", file.toString(), "--key", "my-key-1")).isZero();
+
+        assertThat(idempotencyKeys).containsExactly("my-key-1");
+    }
+
+    @Test
+    void withoutARetryBudgetA503IsReportedAsAnError() throws Exception {
+        unavailableAnswers.set(1);
+
+        assertThat(run("status")).isEqualTo(1);
+        assertThat(stderr.toString()).contains("safe_mode");
     }
 
     @Test
@@ -197,7 +230,7 @@ class ObjectStoreCliTest {
         withBase[0] = "--base";
         withBase[1] = base;
         System.arraycopy(args, 0, withBase, 2, args.length);
-        return new ObjectStoreCli(new PrintStream(stdout), new PrintStream(stderr), null).run(withBase);
+        return new ObjectStoreCli(new PrintStream(stdout), new PrintStream(stderr), null, retrySeconds).run(withBase);
     }
 
     private void handle(HttpExchange exchange) throws IOException {
@@ -207,6 +240,15 @@ class ObjectStoreCliTest {
             lastRequest.set(method + " " + target);
             lastContentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
             lastBody.set(exchange.getRequestBody().readAllBytes());
+            String key = exchange.getRequestHeaders().getFirst("Idempotency-Key");
+            if (key != null) {
+                idempotencyKeys.add(key);
+            }
+            if (unavailableAnswers.getAndDecrement() > 0) {
+                exchange.getResponseHeaders().add("Retry-After", "5");
+                respond(exchange, 503, "{\"error\":\"safe_mode\",\"detail\":\"starting\"}");
+                return;
+            }
 
             if (target.contains("00000000-0000-0000-0000-000000000000")) {
                 respond(exchange, 404, "{\"error\":\"object_not_found\",\"detail\":\"no such object\"}");

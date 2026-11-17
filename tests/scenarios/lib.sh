@@ -8,6 +8,7 @@ cd "$ROOT"
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 API="$BASE_URL/api/v1"
 WORK="$ROOT/.demo/scenarios"
+REL=".demo/scenarios"   # the same directory relative to the project: what ./oscli (in the client container) can see
 mkdir -p "$WORK"
 MIB=1048576
 FAILED=0

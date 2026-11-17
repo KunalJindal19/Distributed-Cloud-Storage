@@ -3,6 +3,7 @@ package com.objectstore.controller.cluster;
 import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.repository.ChunkRepository;
 import com.objectstore.controller.repository.ClusterMetaRepository;
+import com.objectstore.controller.repository.ObjectRepository;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,11 +22,14 @@ public class ClusterBootstrap {
     private final ClusterState cluster;
     private final ClusterMetaRepository meta;
     private final ChunkRepository chunks;
+    private final ObjectRepository objects;
 
-    public ClusterBootstrap(ClusterState cluster, ClusterMetaRepository meta, ChunkRepository chunks) {
+    public ClusterBootstrap(ClusterState cluster, ClusterMetaRepository meta, ChunkRepository chunks,
+                            ObjectRepository objects) {
         this.cluster = cluster;
         this.meta = meta;
         this.chunks = chunks;
+        this.objects = objects;
     }
 
     @PostConstruct
@@ -36,6 +40,7 @@ public class ClusterBootstrap {
                 cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(
                         chunk.objectId(), chunk.index(), chunk.size(), chunk.checksum()));
             }
+            objects.garbageObjectIds().forEach(cluster::addGarbage);
             cluster.setSafeMode(true);
             log.info("[safemode] ON: cluster {} with {} chunks; waiting for block reports", cluster.clusterId(),
                     cluster.chunks().size());
