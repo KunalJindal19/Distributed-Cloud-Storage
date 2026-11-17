@@ -1,5 +1,7 @@
 package com.objectstore.controller.config;
 
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
@@ -10,57 +12,89 @@ import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
-/**
- * Controller settings, bound once at start-up from environment variables (see application.yml).
- *
- * @param chunkSize               CHUNK_SIZE, bytes per chunk (1 MiB)
- * @param replicationFactor       REPLICATION_FACTOR, good copies wanted per chunk (2)
- * @param heartbeatTimeoutSeconds HEARTBEAT_TIMEOUT, silence after which a worker is DEAD
- * @param healthIntervalSeconds   HEALTH_INTERVAL, period of the health monitor
- * @param startupGraceSeconds     STARTUP_GRACE, time after a controller start during which no
- *                                worker is declared DEAD (they may still be booting)
- * @param repairIntervalSeconds   REPAIR_INTERVAL, period of the repair loop
- * @param scrubIntervalSeconds    SCRUB_INTERVAL, period of the scrub loop
- * @param workerTimeoutSeconds    WORKER_TIMEOUT_S, time limit of one HTTP call to a worker
- * @param repairConcurrency       REPAIR_CONCURRENCY, chunks repaired in parallel
- * @param dbPath                  DB_PATH, the SQLite metadata file
- */
+/** Controller settings, bound once at start-up from environment variables (see application.yml and the README). */
 @Validated
 @ConfigurationProperties(prefix = "objectstore")
 public record ControllerProperties(
         @Min(1) @Max(64 * 1024 * 1024) int chunkSize,
         @Min(1) int replicationFactor,
-        @Positive double heartbeatTimeoutSeconds,
+        @NotNull Path dbPath,
+        @Positive double staleAfterSeconds,
+        @Positive double deadAfterSeconds,
+        @DecimalMin("0") @DecimalMax("1") double staleRatio,
         @Positive double healthIntervalSeconds,
-        @PositiveOrZero double startupGraceSeconds,
-        @Positive double repairIntervalSeconds,
-        @Positive double scrubIntervalSeconds,
-        @Positive double workerTimeoutSeconds,
-        @Min(1) int repairConcurrency,
-        @NotNull Path dbPath) {
+        @Positive double monitorIntervalSeconds,
+        @Positive double pendingTimeoutSeconds,
+        @Positive double targetBackoffSeconds,
+        @Min(1) int maxStreams,
+        @Positive double commandTtlSeconds,
+        @Min(1) int maxCommandsPerWorker,
+        @Positive double maxMessageAgeSeconds,
+        @DecimalMin("0") @DecimalMax("1") double safeModeThreshold,
+        @PositiveOrZero double safeModeExtensionSeconds,
+        @PositiveOrZero double safeModeTimeoutSeconds,
+        @PositiveOrZero double orphanGcDelaySeconds,
+        @DecimalMin("0") @DecimalMax("1") double orphanGcMaxFraction,
+        @PositiveOrZero long minFreeBytes,
+        @Positive double fullReportIntervalSeconds,
+        @Positive double connectTimeoutSeconds,
+        @Positive double readTimeoutSeconds,
+        boolean invariantChecks) {
 
-    public Duration heartbeatTimeout() {
-        return seconds(heartbeatTimeoutSeconds);
+    public Duration staleAfter() {
+        return seconds(staleAfterSeconds);
+    }
+
+    public Duration deadAfter() {
+        return seconds(deadAfterSeconds);
     }
 
     public Duration healthInterval() {
         return seconds(healthIntervalSeconds);
     }
 
-    public Duration startupGrace() {
-        return seconds(startupGraceSeconds);
+    public Duration monitorInterval() {
+        return seconds(monitorIntervalSeconds);
     }
 
-    public Duration repairInterval() {
-        return seconds(repairIntervalSeconds);
+    public Duration pendingTimeout() {
+        return seconds(pendingTimeoutSeconds);
     }
 
-    public Duration scrubInterval() {
-        return seconds(scrubIntervalSeconds);
+    public Duration targetBackoff() {
+        return seconds(targetBackoffSeconds);
     }
 
-    public Duration workerTimeout() {
-        return seconds(workerTimeoutSeconds);
+    public Duration commandTtl() {
+        return seconds(commandTtlSeconds);
+    }
+
+    public Duration maxMessageAge() {
+        return seconds(maxMessageAgeSeconds);
+    }
+
+    public Duration safeModeExtension() {
+        return seconds(safeModeExtensionSeconds);
+    }
+
+    public Duration safeModeTimeout() {
+        return seconds(safeModeTimeoutSeconds);
+    }
+
+    public Duration orphanGcDelay() {
+        return seconds(orphanGcDelaySeconds);
+    }
+
+    public Duration fullReportInterval() {
+        return seconds(fullReportIntervalSeconds);
+    }
+
+    public Duration connectTimeout() {
+        return seconds(connectTimeoutSeconds);
+    }
+
+    public Duration readTimeout() {
+        return seconds(readTimeoutSeconds);
     }
 
     private static Duration seconds(double value) {

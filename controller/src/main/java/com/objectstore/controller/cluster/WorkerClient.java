@@ -3,10 +3,10 @@ package com.objectstore.controller.cluster;
 import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.ChunkInfo;
 import com.objectstore.common.dto.ChunkListResponse;
+import com.objectstore.common.http.FaultSettings;
+import com.objectstore.common.http.HttpClients;
 import com.objectstore.controller.config.ControllerProperties;
 import java.io.IOException;
-import java.net.http.HttpClient;
-import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -14,23 +14,19 @@ import java.util.Map;
 import java.util.function.Supplier;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.ClientHttpResponse;
-import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 /**
- * The controller side of the internal API: every HTTP call to a worker goes through here.
- *
- * <p>All four operations are idempotent by design of the protocol (a repeated PUT of the same
- * content is a 200, a repeated DELETE is a 404), so a call that fails because a pooled connection
- * turned out to be stale is transparently tried once more. Time-outs are not retried.
+ * The controller's direct HTTP calls to workers: writing chunks during an upload, reading them
+ * for a download, best-effort cleanup after a failed upload, and listing a worker's disk for
+ * fsck. Repairs do <em>not</em> go through here: workers copy chunks to each other on command.
  */
 @Component
 public class WorkerClient {
 
-    /** Bytes of a chunk together with the checksum the worker computed while reading it. */
+    /** Bytes of a chunk together with the checksum the worker computed from its sidecar. */
     public record FetchedChunk(byte[] data, String checksum) {
     }
 
@@ -38,23 +34,14 @@ public class WorkerClient {
     private final RestClient listing;
 
     public WorkerClient(RestClient.Builder builder, ControllerProperties properties) {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofSeconds(2))
-                .build();
-        Duration timeout = properties.workerTimeout();
-        this.chunks = builder.clone().requestFactory(requestFactory(httpClient, timeout)).build();
+        FaultSettings faults = FaultSettings.fromEnvironment();
+        Duration connect = properties.connectTimeout();
+        Duration read = properties.readTimeout();
+        this.chunks = HttpClients.restClient(builder, connect, read, faults);
         // Listing makes the worker hash every file it holds, which takes longer than one chunk call.
-        Duration listingTimeout = timeout.multipliedBy(6).compareTo(Duration.ofMinutes(1)) > 0
-                ? timeout.multipliedBy(6)
-                : Duration.ofMinutes(1);
-        this.listing = builder.clone().requestFactory(requestFactory(httpClient, listingTimeout)).build();
-    }
-
-    private static JdkClientHttpRequestFactory requestFactory(HttpClient httpClient, Duration readTimeout) {
-        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(httpClient);
-        factory.setReadTimeout(readTimeout);
-        return factory;
+        Duration listingTimeout = read.multipliedBy(6).compareTo(Duration.ofMinutes(1)) > 0
+                ? read.multipliedBy(6) : Duration.ofMinutes(1);
+        this.listing = HttpClients.restClient(builder, connect, listingTimeout, faults);
     }
 
     /** {@code PUT /internal/chunks/{chunk_id}}. 200 (already there) and 201 (written) both succeed. */
@@ -73,7 +60,7 @@ public class WorkerClient {
                 }));
     }
 
-    /** {@code GET /internal/chunks/{chunk_id}}. The caller is responsible for verifying the bytes. */
+    /** {@code GET /internal/chunks/{chunk_id}}. The caller classifies and verifies the result. */
     public FetchedChunk getChunk(String workerUrl, String chunkId) {
         return call(workerUrl, () -> chunks.get()
                 .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
@@ -87,31 +74,20 @@ public class WorkerClient {
                 }));
     }
 
-    /**
-     * {@code DELETE /internal/chunks/{chunk_id}}.
-     *
-     * @return {@code true} if the worker removed a file, {@code false} if it had none
-     */
-    public boolean deleteChunk(String workerUrl, String chunkId) {
-        return call(workerUrl, () -> chunks.delete()
+    /** {@code DELETE /internal/chunks/{chunk_id}}: best-effort cleanup of a failed upload. */
+    public void deleteChunk(String workerUrl, String chunkId) {
+        call(workerUrl, () -> chunks.delete()
                 .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
                 .exchange((request, response) -> {
                     int status = response.getStatusCode().value();
-                    if (status == 204) {
-                        return Boolean.TRUE;
+                    if (status != 204 && status != 404) {
+                        throw failure(workerUrl, response);
                     }
-                    if (status == 404) {
-                        return Boolean.FALSE;
-                    }
-                    throw failure(workerUrl, response);
+                    return Boolean.TRUE;
                 }));
     }
 
-    /**
-     * {@code GET /internal/workers/{worker_id}/chunks}: what is really on the worker's disk.
-     *
-     * @return chunk id &rarr; size and checksum as computed by the worker from the file
-     */
+    /** {@code GET /internal/workers/{worker_id}/chunks}: the disk as it is now, hashes recomputed. */
     public Map<String, ChunkInfo> listChunks(String workerUrl, String workerId) {
         ChunkListResponse response = call(workerUrl, () -> listing.get()
                 .uri(workerUrl + InternalApi.WORKER_CHUNKS_PATH, workerId)
@@ -133,31 +109,12 @@ public class WorkerClient {
 
     private static <T> T call(String workerUrl, Supplier<T> request) {
         try {
-            try {
-                return request.get();
-            } catch (ResourceAccessException e) {
-                if (isTimeout(e)) {
-                    throw e;
-                }
-                return request.get();
-            }
+            return request.get();
         } catch (WorkerException e) {
             throw e;
         } catch (RestClientException e) {
             throw new WorkerException(workerUrl, null, describe(e), e);
         }
-    }
-
-    private static boolean isTimeout(Throwable error) {
-        for (Throwable t = error; t != null; t = t.getCause()) {
-            if (t instanceof HttpTimeoutException || t instanceof java.net.SocketTimeoutException) {
-                return true;
-            }
-            if (t.getCause() == t) {
-                break;
-            }
-        }
-        return false;
     }
 
     private static WorkerException failure(String workerUrl, ClientHttpResponse response) throws IOException {

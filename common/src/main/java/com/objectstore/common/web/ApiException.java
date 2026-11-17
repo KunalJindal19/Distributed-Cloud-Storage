@@ -1,5 +1,8 @@
 package com.objectstore.common.web;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.springframework.http.HttpStatus;
 
 /**
@@ -10,6 +13,7 @@ public class ApiException extends RuntimeException {
 
     private final HttpStatus status;
     private final String code;
+    private final Map<String, String> headers = new LinkedHashMap<>();
 
     public ApiException(HttpStatus status, String code, String detail) {
         super(detail);
@@ -31,6 +35,16 @@ public class ApiException extends RuntimeException {
         return code;
     }
 
+    /** Extra response headers, e.g. {@code Retry-After}. */
+    public Map<String, String> headers() {
+        return Collections.unmodifiableMap(headers);
+    }
+
+    public ApiException withHeader(String name, String value) {
+        headers.put(name, value);
+        return this;
+    }
+
     public static ApiException badRequest(String detail) {
         return new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.BAD_REQUEST, detail);
     }
@@ -49,6 +63,10 @@ public class ApiException extends RuntimeException {
 
     public static ApiException payloadTooLarge(String detail) {
         return new ApiException(HttpStatus.PAYLOAD_TOO_LARGE, ErrorCodes.PAYLOAD_TOO_LARGE, detail);
+    }
+
+    public static ApiException conflict(String code, String detail) {
+        return new ApiException(HttpStatus.CONFLICT, code, detail);
     }
 
     public static ApiException unavailable(String code, String detail) {

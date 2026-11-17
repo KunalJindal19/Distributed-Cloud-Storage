@@ -74,34 +74,39 @@ public class ChunkController {
         return ResponseEntity.status(status).body(new ChunkInfo(chunkId, body.length, checksum));
     }
 
-    /** Returns the raw bytes; {@code X-Checksum} is the hash of exactly the bytes being sent. */
+    /**
+     * Returns the raw bytes after verifying them against the sidecar; {@code X-Checksum} is their
+     * hash. A copy that no longer matches its sidecar is never served: 409 {@code chunk_corrupt}.
+     */
     @GetMapping(InternalApi.CHUNK_PATH)
     public ResponseEntity<byte[]> getChunk(@PathVariable String chunkId) {
         StoredChunk chunk = store.read(chunkId).orElseThrow(() -> chunkNotFound(chunkId));
+        if (chunk.corrupt()) {
+            log.warn("[store] get chunk={}: bytes do not match the sidecar; refusing to serve them", chunkId);
+            throw ApiException.conflict(ErrorCodes.CHUNK_CORRUPT, "chunk " + chunkId + " is corrupt on this worker");
+        }
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
                 .header(InternalApi.CHECKSUM_HEADER, chunk.checksum())
                 .body(chunk.data());
     }
 
+    /** 204 whether or not there was anything to delete: the outcome is the same, and retries are harmless. */
     @DeleteMapping(InternalApi.CHUNK_PATH)
     public ResponseEntity<Void> deleteChunk(@PathVariable String chunkId) {
         boolean removed = store.delete(chunkId);
-        log.info("[store] delete chunk={} ({})", chunkId, removed ? "ok" : "missing");
-        if (!removed) {
-            throw chunkNotFound(chunkId);
-        }
+        log.info("[store] delete chunk={} ({})", chunkId, removed ? "ok" : "was absent");
         return ResponseEntity.noContent().build();
     }
 
-    /** Everything on this worker's disk, hashed from the files as they are now. */
+    /** Everything on this worker's disk, with checksums recomputed from the files right now (used by fsck). */
     @GetMapping(InternalApi.WORKER_CHUNKS_PATH)
     public ChunkListResponse listChunks(@PathVariable String workerId) {
         if (!properties.id().equals(workerId)) {
             throw ApiException.notFound(ErrorCodes.UNKNOWN_WORKER,
                     "this is worker '" + properties.id() + "', not '" + workerId + "'");
         }
-        return new ChunkListResponse(properties.id(), store.list());
+        return new ChunkListResponse(properties.id(), store.listVerified());
     }
 
     // The store reports problems with its own exception types; translate them to the wire contract.
@@ -119,6 +124,11 @@ public class ChunkController {
     @ExceptionHandler(ChunkStore.ChunkConflictException.class)
     ResponseEntity<ApiError> onConflict(ChunkStore.ChunkConflictException ex) {
         return error(HttpStatus.CONFLICT, ErrorCodes.CONFLICT, ex.getMessage());
+    }
+
+    @ExceptionHandler(ChunkStore.InsufficientStorageException.class)
+    ResponseEntity<ApiError> onInsufficientStorage(ChunkStore.InsufficientStorageException ex) {
+        return error(HttpStatus.INSUFFICIENT_STORAGE, ErrorCodes.INSUFFICIENT_STORAGE, ex.getMessage());
     }
 
     private static ResponseEntity<ApiError> error(HttpStatus status, String code, String detail) {

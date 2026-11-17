@@ -1,0 +1,77 @@
+# Every operational setting comes from an environment variable (see README "Configuration").
+spring:
+  application:
+    name: objectstore-controller
+  main:
+    banner-mode: "off"
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 3s
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  servlet:
+    multipart:
+      # The servlet container spools the upload to a temporary file, so memory use stays flat
+      # regardless of object size; the controller then reads it back one chunk at a time.
+      max-file-size: ${MAX_UPLOAD_SIZE:10GB}
+      max-request-size: -1
+      # Parse the multipart body only when the upload handler asks for it, so safe mode and
+      # worker availability are checked before the body is read.
+      resolve-lazily: true
+  mvc:
+    formcontent:
+      filter:
+        enabled: false
+  flyway:
+    locations: classpath:db/migration
+
+server:
+  port: ${PORT:8000}
+  shutdown: graceful
+  tomcat:
+    # A request refused before its body was read (safe mode, too few workers) still has its
+    # body drained up to this size, so the client receives the JSON error instead of a reset.
+    max-swallow-size: 64MB
+
+objectstore:
+  chunk-size: ${CHUNK_SIZE:1048576}
+  replication-factor: ${REPLICATION_FACTOR:2}
+  db-path: ${DB_PATH:/data/meta.db}
+  stale-after-seconds: ${STALE_AFTER:6}
+  dead-after-seconds: ${DEAD_AFTER:12}
+  stale-ratio: ${STALE_RATIO:0.5}
+  health-interval-seconds: ${HEALTH_INTERVAL:1}
+  monitor-interval-seconds: ${MONITOR_INTERVAL:3}
+  pending-timeout-seconds: ${PENDING_TIMEOUT:15}
+  target-backoff-seconds: ${TARGET_BACKOFF:30}
+  max-streams: ${MAX_STREAMS:2}
+  command-ttl-seconds: ${COMMAND_TTL:30}
+  max-commands-per-worker: ${MAX_COMMANDS_PER_WORKER:1000}
+  max-message-age-seconds: ${MAX_MESSAGE_AGE:10}
+  safe-mode-threshold: ${SAFE_MODE_THRESHOLD:0.999}
+  safe-mode-extension-seconds: ${SAFE_MODE_EXTENSION:5}
+  safe-mode-timeout-seconds: ${SAFE_MODE_TIMEOUT:30}
+  orphan-gc-delay-seconds: ${ORPHAN_GC_DELAY:60}
+  orphan-gc-max-fraction: ${ORPHAN_GC_MAX_FRACTION:0.5}
+  min-free-bytes: ${MIN_FREE_BYTES:16777216}
+  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:30}
+  connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
+  read-timeout-seconds: ${READ_TIMEOUT:10}
+  invariant-checks: ${INVARIANT_CHECKS:true}
+
+logging:
+  level:
+    root: ${LOG_LEVEL:INFO}
+    org.springframework: WARN
+    org.apache: WARN
+    org.hibernate.validator: WARN
+    org.flywaydb: WARN
+    com.zaxxer.hikari: WARN
+    # A download that fails after its first bytes were sent is aborted by letting the exception
+    # reach the container. The controller logs that itself ("[download] aborted ..."); the
+    # container's additional stack trace would only be noise.
+    "[org.apache.catalina.core.ContainerBase.[Tomcat].[localhost].[/].[dispatcherServlet]]": "OFF"
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level %msg%n"

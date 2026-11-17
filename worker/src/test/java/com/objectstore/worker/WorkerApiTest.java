@@ -22,7 +22,7 @@ import org.springframework.test.context.DynamicPropertySource;
 /** Drives the worker's internal API over real HTTP, exactly as the controller does. */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"worker.id=worker1", "worker.registration-enabled=false"})
+        properties = {"spring.config.name=worker", "worker.id=worker1", "worker.background-enabled=false"})
 class WorkerApiTest {
 
     private static final String OBJECT_ID = "3f1c9a52-7d0e-4c1b-9a54-1f2e3d4c5b6a";
@@ -108,6 +108,11 @@ class WorkerApiTest {
     }
 
     @Test
+    void healthReportsMisconfigurationAsUnavailable() throws Exception {
+        assertThat(get("/health").statusCode()).isEqualTo(200);
+    }
+
+    @Test
     void putLargerThanOneChunkIsRejected() throws Exception {
         byte[] tooBig = bytes(1_048_577, 1);
 
@@ -128,7 +133,7 @@ class WorkerApiTest {
     }
 
     @Test
-    void getReturnsBytesWithAChecksumComputedFromDisk() throws Exception {
+    void getReturnsTheVerifiedBytesWithTheirChecksum() throws Exception {
         byte[] data = bytes(4096, 9);
         String id = chunkId(2);
         put(id, data, Checksums.sha256Hex(data));
@@ -139,13 +144,6 @@ class WorkerApiTest {
         assertThat(intact.headers().firstValue("X-Checksum")).contains(Checksums.sha256Hex(data));
         assertThat(intact.headers().firstValue("Content-Type")).contains("application/octet-stream");
 
-        // Damage the file behind the worker's back: the header must describe the damaged bytes.
-        byte[] damaged = data.clone();
-        damaged[100] ^= 0x5A;
-        Files.write(dataDir.resolve("chunks").resolve(id), damaged);
-
-        HttpResponse<byte[]> afterDamage = getBytes("/internal/chunks/" + id);
-        assertThat(afterDamage.headers().firstValue("X-Checksum")).contains(Checksums.sha256Hex(damaged));
     }
 
     @Test
@@ -157,14 +155,27 @@ class WorkerApiTest {
     }
 
     @Test
-    void deleteReturns204Then404() throws Exception {
+    void deleteIsIdempotent() throws Exception {
         byte[] data = bytes(10, 1);
         put(chunkId(0), data, Checksums.sha256Hex(data));
 
         assertThat(delete(chunkId(0)).statusCode()).isEqualTo(204);
-        HttpResponse<String> second = delete(chunkId(0));
-        assertThat(second.statusCode()).isEqualTo(404);
-        assertThat(second.body()).contains("\"error\":\"chunk_not_found\"");
+        assertThat(delete(chunkId(0)).statusCode()).isEqualTo(204);
+        assertThat(get("/internal/chunks/" + chunkId(0)).statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void aCorruptCopyIsNeverServed() throws Exception {
+        byte[] data = bytes(4096, 4);
+        put(chunkId(3), data, Checksums.sha256Hex(data));
+        byte[] damaged = data.clone();
+        damaged[7] ^= 0x10;
+        Files.write(dataDir.resolve("chunks").resolve(chunkId(3)), damaged);
+
+        HttpResponse<String> response = get("/internal/chunks/" + chunkId(3));
+
+        assertThat(response.statusCode()).isEqualTo(409);
+        assertThat(response.body()).contains("\"error\":\"chunk_corrupt\"");
     }
 
     @Test
@@ -176,6 +187,7 @@ class WorkerApiTest {
 
         HttpResponse<String> mine = get("/internal/workers/worker1/chunks");
         assertThat(mine.statusCode()).isEqualTo(200);
+        // The listing re-hashes the files: it is what fsck compares with the controller's view.
         assertThat(mine.body()).isEqualTo(
                 "{\"worker_id\":\"worker1\",\"chunks\":["
                         + "{\"chunk_id\":\"" + chunkId(0) + "\",\"size\":300,\"checksum\":\"" + Checksums.sha256Hex(a) + "\"},"

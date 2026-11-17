@@ -12,8 +12,8 @@ import java.util.function.Function;
 import org.springframework.stereotype.Component;
 
 /**
- * Runs blocking calls to workers concurrently, one virtual thread per call. This is how the
- * copies of a chunk are written in parallel and how an object's chunks are deleted in one go.
+ * Runs blocking calls to workers concurrently, one virtual thread per call: the copies of a chunk
+ * are written in parallel, and fsck asks every worker at once.
  */
 @Component
 public class WorkerIo {
@@ -27,8 +27,7 @@ public class WorkerIo {
 
     /**
      * Applies {@code task} to every item concurrently and waits for all of them. Results are in
-     * the order of {@code items}. An exception thrown by a task is rethrown to the caller once
-     * all tasks have finished.
+     * the order of {@code items}; a task that threw yields {@code null}.
      */
     public <T, R> List<R> mapAll(Collection<T> items, Function<T, R> task) {
         List<Future<R>> futures = new ArrayList<>(items.size());
@@ -36,7 +35,6 @@ public class WorkerIo {
             futures.add(executor.submit(() -> task.apply(item)));
         }
         List<R> results = new ArrayList<>(items.size());
-        RuntimeException failure = null;
         for (Future<R> future : futures) {
             try {
                 results.add(future.get());
@@ -44,17 +42,8 @@ public class WorkerIo {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted while waiting for worker calls", e);
             } catch (ExecutionException e) {
-                Throwable cause = e.getCause();
-                RuntimeException wrapped = cause instanceof RuntimeException runtime
-                        ? runtime
-                        : new IllegalStateException(cause);
-                if (failure == null) {
-                    failure = wrapped;
-                }
+                results.add(null);
             }
-        }
-        if (failure != null) {
-            throw failure;
         }
         return results;
     }

@@ -10,18 +10,7 @@ import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
-/**
- * Worker settings, bound once at start-up from environment variables (see application.yml).
- *
- * @param id                       WORKER_ID, e.g. {@code worker1}; also the container's host name
- * @param dataDir                  DATA_DIR, the mount point of the persistent volume
- * @param controllerUrl            CONTROLLER_URL, where to register and send heartbeats
- * @param advertiseUrl             ADVERTISE_URL, the URL the controller should use to reach this
- *                                 worker; blank means {@code http://<id>:<port>}
- * @param heartbeatIntervalSeconds HEARTBEAT_INTERVAL
- * @param maxChunkSize             CHUNK_SIZE, the largest chunk body accepted
- * @param registrationEnabled      switches the register/heartbeat loop off (tests only)
- */
+/** Worker settings, bound once at start-up from environment variables (see application.yml). */
 @Validated
 @ConfigurationProperties(prefix = "worker")
 public record WorkerProperties(
@@ -29,16 +18,57 @@ public record WorkerProperties(
         @NotNull Path dataDir,
         @NotBlank String controllerUrl,
         String advertiseUrl,
-        @Positive double heartbeatIntervalSeconds,
         @Positive int maxChunkSize,
-        boolean registrationEnabled) {
+        @Positive double heartbeatIntervalSeconds,
+        @Positive double heartbeatHttpTimeoutSeconds,
+        @Positive double fullReportIntervalSeconds,
+        @Positive double ibrIntervalSeconds,
+        @Positive int ibrBufferMax,
+        @Positive double scanIntervalSeconds,
+        @Positive double diskCheckIntervalSeconds,
+        @Positive double connectTimeoutSeconds,
+        @Positive double readTimeoutSeconds,
+        /** Switches every background loop off (register, heartbeat, reports, scanner, disk check); tests only. */
+        boolean backgroundEnabled) {
 
-    /** One file per chunk lives directly in this directory. */
+    /** One data file and one {@code .meta} sidecar per chunk live directly in this directory. */
     public Path chunkDir() {
         return dataDir.resolve("chunks");
     }
 
     public Duration heartbeatInterval() {
-        return Duration.ofMillis(Math.round(heartbeatIntervalSeconds * 1000));
+        return seconds(heartbeatIntervalSeconds);
+    }
+
+    public Duration heartbeatHttpTimeout() {
+        return seconds(heartbeatHttpTimeoutSeconds);
+    }
+
+    public Duration fullReportInterval() {
+        return seconds(fullReportIntervalSeconds);
+    }
+
+    public Duration ibrInterval() {
+        return seconds(ibrIntervalSeconds);
+    }
+
+    public Duration scanInterval() {
+        return seconds(scanIntervalSeconds);
+    }
+
+    public Duration diskCheckInterval() {
+        return seconds(diskCheckIntervalSeconds);
+    }
+
+    public Duration connectTimeout() {
+        return seconds(connectTimeoutSeconds);
+    }
+
+    public Duration readTimeout() {
+        return seconds(readTimeoutSeconds);
+    }
+
+    private static Duration seconds(double value) {
+        return Duration.ofMillis(Math.round(value * 1000));
     }
 }
