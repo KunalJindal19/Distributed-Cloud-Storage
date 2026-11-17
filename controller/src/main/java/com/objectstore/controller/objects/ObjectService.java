@@ -1,23 +1,20 @@
 package com.objectstore.controller.objects;
 
+import com.objectstore.common.InternalApi;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectListResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
-import com.objectstore.controller.cluster.WorkerClient;
-import com.objectstore.controller.cluster.WorkerException;
-import com.objectstore.controller.config.WorkerIo;
-import com.objectstore.controller.domain.ReplicaLocation;
+import com.objectstore.controller.cluster.ClusterState;
+import com.objectstore.controller.cluster.SafeMode;
+import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.domain.StoredObject;
-import com.objectstore.controller.domain.WorkerStatus;
-import com.objectstore.controller.replication.ReplicaGuard;
 import com.objectstore.controller.repository.ChunkRepository;
 import com.objectstore.controller.repository.ObjectRepository;
 import com.objectstore.controller.repository.ObjectRepository.PatchOutcome;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -34,41 +31,33 @@ public class ObjectService {
     private final ChunkRepository chunks;
     private final ObjectViewAssembler views;
     private final MetadataValidator metadataValidator;
-    private final WorkerClient workers;
-    private final WorkerIo io;
-    private final ReplicaGuard guard;
+    private final ClusterState cluster;
+    private final SafeMode safeMode;
     private final Clock clock;
 
-    /** Objects with a delete in progress; a second mutating request for one of them is a conflict. */
-    private final Set<String> deleting = ConcurrentHashMap.newKeySet();
-
     public ObjectService(ObjectRepository objects, ChunkRepository chunks, ObjectViewAssembler views,
-                         MetadataValidator metadataValidator, WorkerClient workers, WorkerIo io, ReplicaGuard guard,
-                         Clock clock) {
+                         MetadataValidator metadataValidator, ClusterState cluster, SafeMode safeMode, Clock clock) {
         this.objects = objects;
         this.chunks = chunks;
         this.views = views;
         this.metadataValidator = metadataValidator;
-        this.workers = workers;
-        this.io = io;
-        this.guard = guard;
+        this.cluster = cluster;
+        this.safeMode = safeMode;
         this.clock = clock;
     }
 
-    /** System and custom metadata, including chunk locations. Reads the database only. */
+    /** System and custom metadata, including chunk locations. No worker is contacted. */
     public ObjectResponse getMetadata(String objectId) {
         return views.describe(find(objectId));
     }
 
     /**
-     * Adds, overwrites and removes custom metadata keys. Only the metadata tables are touched: the
-     * object's data, checksum and chunks are not read, moved or re-uploaded.
+     * Adds, overwrites and removes custom metadata keys in one transaction. Only the metadata
+     * tables are touched: the object's data, checksum and chunks are not read, moved or re-uploaded.
      */
     public ObjectResponse patchMetadata(String objectId, byte[] body) {
+        safeMode.requireWritable();
         MetadataValidator.Patch patch = metadataValidator.parseForPatch(body);
-        if (deleting.contains(objectId)) {
-            throw ApiException.conflict("object " + objectId + " is being deleted");
-        }
         PatchOutcome outcome = objects.patchMetadata(
                 objectId, patch.upserts(), patch.removals(), MetadataValidator.MAX_KEYS, clock.instant());
         switch (outcome) {
@@ -95,45 +84,32 @@ public class ObjectService {
     }
 
     /**
-     * Deletes an object and its stored data.
+     * Deletes an object (HDFS {@code delete} followed by {@code DNA_INVALIDATE}).
      *
-     * <p>Chunk files are deleted on every worker that is alive, then the object row is removed
-     * (which removes metadata, chunks and copy records with it). Copies on a worker that is
-     * currently DEAD cannot be reached; their files become orphans and are removed by the
-     * scrubber as soon as that worker returns.
-     *
-     * <p>Runs under the replica guard so that it cannot interleave with a repair of the same chunks.
+     * <p>In one synchronous block: the namespace row is deleted durably (cascading to metadata,
+     * chunks and idempotency key), then every known copy gets a DELETE command and the chunks
+     * are forgotten. The workers delete the files when they pick the commands up with their next
+     * heartbeat. Copies the controller does not know about (on a DEAD worker, or a DELETE lost
+     * with a heartbeat reply) become orphans, which the workers' block reports clean up.
      */
     public void delete(String objectId) {
-        find(objectId);
-        if (!deleting.add(objectId)) {
-            throw ApiException.conflict("object " + objectId + " is already being deleted");
-        }
-        try {
-            guard.run(() -> {
-                StoredObject object = find(objectId);
-                List<ReplicaLocation> reachable = chunks.findLocationsByObject(objectId).stream()
-                        .filter(location -> location.workerStatus() == WorkerStatus.ALIVE)
-                        .toList();
-                List<Boolean> removed = io.mapAll(reachable, this::deleteCopy);
-                objects.delete(objectId);
-                log.info("[api] deleted object={} name={} chunks={} files_removed={}", objectId, object.name(),
-                        object.chunkCount(), removed.stream().filter(Boolean::booleanValue).count());
-            });
-        } finally {
-            deleting.remove(objectId);
-        }
-    }
-
-    private boolean deleteCopy(ReplicaLocation location) {
-        try {
-            return workers.deleteChunk(location.workerUrl(), location.chunkId());
-        } catch (WorkerException e) {
-            // Best effort: the file is now an orphan and the scrubber will collect it.
-            log.warn("[api] could not delete chunk={} on worker={}: {}",
-                    location.chunkId(), location.workerId(), e.getMessage());
-            return false;
-        }
+        safeMode.requireWritable();
+        int queued = cluster.locked(() -> {
+            List<Chunk> chunkRows = chunks.findChunksByObject(objectId);
+            if (!objects.delete(objectId)) {
+                throw notFound(objectId);
+            }
+            int commands = 0;
+            for (Chunk chunk : chunkRows) {
+                for (String workerId : new ArrayList<>(cluster.replicasOf(chunk.chunkId()).keySet())) {
+                    cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunk.chunkId(), null, null, "object_deleted");
+                    commands++;
+                }
+                cluster.removeChunk(chunk.chunkId());
+            }
+            return commands;
+        });
+        log.info("[api] deleted object={}; {} DELETE commands queued", objectId, queued);
     }
 
     private StoredObject find(String objectId) {

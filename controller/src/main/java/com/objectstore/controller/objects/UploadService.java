@@ -5,15 +5,16 @@ import com.objectstore.common.ChunkIds;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.controller.cluster.ClusterState;
+import com.objectstore.controller.cluster.ClusterState.ReplicaState;
+import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
+import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.cluster.WorkerClient;
 import com.objectstore.controller.cluster.WorkerException;
-import com.objectstore.controller.cluster.WorkerRegistry;
 import com.objectstore.controller.config.ControllerProperties;
 import com.objectstore.controller.config.WorkerIo;
 import com.objectstore.controller.domain.Chunk;
-import com.objectstore.controller.domain.NewReplica;
 import com.objectstore.controller.domain.StoredObject;
-import com.objectstore.controller.domain.Worker;
 import com.objectstore.controller.repository.ObjectRepository;
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,7 +22,7 @@ import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,25 +30,26 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.MediaTypeFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 /**
- * The upload path: split the incoming byte stream into chunks, store every chunk on
- * REPLICATION_FACTOR different workers, then record the object.
+ * The upload path (HDFS {@code create}, the write pipeline with pipeline recovery, and
+ * {@code completeFile}).
  *
- * <p>Key properties:
  * <ul>
- *   <li><b>Constant memory.</b> At most one chunk is held in memory at a time, however large the
- *       object is.</li>
- *   <li><b>All or nothing.</b> The database is written once, at the very end, in a single
- *       transaction. If anything fails before that, every chunk copy already written is deleted
- *       again and nothing is recorded: a half-uploaded object can never be observed.</li>
- *   <li><b>End-to-end checksums.</b> Each chunk's SHA-256 travels with it and is re-verified by
- *       the worker before it touches the disk; the SHA-256 of the whole object is accumulated on
- *       the way through.</li>
+ *   <li><b>Constant memory.</b> At most one chunk is in memory at a time.</li>
+ *   <li><b>Pipeline recovery.</b> If a target fails a write (it may have died a moment ago and
+ *       not been declared dead yet), it is excluded for the rest of this upload and the next
+ *       worker on the ring takes its place.</li>
+ *   <li><b>All or nothing.</b> The namespace is written once, at the very end, in one durable
+ *       transaction, and only after every chunk is fsynced on two workers. A 201 therefore
+ *       survives a controller crash and the loss of any one worker. If the upload fails before
+ *       that, nothing is recorded and every copy written so far is deleted (best effort; whatever
+ *       is left is an orphan, which block reports clean up).</li>
  * </ul>
  */
 @Service
@@ -58,61 +60,79 @@ public class UploadService {
     private static final int MAX_CONTENT_TYPE_LENGTH = 255;
     private static final String DEFAULT_NAME = "unnamed";
 
-    /** A copy that was (or may have been) written to a worker during the current upload. */
-    private record WrittenCopy(Worker worker, String chunkId) {
+    /** A target worker, with the boot id it had when we wrote to it. */
+    private record Target(String workerId, String url, String bootId) {
+    }
+
+    /** A copy that was, or may have been, written during this upload. */
+    private record WrittenCopy(Target target, String chunkId) {
+    }
+
+    /** A chunk and the workers that confirmed writing it. */
+    private record StoredChunk(Chunk chunk, List<Target> holders) {
     }
 
     private final ControllerProperties properties;
     private final MetadataValidator metadataValidator;
-    private final WorkerRegistry registry;
+    private final ClusterState cluster;
+    private final SafeMode safeMode;
     private final PlacementPolicy placement;
     private final WorkerClient workers;
     private final WorkerIo io;
-    private final InFlightUploads inFlight;
     private final ObjectRepository objects;
     private final ObjectViewAssembler views;
     private final Clock clock;
 
-    public UploadService(ControllerProperties properties, MetadataValidator metadataValidator,
-                         WorkerRegistry registry, PlacementPolicy placement, WorkerClient workers, WorkerIo io,
-                         InFlightUploads inFlight, ObjectRepository objects, ObjectViewAssembler views, Clock clock) {
+    public UploadService(ControllerProperties properties, MetadataValidator metadataValidator, ClusterState cluster,
+                         SafeMode safeMode, PlacementPolicy placement, WorkerClient workers, WorkerIo io,
+                         ObjectRepository objects, ObjectViewAssembler views, Clock clock) {
         this.properties = properties;
         this.metadataValidator = metadataValidator;
-        this.registry = registry;
+        this.cluster = cluster;
+        this.safeMode = safeMode;
         this.placement = placement;
         this.workers = workers;
         this.io = io;
-        this.inFlight = inFlight;
         this.objects = objects;
         this.views = views;
         this.clock = clock;
     }
 
-    public ObjectResponse upload(MultipartFile file, String rawMetadata) {
-        // Validate everything that can be validated before a single byte is sent to a worker.
+    /**
+     * Checks that a write can be accepted at all, before the body is read: not in safe mode, and
+     * at least REPLICATION_FACTOR write-eligible workers.
+     */
+    public void checkWritable() {
+        safeMode.requireWritable();
+        int eligible = cluster.locked(() -> placement.writeEligibleWorkers().size());
+        if (eligible < properties.replicationFactor()) {
+            throw ApiException.unavailable(ErrorCodes.INSUFFICIENT_WORKERS,
+                    "%d storage worker(s) can accept writes but %d are required to store an object"
+                            .formatted(eligible, properties.replicationFactor()));
+        }
+    }
+
+    public ObjectResponse upload(MultipartFile file, String rawMetadata, String idempotencyKey) {
         Map<String, String> metadata = metadataValidator.parseForUpload(rawMetadata);
         String name = objectName(file.getOriginalFilename());
         String contentType = contentType(file.getContentType(), name);
-        requireEnoughWorkers(registry.aliveWorkers());
 
         String objectId = UUID.randomUUID().toString();
         long startedNanos = System.nanoTime();
         Set<WrittenCopy> attempted = ConcurrentHashMap.newKeySet();
+        Set<String> exclude = ConcurrentHashMap.newKeySet();
         boolean committed = false;
 
-        inFlight.begin(objectId);
+        cluster.locked(() -> cluster.beginUpload(objectId));
         try (InputStream in = file.getInputStream()) {
-            int chunkSize = properties.chunkSize();
             MessageDigest objectDigest = Checksums.newSha256();
-            List<Chunk> chunks = new ArrayList<>();
-            List<NewReplica> replicas = new ArrayList<>();
+            List<StoredChunk> stored = new ArrayList<>();
             long size = 0;
-
             byte[] piece;
             // readNBytes blocks until it has a full chunk or the stream ends, so only the final
             // piece can be shorter, and an input that is an exact multiple yields no empty piece.
-            while ((piece = in.readNBytes(chunkSize)).length > 0) {
-                int index = chunks.size();
+            while ((piece = in.readNBytes(properties.chunkSize())).length > 0) {
+                int index = stored.size();
                 if (index > ChunkIds.MAX_INDEX) {
                     throw ApiException.payloadTooLarge("an object can have at most " + (ChunkIds.MAX_INDEX + 1) + " chunks");
                 }
@@ -120,108 +140,136 @@ public class UploadService {
                 String checksum = Checksums.sha256Hex(piece);
                 objectDigest.update(piece);
                 size += piece.length;
-
-                for (Worker holder : storeChunk(objectId, index, chunkId, piece, checksum, attempted)) {
-                    replicas.add(new NewReplica(chunkId, holder.workerId()));
-                }
-                chunks.add(new Chunk(chunkId, objectId, index, piece.length, checksum));
+                List<Target> holders = storeChunk(objectId, index, chunkId, piece, checksum, exclude, attempted);
+                stored.add(new StoredChunk(new Chunk(chunkId, objectId, index, piece.length, checksum), holders));
             }
 
             Instant now = clock.instant();
-            StoredObject object = new StoredObject(
-                    objectId, name, size, contentType, Checksums.hex(objectDigest), chunks.size(), now, now);
-            objects.insert(object, metadata, chunks, replicas);
+            StoredObject object = new StoredObject(objectId, name, size, contentType, Checksums.hex(objectDigest),
+                    stored.size(), now, now);
+            commit(object, metadata, stored, idempotencyKey);
             committed = true;
-
-            log.info("[upload] object={} name={} size={} chunks={} ms={}",
-                    objectId, name, size, chunks.size(), (System.nanoTime() - startedNanos) / 1_000_000);
+            log.info("[upload] object={} name={} size={} chunks={} ms={}{}", objectId, name, size, stored.size(),
+                    (System.nanoTime() - startedNanos) / 1_000_000,
+                    exclude.isEmpty() ? "" : " (replaced failed targets " + exclude + ")");
             return views.describe(object);
         } catch (IOException e) {
-            throw new ApiException(org.springframework.http.HttpStatus.BAD_REQUEST, ErrorCodes.BAD_REQUEST,
+            throw new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.BAD_REQUEST,
                     "the uploaded file could not be read completely", e);
         } finally {
+            cluster.locked(() -> cluster.endUpload(objectId));
             if (!committed) {
-                rollBack(objectId, attempted);
+                cleanUp(objectId, attempted);
             }
-            // Only now may the scrubber treat unrecorded files of this object as orphans.
-            inFlight.end(objectId);
         }
     }
 
     /**
-     * Stores one chunk on REPLICATION_FACTOR different workers and returns the workers that have it.
-     *
-     * <p>The intended holders are written in parallel. If one of them fails (it may have died a
-     * moment ago and not been declared dead yet), the next worker on the ring is tried instead, so
-     * an upload survives a worker failing underneath it as long as enough workers remain.
+     * Commits the namespace and records the copies, as one synchronous block under the cluster
+     * lock: the durable transaction first, then the in-memory mirror. A copy whose worker died or
+     * restarted since the write is not recorded (it cannot be trusted to exist); the monitor then
+     * repairs that chunk like any other under-replicated one.
      */
-    private List<Worker> storeChunk(String objectId, int index, String chunkId, byte[] data, String checksum,
-                                    Set<WrittenCopy> attempted) {
-        int replicationFactor = properties.replicationFactor();
-        List<Worker> alive = registry.aliveWorkers();
-        requireEnoughWorkers(alive);
-        List<Worker> ring = placement.ringFor(alive, objectId, index);
+    private void commit(StoredObject object, Map<String, String> metadata, List<StoredChunk> stored, String idempotencyKey) {
+        cluster.locked(() -> {
+            objects.insert(object, metadata, stored.stream().map(StoredChunk::chunk).toList(), idempotencyKey);
+            int refused = 0;
+            for (StoredChunk entry : stored) {
+                Chunk chunk = entry.chunk();
+                cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(
+                        chunk.objectId(), chunk.index(), chunk.size(), chunk.checksum()));
+                for (Target holder : entry.holders()) {
+                    boolean confirmed = cluster.hasUploadReceipt(object.objectId(), chunk.chunkId(), holder.workerId());
+                    if (!cluster.addReplica(chunk.chunkId(), holder.workerId(), confirmed, ReplicaState.OK, holder.bootId())) {
+                        refused++;
+                    }
+                }
+            }
+            if (refused > 0) {
+                log.warn("[upload] object={}: {} copies not recorded because their worker died or restarted meanwhile; "
+                        + "the monitor will re-replicate", object.objectId(), refused);
+            }
+        });
+    }
 
-        List<Worker> intended = ring.subList(0, replicationFactor);
-        List<Boolean> outcomes = io.mapAll(intended, worker -> tryStore(worker, chunkId, data, checksum, attempted));
-        List<Worker> holders = new ArrayList<>(replicationFactor);
-        for (int i = 0; i < intended.size(); i++) {
-            if (outcomes.get(i)) {
-                holders.add(intended.get(i));
+    /**
+     * Stores one chunk on REPLICATION_FACTOR different workers. The intended holders are written
+     * in parallel; a failed target is excluded for the rest of the upload and the next one on the
+     * ring is tried instead.
+     */
+    private List<Target> storeChunk(String objectId, int index, String chunkId, byte[] data, String checksum,
+                                    Set<String> exclude, Set<WrittenCopy> attempted) {
+        int rf = properties.replicationFactor();
+        List<Target> ring = cluster.locked(() -> {
+            List<Target> targets = new ArrayList<>();
+            for (WorkerInfo worker : placement.ringForUpload(objectId, index, exclude)) {
+                targets.add(new Target(worker.workerId, worker.url, worker.bootId));
+            }
+            return targets;
+        });
+        List<Target> holders = new ArrayList<>(rf);
+        Set<String> tried = new HashSet<>();
+        int next = 0;
+        while (holders.size() < rf && next < ring.size()) {
+            List<Target> batch = new ArrayList<>();
+            while (batch.size() < rf - holders.size() && next < ring.size()) {
+                Target candidate = ring.get(next++);
+                if (!exclude.contains(candidate.workerId()) && tried.add(candidate.workerId())) {
+                    batch.add(candidate);
+                }
+            }
+            List<Boolean> outcomes = io.mapAll(batch, target -> tryStore(target, chunkId, data, checksum, attempted));
+            for (int i = 0; i < batch.size(); i++) {
+                if (Boolean.TRUE.equals(outcomes.get(i))) {
+                    holders.add(batch.get(i));
+                } else {
+                    exclude.add(batch.get(i).workerId());
+                }
             }
         }
-
-        Iterator<Worker> fallbacks = ring.subList(replicationFactor, ring.size()).iterator();
-        while (holders.size() < replicationFactor && fallbacks.hasNext()) {
-            Worker fallback = fallbacks.next();
-            if (tryStore(fallback, chunkId, data, checksum, attempted)) {
-                holders.add(fallback);
-            }
-        }
-
-        if (holders.size() < replicationFactor) {
+        if (holders.size() < rf) {
             throw ApiException.unavailable(ErrorCodes.UPLOAD_FAILED,
                     "chunk %d could be stored on only %d of the required %d workers; the upload was rolled back"
-                            .formatted(index, holders.size(), replicationFactor));
+                            .formatted(index, holders.size(), rf));
         }
         return holders;
     }
 
-    private boolean tryStore(Worker worker, String chunkId, byte[] data, String checksum, Set<WrittenCopy> attempted) {
+    private boolean tryStore(Target target, String chunkId, byte[] data, String checksum, Set<WrittenCopy> attempted) {
         // Recorded before the call: a write that timed out may still have reached the disk.
-        attempted.add(new WrittenCopy(worker, chunkId));
+        attempted.add(new WrittenCopy(target, chunkId));
         try {
-            workers.putChunk(worker.url(), chunkId, data, checksum);
+            workers.putChunk(target.url(), chunkId, data, checksum);
             return true;
         } catch (WorkerException e) {
-            log.warn("[upload] chunk={} worker={} write failed: {}", chunkId, worker.workerId(), e.getMessage());
+            log.warn("[upload] chunk={} worker={} write failed ({}); replacing it for this upload",
+                    chunkId, target.workerId(), e.getMessage());
+            cluster.locked(() -> {
+                WorkerInfo worker = cluster.worker(target.workerId());
+                if (worker != null) {
+                    worker.lastDataError = cluster.now();
+                }
+            });
             return false;
         }
     }
 
-    /** Compensation for a failed upload: remove every copy that was or may have been written. */
-    private void rollBack(String objectId, Set<WrittenCopy> attempted) {
+    /** A failed upload: delete every copy that was or may have been written. Fire and forget. */
+    private void cleanUp(String objectId, Set<WrittenCopy> attempted) {
         if (attempted.isEmpty()) {
             return;
         }
-        io.mapAll(attempted, copy -> {
-            try {
-                return workers.deleteChunk(copy.worker().url(), copy.chunkId());
-            } catch (WorkerException unreachable) {
-                // Best effort. Whatever cannot be deleted now is an orphan the scrubber removes later.
-                return false;
+        List<WrittenCopy> copies = List.copyOf(attempted);
+        io.execute(() -> {
+            for (WrittenCopy copy : copies) {
+                try {
+                    workers.deleteChunk(copy.target().url(), copy.chunkId());
+                } catch (WorkerException unreachable) {
+                    // An orphan now; block reports clean it up.
+                }
             }
         });
-        log.warn("[upload] failed object={}; rolled back {} chunk copies", objectId, attempted.size());
-    }
-
-    private void requireEnoughWorkers(List<Worker> alive) {
-        int replicationFactor = properties.replicationFactor();
-        if (alive.size() < replicationFactor) {
-            throw ApiException.unavailable(ErrorCodes.INSUFFICIENT_WORKERS,
-                    "%d storage worker(s) alive but %d are required to store an object"
-                            .formatted(alive.size(), replicationFactor));
-        }
+        log.warn("[upload] failed object={}; deleting {} chunk copies written so far", objectId, copies.size());
     }
 
     /** The uploaded file name without any client-side directory, or "unnamed". */

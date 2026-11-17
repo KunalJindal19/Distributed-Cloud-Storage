@@ -1,7 +1,6 @@
 package com.objectstore.controller.repository;
 
 import com.objectstore.controller.domain.Chunk;
-import com.objectstore.controller.domain.NewReplica;
 import com.objectstore.controller.domain.StoredObject;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -9,12 +8,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionOperations;
 
+/** The namespace: {@code objects}, {@code object_metadata} and {@code idempotency_keys}. */
 @Repository
 public class ObjectRepository {
 
@@ -30,6 +31,17 @@ public class ObjectRepository {
 
     public enum PatchOutcome { UPDATED, NOT_FOUND, TOO_MANY_KEYS }
 
+    /** The object an Idempotency-Key was first used for, and the size that was uploaded with it. */
+    public record IdempotentUpload(String key, String objectId, long size) {
+    }
+
+    /** Thrown when an insert loses the race for an Idempotency-Key. */
+    public static class IdempotencyConflictException extends RuntimeException {
+        public IdempotencyConflictException(String key) {
+            super("Idempotency-Key " + key + " was used concurrently");
+        }
+    }
+
     private final JdbcClient jdbc;
     private final JdbcOperations batch;
     private final TransactionOperations tx;
@@ -42,35 +54,47 @@ public class ObjectRepository {
 
     /**
      * Records a completely uploaded object in one transaction: the object, its custom metadata,
-     * its chunks and where every copy lives. Either all of it becomes visible or none of it.
+     * its chunks and, if given, the idempotency key. Either all of it becomes visible or none.
+     *
+     * @throws IdempotencyConflictException if another upload with the same key committed first
      */
-    public void insert(StoredObject object, Map<String, String> metadata, List<Chunk> chunks,
-                       List<NewReplica> replicas) {
-        tx.executeWithoutResult(status -> {
-            long createdAt = object.createdAt().toEpochMilli();
-            jdbc.sql("""
-                    INSERT INTO objects (object_id, name, size, content_type, checksum, chunk_count, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """)
-                    .params(object.objectId(), object.name(), object.size(), object.contentType(),
-                            object.checksum(), object.chunkCount(), createdAt, object.updatedAt().toEpochMilli())
-                    .update();
-            batch.batchUpdate(
-                    "INSERT INTO object_metadata (object_id, meta_key, meta_value) VALUES (?, ?, ?)",
-                    metadata.entrySet().stream()
-                            .map(e -> new Object[] {object.objectId(), e.getKey(), e.getValue()})
-                            .toList());
-            batch.batchUpdate(
-                    "INSERT INTO chunks (chunk_id, object_id, idx, size, checksum) VALUES (?, ?, ?, ?, ?)",
-                    chunks.stream()
-                            .map(c -> new Object[] {c.chunkId(), c.objectId(), c.index(), c.size(), c.checksum()})
-                            .toList());
-            batch.batchUpdate(
-                    "INSERT INTO chunk_replicas (chunk_id, worker_id, status, updated_at) VALUES (?, ?, 'OK', ?)",
-                    replicas.stream()
-                            .map(r -> new Object[] {r.chunkId(), r.workerId(), createdAt})
-                            .toList());
-        });
+    public void insert(StoredObject object, Map<String, String> metadata, List<Chunk> chunks, String idempotencyKey) {
+        try {
+            tx.executeWithoutResult(status -> {
+                long createdAt = object.createdAt().toEpochMilli();
+                jdbc.sql("""
+                        INSERT INTO objects (object_id, name, size, content_type, checksum, chunk_count, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """)
+                        .params(object.objectId(), object.name(), object.size(), object.contentType(),
+                                object.checksum(), object.chunkCount(), createdAt, object.updatedAt().toEpochMilli())
+                        .update();
+                batch.batchUpdate(
+                        "INSERT INTO object_metadata (object_id, meta_key, meta_value) VALUES (?, ?, ?)",
+                        metadata.entrySet().stream()
+                                .map(e -> new Object[] {object.objectId(), e.getKey(), e.getValue()})
+                                .toList());
+                batch.batchUpdate(
+                        "INSERT INTO chunks (chunk_id, object_id, idx, size, checksum) VALUES (?, ?, ?, ?, ?)",
+                        chunks.stream()
+                                .map(c -> new Object[] {c.chunkId(), c.objectId(), c.index(), c.size(), c.checksum()})
+                                .toList());
+                if (idempotencyKey != null) {
+                    jdbc.sql("INSERT INTO idempotency_keys (key, object_id, size, created_at) VALUES (?, ?, ?, ?)")
+                            .params(idempotencyKey, object.objectId(), object.size(), createdAt)
+                            .update();
+                }
+            });
+        } catch (DuplicateKeyException e) {
+            throw new IdempotencyConflictException(idempotencyKey);
+        }
+    }
+
+    public Optional<IdempotentUpload> findIdempotent(String key) {
+        return jdbc.sql("SELECT key, object_id, size FROM idempotency_keys WHERE key = ?")
+                .param(key)
+                .query((rs, rowNum) -> new IdempotentUpload(rs.getString("key"), rs.getString("object_id"), rs.getLong("size")))
+                .optional();
     }
 
     public Optional<StoredObject> findById(String objectId) {
@@ -92,6 +116,10 @@ public class ObjectRepository {
                 .params(limit, offset)
                 .query(OBJECT)
                 .list();
+    }
+
+    public List<String> allObjectIds() {
+        return jdbc.sql("SELECT object_id FROM objects").query(String.class).list();
     }
 
     /** Custom metadata of an object, sorted by key. */
@@ -142,7 +170,7 @@ public class ObjectRepository {
         });
     }
 
-    /** Deletes the object; its metadata, chunks and copy records go with it (ON DELETE CASCADE). */
+    /** Deletes the object; metadata, chunks and idempotency keys go with it (ON DELETE CASCADE). */
     public boolean delete(String objectId) {
         return jdbc.sql("DELETE FROM objects WHERE object_id = ?").param(objectId).update() > 0;
     }

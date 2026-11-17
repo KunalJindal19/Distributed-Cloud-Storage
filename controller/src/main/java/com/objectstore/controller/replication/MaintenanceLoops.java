@@ -1,6 +1,6 @@
 package com.objectstore.controller.replication;
 
-import com.objectstore.controller.cluster.WorkerRegistry;
+import com.objectstore.controller.cluster.Registry;
 import com.objectstore.controller.config.ControllerProperties;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -11,16 +11,15 @@ import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
 /**
- * The three background loops of the controller, each on its own thread:
+ * The controller's two background loops, each a plain "sleep, then one pass under the cluster
+ * lock" cycle on its own thread:
  *
  * <ul>
- *   <li><b>health monitor</b>, every HEALTH_INTERVAL: declares silent workers DEAD;</li>
- *   <li><b>repair</b>, every REPAIR_INTERVAL: restores the replication factor;</li>
- *   <li><b>scrub</b>, every SCRUB_INTERVAL: compares the workers' disks with the database.</li>
+ *   <li><b>health</b>, every HEALTH_INTERVAL: STALE and DEAD detection, with stall protection;</li>
+ *   <li><b>monitor</b>, every MONITOR_INTERVAL: safe mode, time-outs, replication, invariants.</li>
  * </ul>
  *
- * Each loop is a plain "run, then sleep" cycle, so a loop can never overlap itself and a slow
- * pass of one loop never delays another. A failing pass is logged and the loop carries on.
+ * A loop never overlaps itself, and a failing pass is logged and the loop carries on.
  */
 @Component
 public class MaintenanceLoops implements SmartLifecycle {
@@ -28,19 +27,15 @@ public class MaintenanceLoops implements SmartLifecycle {
     private static final Logger log = LoggerFactory.getLogger(MaintenanceLoops.class);
 
     private final ControllerProperties properties;
-    private final WorkerRegistry registry;
-    private final RepairService repair;
-    private final ScrubService scrub;
-
+    private final Registry registry;
+    private final Monitor monitor;
     private final List<Thread> threads = new ArrayList<>();
     private volatile boolean running;
 
-    public MaintenanceLoops(ControllerProperties properties, WorkerRegistry registry, RepairService repair,
-                            ScrubService scrub) {
+    public MaintenanceLoops(ControllerProperties properties, Registry registry, Monitor monitor) {
         this.properties = properties;
         this.registry = registry;
-        this.repair = repair;
-        this.scrub = scrub;
+        this.monitor = monitor;
     }
 
     @Override
@@ -49,12 +44,10 @@ public class MaintenanceLoops implements SmartLifecycle {
             return;
         }
         running = true;
-        threads.add(loop("health-monitor", properties.healthInterval(), registry::detectDeadWorkers));
-        threads.add(loop("repair-loop", properties.repairInterval(), repair::runOnce));
-        threads.add(loop("scrub-loop", properties.scrubInterval(), scrub::runOnce));
-        log.info("[api] background loops started: health every {}s, repair every {}s, scrub every {}s",
-                properties.healthIntervalSeconds(), properties.repairIntervalSeconds(),
-                properties.scrubIntervalSeconds());
+        threads.add(loop("health-loop", properties.healthInterval(), registry::healthPass));
+        threads.add(loop("monitor-loop", properties.monitorInterval(), monitor::tick));
+        log.info("[api] background loops started: health every {}s, monitor every {}s",
+                properties.healthIntervalSeconds(), properties.monitorIntervalSeconds());
     }
 
     @Override
@@ -70,7 +63,7 @@ public class MaintenanceLoops implements SmartLifecycle {
     }
 
     private Thread loop(String name, Duration interval, Runnable pass) {
-        return Thread.ofVirtual().name(name).start(() -> {
+        return Thread.ofPlatform().name(name).daemon(true).start(() -> {
             while (running) {
                 try {
                     Thread.sleep(interval);

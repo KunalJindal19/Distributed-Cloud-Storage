@@ -1,0 +1,18 @@
+# Fault injection for the chaos test: every internal call (controller <-> worker, worker -> worker)
+# is delayed up to 300 ms, lost 5 % of the time (half before sending, half after: a lost response)
+# and duplicated 5 % of the time. Use together with the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d --wait
+services:
+  controller:
+    environment: &faults
+      FAULT_DELAY_MS: "300"
+      FAULT_DROP_RATE: "0.05"
+      FAULT_DUP_RATE: "0.05"
+  worker1:
+    environment: *faults
+  worker2:
+    environment: *faults
+  worker3:
+    environment: *faults
+  worker4:
+    environment: *faults

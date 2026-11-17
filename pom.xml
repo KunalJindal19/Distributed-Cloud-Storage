@@ -24,6 +24,7 @@
         <module>worker</module>
         <module>controller</module>
         <module>client</module>
+        <module>system-tests</module>
     </modules>
 
     <properties>
@@ -37,6 +38,16 @@
             <dependency>
                 <groupId>com.objectstore</groupId>
                 <artifactId>common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.objectstore</groupId>
+                <artifactId>worker</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.objectstore</groupId>
+                <artifactId>controller</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>

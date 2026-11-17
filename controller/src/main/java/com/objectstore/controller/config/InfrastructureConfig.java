@@ -25,7 +25,8 @@ public class InfrastructureConfig {
      * <p>SQLite allows a single writer at a time. Rather than relying on lock time-outs between
      * competing connections, the pool holds exactly one connection, so every statement and
      * transaction is serialised in-process. This is safe because no transaction ever spans a
-     * network call: they all complete in well under a millisecond.
+     * network call: they all complete in well under a millisecond. {@code synchronous=FULL} makes
+     * a commit durable before it is acknowledged, so a 201 survives a crash.
      */
     @Bean(destroyMethod = "close")
     public HikariDataSource dataSource(ControllerProperties properties) throws IOException {

@@ -12,6 +12,7 @@ COPY common/pom.xml common/pom.xml
 COPY worker/pom.xml worker/pom.xml
 COPY controller/pom.xml controller/pom.xml
 COPY client/pom.xml client/pom.xml
+COPY system-tests/pom.xml system-tests/pom.xml
 COPY common/src common/src
 COPY worker/src worker/src
 COPY controller/src controller/src
@@ -19,7 +20,7 @@ COPY client/src client/src
 
 # Tests are run by "make test" (and in CI), not while building images.
 # The cache mount keeps downloaded dependencies between builds without baking them into a layer.
-RUN --mount=type=cache,target=/root/.m2 mvn -B -ntp -DskipTests package
+RUN --mount=type=cache,target=/root/.m2 mvn -B -ntp -DskipTests -pl common,worker,controller,client package
 
 # ---- runtime base: JRE, non-root user, /data owned by that user ---------------------------------
 FROM eclipse-temurin:21-jre AS runtime
@@ -35,7 +36,7 @@ ENV JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
 
 # ---- controller ---------------------------------------------------------------------------------
 FROM runtime AS controller
-COPY --from=build --chown=objectstore:objectstore /workspace/controller/target/controller.jar /app/app.jar
+COPY --from=build --chown=objectstore:objectstore /workspace/controller/target/controller-exec.jar /app/app.jar
 USER objectstore
 ENV PORT=8000
 EXPOSE 8000
@@ -46,7 +47,7 @@ ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
 
 # ---- worker -------------------------------------------------------------------------------------
 FROM runtime AS worker
-COPY --from=build --chown=objectstore:objectstore /workspace/worker/target/worker.jar /app/app.jar
+COPY --from=build --chown=objectstore:objectstore /workspace/worker/target/worker-exec.jar /app/app.jar
 USER objectstore
 # Each worker listens on its own port (8001-8004), set through the PORT variable in docker-compose.yml.
 ENV PORT=8001

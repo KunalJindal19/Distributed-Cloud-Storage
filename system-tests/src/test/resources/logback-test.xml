@@ -1,0 +1,16 @@
+<configuration>
+    <!-- One line per event, tagged with the thread so controller and worker lines can be told apart. -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%-14.14thread] %msg%n</pattern>
+        </encoder>
+    </appender>
+    <logger name="org.springframework" level="WARN"/>
+    <logger name="org.apache" level="WARN"/>
+    <logger name="org.flywaydb" level="WARN"/>
+    <logger name="com.zaxxer" level="WARN"/>
+    <logger name="org.hibernate.validator" level="WARN"/>
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

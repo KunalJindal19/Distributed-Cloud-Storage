@@ -1,0 +1,50 @@
+# Every operational setting comes from an environment variable (see README "Configuration").
+spring:
+  application:
+    name: objectstore-worker
+  main:
+    banner-mode: "off"
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 3s
+  autoconfigure:
+    # A worker has no database. These only matter when the controller's jars share the classpath
+    # (the in-process system tests); in a worker container the classes do not exist.
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceTransactionManagerAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.JdbcTemplateAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.JdbcClientAutoConfiguration
+      - org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration
+
+server:
+  port: ${PORT:8001}
+  shutdown: graceful
+
+worker:
+  id: ${WORKER_ID}
+  data-dir: ${DATA_DIR:/data}
+  controller-url: ${CONTROLLER_URL:http://controller:8000}
+  advertise-url: ${ADVERTISE_URL:}
+  max-chunk-size: ${CHUNK_SIZE:1048576}
+  heartbeat-interval-seconds: ${HEARTBEAT_INTERVAL:2}
+  heartbeat-http-timeout-seconds: ${HEARTBEAT_HTTP_TIMEOUT:3}
+  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:30}
+  ibr-interval-seconds: ${IBR_INTERVAL:0.5}
+  ibr-buffer-max: ${IBR_BUFFER_MAX:10000}
+  scan-interval-seconds: ${SCAN_INTERVAL:10}
+  disk-check-interval-seconds: ${DISK_CHECK_INTERVAL:30}
+  connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
+  read-timeout-seconds: ${READ_TIMEOUT:10}
+  background-enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL:INFO}
+    org.springframework: WARN
+    org.apache: WARN
+    org.hibernate.validator: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level %msg%n"

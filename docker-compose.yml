@@ -1,17 +1,25 @@
-# Mini Distributed Cloud Object Store
+# Mini Distributed Cloud Object Store, HDFS-style
 #
-#   1 controller  - the only service published to the host (port 8000)
-#   4 workers     - reachable only inside the private network, one persistent volume each
+#   1 controller  - the NameNode: namespace on disk, block map in memory; port 8000 is the only
+#                   one published to the host
+#   4 workers     - DataNodes: one persistent volume each, reachable only inside the network
 #   1 client      - a ready-to-use CLI container (curl, jq and the oscli command)
 #
-# Start:  docker compose up --build -d        (or: make up)
-# Stop:   docker compose down                 (data is kept; add -v to wipe it)
+# Start:  docker compose up --build -d --wait    (or: make up)
+# Stop:   docker compose down                    (data is kept; add -v to wipe it)
+# Chaos:  docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d   (fault injection on)
 
 name: objectstore
 
-# Everything the four workers have in common. No shared "image:" name on purpose: the services
-# are built in parallel, and four builds exporting to one tag race with each other. Each service
-# gets its own tag instead (objectstore-worker1 ...); the layers are identical and built once.
+# Settings shared by every service. Fault injection is off unless the chaos override sets it.
+x-common-environment: &common-environment
+  CONNECT_TIMEOUT: "2"
+  READ_TIMEOUT: "10"
+  LOG_LEVEL: INFO
+  FAULT_DELAY_MS: "0"
+  FAULT_DROP_RATE: "0"
+  FAULT_DUP_RATE: "0"
+
 x-worker: &worker
   build:
     context: .
@@ -19,21 +27,29 @@ x-worker: &worker
   depends_on:
     controller:
       condition: service_healthy
+  # A crashed worker comes back by itself; "docker stop" still keeps it stopped (for the demo).
+  restart: unless-stopped
+  stop_grace_period: 5s
   healthcheck:
     test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health > /dev/null || exit 1"]
     interval: 3s
     timeout: 3s
     retries: 20
     start_period: 20s
-  stop_grace_period: 10s
   networks: [objectstore-net]
 
 x-worker-environment: &worker-environment
+  <<: *common-environment
   CONTROLLER_URL: http://controller:8000
   DATA_DIR: /data
-  HEARTBEAT_INTERVAL: "2"
   CHUNK_SIZE: "1048576"
-  LOG_LEVEL: INFO
+  HEARTBEAT_INTERVAL: "2"          # lifeline period (s)
+  HEARTBEAT_HTTP_TIMEOUT: "3"      # must stay below STALE_AFTER
+  FULL_REPORT_INTERVAL: "30"       # full block report period (s)
+  IBR_INTERVAL: "0.5"              # incremental block report flush period (s)
+  IBR_BUFFER_MAX: "10000"          # on overflow: drop the buffer, send a full report
+  SCAN_INTERVAL: "10"              # block scanner period (s)
+  DISK_CHECK_INTERVAL: "30"        # volume probe period (s)
 
 services:
   controller:
@@ -43,21 +59,35 @@ services:
     image: objectstore-controller:1.0.0
     container_name: controller
     hostname: controller
+    restart: unless-stopped
+    stop_grace_period: 5s
     ports:
       - "${CONTROLLER_PORT:-8000}:8000"
     environment:
+      <<: *common-environment
       PORT: "8000"
       DB_PATH: /data/meta.db
-      CHUNK_SIZE: "1048576"        # 1 MB chunks
-      REPLICATION_FACTOR: "2"      # two copies of every chunk
-      HEARTBEAT_TIMEOUT: "6"       # a worker is DEAD after 6 s of silence
+      CHUNK_SIZE: "1048576"          # 1 MB chunks
+      REPLICATION_FACTOR: "2"        # two copies of every chunk
+      STALE_AFTER: "6"               # silence -> STALE (avoided, copies still count)
+      DEAD_AFTER: "12"               # silence -> DEAD (copies forgotten and re-replicated)
+      STALE_RATIO: "0.5"             # above this fraction of STALE workers, write to them anyway
       HEALTH_INTERVAL: "1"
-      STARTUP_GRACE: "20"          # after a controller start, wait this long before declaring anyone dead
-      REPAIR_INTERVAL: "10"
-      SCRUB_INTERVAL: "15"
-      WORKER_TIMEOUT_S: "10"
-      REPAIR_CONCURRENCY: "4"
-      LOG_LEVEL: INFO
+      MONITOR_INTERVAL: "3"          # replication monitor period
+      PENDING_TIMEOUT: "15"          # an unconfirmed copy or DELETE is retried after this
+      TARGET_BACKOFF: "30"           # avoid a (chunk, target) pair for this long after a failed copy
+      MAX_STREAMS: "2"               # in-flight copies per source worker
+      COMMAND_TTL: "30"              # workers drop commands older than this
+      MAX_COMMANDS_PER_WORKER: "1000"
+      MAX_MESSAGE_AGE: "10"          # reject worker messages sent longer ago than this
+      SAFE_MODE_THRESHOLD: "0.999"
+      SAFE_MODE_EXTENSION: "5"
+      SAFE_MODE_TIMEOUT: "30"
+      ORPHAN_GC_DELAY: "60"          # no orphan deletion during the first minute after a start
+      ORPHAN_GC_MAX_FRACTION: "0.5"
+      MIN_FREE_BYTES: "16777216"
+      FULL_REPORT_INTERVAL: "30"     # as configured on the workers
+      INVARIANT_CHECKS: "1"
     volumes:
       - controller_data:/data
     healthcheck:
@@ -66,7 +96,6 @@ services:
       timeout: 3s
       retries: 20
       start_period: 20s
-    stop_grace_period: 10s
     networks: [objectstore-net]
 
   # The four workers are identical; only the id, the port and the volume differ.
@@ -125,6 +154,8 @@ services:
     container_name: client
     hostname: client
     init: true
+    restart: unless-stopped
+    stop_grace_period: 5s
     depends_on:
       controller:
         condition: service_healthy
@@ -133,7 +164,6 @@ services:
     volumes:
       - .:/work
     working_dir: /work
-    stop_grace_period: 2s
     networks: [objectstore-net]
 
 volumes:

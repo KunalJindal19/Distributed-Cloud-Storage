@@ -3,12 +3,13 @@ package com.objectstore.controller.api;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.controller.api.dto.ObjectListResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.domain.StoredObject;
 import com.objectstore.controller.objects.DownloadService;
 import com.objectstore.controller.objects.DownloadService.DownloadPlan;
-import com.objectstore.controller.objects.DownloadService.PlannedChunk;
 import com.objectstore.controller.objects.ObjectService;
 import com.objectstore.controller.objects.UploadService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -26,9 +27,9 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.multipart.MultipartHttpServletRequest;
 
 /**
  * The client-facing REST API: the six endpoints under {@code /api/v1/objects}.
@@ -57,13 +58,20 @@ public class ObjectsController {
      * Upload an object. multipart/form-data with a required {@code file} part and an optional
      * {@code metadata} field holding a JSON object of custom key/value pairs.
      *
-     * @return 201 with the new object's id, system metadata, custom metadata and chunk locations
+     * <p>Multipart parsing is lazy: safe mode and the number of writable workers are checked
+     * before the request body is read.
      */
     @PostMapping
-    public ResponseEntity<ObjectResponse> upload(
-            @RequestPart("file") MultipartFile file,
-            @RequestParam(value = "metadata", required = false) String metadata) {
-        ObjectResponse created = uploads.upload(file, metadata);
+    public ResponseEntity<ObjectResponse> upload(HttpServletRequest request) {
+        uploads.checkWritable();
+        if (!(request instanceof MultipartHttpServletRequest multipart)) {
+            throw ApiException.badRequest("expected a multipart/form-data request with a 'file' part");
+        }
+        MultipartFile file = multipart.getFile("file");
+        if (file == null) {
+            throw ApiException.badRequest("the multipart request has no 'file' part");
+        }
+        ObjectResponse created = uploads.upload(file, multipart.getParameter("metadata"), null);
         return ResponseEntity.created(URI.create("/api/v1/objects/" + created.objectId())).body(created);
     }
 
@@ -77,18 +85,15 @@ public class ObjectsController {
 
     /**
      * Download an object: the complete original bytes with the content type it was uploaded with.
-     *
-     * <p>Chunks are fetched and verified one at a time and written straight to the response, so
-     * memory use does not depend on the object's size. Everything that can fail cleanly (unknown
-     * id, a chunk without any readable copy) is checked before the response is committed, so
-     * those cases produce a proper 404 / 503 JSON error rather than a broken download.
+     * Chunks are fetched, verified and written one at a time. Everything that can fail cleanly
+     * is checked before the response is committed, so those cases are proper JSON errors.
      */
     @GetMapping("/{objectId}")
     public void download(@PathVariable String objectId, HttpServletResponse response) throws IOException {
         long startedNanos = System.nanoTime();
         DownloadPlan plan = downloads.plan(objectId);
         StoredObject object = plan.object();
-        List<PlannedChunk> chunks = plan.chunks();
+        List<Chunk> chunks = plan.chunks();
 
         // Fetch the first chunk before any header is set: a failure here is still a clean 503.
         byte[] first = chunks.isEmpty() ? null : downloads.fetchVerified(chunks.get(0));
@@ -110,10 +115,9 @@ public class ObjectsController {
             try {
                 data = downloads.fetchVerified(chunks.get(i));
             } catch (ApiException e) {
-                // Headers and earlier chunks are already on the wire. The exception makes the
-                // container drop the connection, so the client sees an incomplete transfer
-                // (fewer bytes than Content-Length), never a silently truncated "success".
-                log.error("[download] aborted object={} chunk={}", objectId, chunks.get(i).chunk().chunkId());
+                // Headers and earlier chunks are on the wire. Dropping the connection makes the
+                // client see fewer bytes than Content-Length, never a silently truncated success.
+                log.error("[download] aborted object={} chunk={}", objectId, chunks.get(i).chunkId());
                 throw e;
             }
             out.write(data);
@@ -129,10 +133,7 @@ public class ObjectsController {
         return objects.getMetadata(objectId);
     }
 
-    /**
-     * Add or update custom metadata. The body is a JSON object; a string value sets a key, a
-     * {@code null} value removes it. The object's data is not touched.
-     */
+    /** Add or update custom metadata; a {@code null} value removes a key. The data is not touched. */
     @PatchMapping("/{objectId}/metadata")
     public ObjectResponse patchMetadata(@PathVariable String objectId, @RequestBody(required = false) byte[] body) {
         return objects.patchMetadata(objectId, body);

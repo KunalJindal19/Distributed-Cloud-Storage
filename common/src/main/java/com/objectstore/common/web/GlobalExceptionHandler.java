@@ -55,7 +55,9 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         if (ex.status().is5xxServerError()) {
             log.warn("[api] {} {}: {}", ex.status().value(), ex.code(), ex.getMessage());
         }
-        return json(ex.status(), new HttpHeaders(), new ApiError(ex.code(), ex.getMessage()));
+        HttpHeaders headers = new HttpHeaders();
+        ex.headers().forEach(headers::add);
+        return json(ex.status(), headers, new ApiError(ex.code(), ex.getMessage()));
     }
 
     @ExceptionHandler(ConstraintViolationException.class)

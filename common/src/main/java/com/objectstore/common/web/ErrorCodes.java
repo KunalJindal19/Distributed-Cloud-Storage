@@ -20,6 +20,16 @@ public final class ErrorCodes {
     public static final String UPLOAD_FAILED = "upload_failed";
     public static final String CHUNK_UNAVAILABLE = "chunk_unavailable";
     public static final String SERVICE_UNAVAILABLE = "service_unavailable";
+    public static final String SAFE_MODE = "safe_mode";
+    public static final String INSUFFICIENT_STORAGE = "insufficient_storage";
+    public static final String CHUNK_CORRUPT = "chunk_corrupt";
+
+    // Controller answers to worker messages (see the protocol acceptance rules).
+    public static final String STALE_BOOT = "stale_boot";
+    public static final String TOO_OLD = "too_old";
+    public static final String STALE_SEQ = "stale_seq";
+    public static final String CLUSTER_ID_MISMATCH = "cluster_id_mismatch";
+    public static final String DUPLICATE_WORKER = "duplicate_worker";
 
     private ErrorCodes() {
     }
@@ -33,6 +43,7 @@ public final class ErrorCodes {
             case 409 -> CONFLICT;
             case 413 -> PAYLOAD_TOO_LARGE;
             case 415 -> UNSUPPORTED_MEDIA_TYPE;
+            case 507 -> INSUFFICIENT_STORAGE;
             case 503 -> SERVICE_UNAVAILABLE;
             default -> status >= 500 ? INTERNAL_ERROR : BAD_REQUEST;
         };
