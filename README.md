@@ -1,34 +1,41 @@
 # Mini Distributed Cloud Object Store
 
-A small S3-like object store. Clients upload arbitrary binary objects (documents, images, video,
-audio, archives, anything) to a single **controller**, which splits them into **1 MB chunks** and
-stores **two copies of every chunk on different storage workers**. The controller detects worker
-failures and corrupted data, keeps serving objects from the remaining good copies, and restores
-the replication factor on its own.
+A small S3-like object store built as a faithful, miniature re-creation of **HDFS**. Clients upload
+arbitrary binary objects (documents, images, video, audio, archives, anything) to a single
+**controller** (the NameNode), which splits them into **1 MB chunks** (blocks) and stores **two
+copies of every chunk on different storage workers** (DataNodes). Like HDFS, the controller keeps
+only the namespace on disk; where every copy lives is held in memory and rebuilt from the workers'
+block reports. It detects dead, stale, partitioned and restarted workers and corrupted data, keeps
+serving objects from good copies, has workers copy chunks directly to each other to restore the
+replication factor, and survives its own crash at any instruction.
 
 | | |
 |---|---|
-| Controller nodes | 1 |
-| Storage / worker nodes | 4, each with its own persistent Docker volume |
+| Controller nodes | 1 (the NameNode) |
+| Storage / worker nodes | 4 (DataNodes), each with its own persistent Docker volume |
 | Clients | 1 or more: `curl`, the bundled `oscli` CLI (also runs as a container), a browser dashboard |
 | Chunk size | 1 MB (1,048,576 bytes) |
 | Replication factor | 2, copies always on different workers |
-| Deployment | Docker Compose (no Kubernetes) |
-| Stack | Java 21, Spring Boot 4.1, Maven, SQLite (controller metadata) |
+| Deployment | Docker Compose (no Kubernetes); every service restarts by itself after a crash |
+| Stack | Java 21, Spring Boot 4.1, Maven, SQLite (controller namespace) |
 
 **Contents:**
 [Quick start](#quick-start) ·
 [Architecture](#architecture) ·
+[HDFS mapping](#what-is-re-created-from-hdfs) ·
 [Using the system](#using-the-system) ·
 [Client REST API](#client-rest-api) ·
-[Internal worker APIs](#internal-worker-apis) ·
+[Worker protocol](#the-worker-protocol) ·
 [Configuration](#configuration) ·
 [Demonstrations](#demonstrations) ·
 [How it works](#how-it-works) ·
-[Requirements traceability](#requirements-traceability) ·
+[Failure model](#failure-model) ·
+[Edge cases](#edge-case-catalogue) ·
+[Guarantees and limits](#guarantees-and-limits) ·
 [Testing](#testing) ·
-[Design decisions](#design-decisions) ·
-[Limitations](#limitations) ·
+[Requirements traceability](#requirements-traceability) ·
+[Decisions](#decisions) ·
+[Future work](#future-work) ·
 [Repository layout](#repository-layout) ·
 [Troubleshooting](#troubleshooting)
 
@@ -36,13 +43,13 @@ the replication factor on its own.
 
 ## Quick start
 
-**Prerequisites:** Docker Engine or Docker Desktop with Compose v2, plus `bash`, `curl` and `make`.
-`jq` is recommended for reading JSON (the demo script falls back to the copy inside the client
-container if you do not have it). A JDK is **not** needed: everything is built inside Docker.
+**Prerequisites:** Docker Engine or Docker Desktop with Compose v2, plus `bash`, `curl`, `make` and
+`jq`. A JDK is **not** needed: everything is built inside Docker. (Python 3 is needed only for the
+chaos test.)
 
 ```bash
 make up          # build the images, start 6 containers, wait until all are healthy
-make demo        # run the six required demonstrations; ends with "6/6 PASS"
+make demo        # run the seven demonstrations; ends with "7/7 PASS"
 ```
 
 Then open the dashboard at <http://localhost:8000/dashboard>, or store something yourself:
@@ -51,36 +58,23 @@ Then open the dashboard at <http://localhost:8000/dashboard>, or store something
 ./oscli upload samples/sample.jpg --meta owner=alice     # prints the new object, including its id
 ./oscli where  <object-id>                               # which workers hold which chunk
 ./oscli download <object-id> .demo/copy.jpg              # verifies the checksum while downloading
+make fsck                                                # end-to-end consistency check
 ```
 
 | Command | What it does |
 |---|---|
 | `make up` | `docker compose up --build -d --wait`, then prints the container table |
-| `make down` | stop and remove the containers; **all data is kept** in the volumes |
-| `make down-v` | stop and wipe everything, including stored objects |
-| `make ps` / `make logs` / `make status` | container table / follow all logs / cluster status JSON |
-| `make stop W=worker2` / `make start W=worker2` | simulate a worker failure / bring it back |
+| `make down` / `make down-v` | stop the containers keeping all data / wiping all data |
+| `make ps` / `make logs` / `make status` / `make fsck` | container table / all logs / cluster status JSON / fsck |
+| `make stop W=worker2` / `make start W=worker2` | stop a worker (it goes STALE, then DEAD) / bring it back |
+| `make pause W=worker2` / `make unpause W=worker2` | freeze a worker (STALE only, if short) |
 | `make corrupt W=worker3 C=<chunk_id>` | overwrite 4 bytes inside a stored chunk file |
-| `make demo` | the six required demonstrations, self-checking |
-| `make test` | all unit and integration tests (uses local Maven, or a Maven container) |
+| `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
+| `make test` | 145 unit and in-process system tests (local Maven, or a Maven container) |
+| `make scenarios` | the acceptance-criteria scripts against Docker (about 15 minutes; wipes data) |
+| `make chaos` | the chaos test: 5 minutes of load and disruption with network faults, then convergence checks |
 
-Without `make`: `docker compose up --build -d --wait`, `./demo.sh`, `docker compose down`.
 If port 8000 is taken: `CONTROLLER_PORT=9000 make up` and `BASE=http://localhost:9000 make demo`.
-
-After `make up`, `docker compose ps` shows:
-
-```text
-NAME         SERVICE      STATUS                    PORTS
-client       client       Up 5 seconds
-controller   controller   Up 11 seconds (healthy)   0.0.0.0:8000->8000/tcp
-worker1      worker1      Up 5 seconds (healthy)
-worker2      worker2      Up 5 seconds (healthy)
-worker3      worker3      Up 5 seconds (healthy)
-worker4      worker4      Up 5 seconds (healthy)
-```
-
-Only the controller is published to the host. The workers are reachable solely inside the private
-Docker network, which is what guarantees that a client can only ever go through the controller.
 
 ---
 
@@ -89,50 +83,89 @@ Docker network, which is what guarantees that a client can only ever go through 
 ```mermaid
 flowchart LR
     subgraph host["Your machine"]
-        C1["curl"]
-        C2["oscli (CLI)"]
-        C3["browser: /dashboard"]
+        C1["curl / oscli / browser"]
     end
 
     subgraph net["Docker network objectstore-net"]
-        CL["client container<br/>oscli, curl, jq"]
-        subgraph ctrl["controller :8000 — the only published port"]
-            API["REST API<br/>/api/v1/objects"]
-            UP["chunker + placement"]
-            REG["worker registry<br/>health monitor (1 s)"]
-            REP["repair loop (10 s)"]
-            SCR["scrubber (15 s)"]
-            DB[("SQLite metadata<br/>volume: controller_data")]
+        subgraph ctrl["controller :8000 (NameNode) - the only published port"]
+            API["public REST API"]
+            NS[("namespace: SQLite<br/>objects, metadata, chunks,<br/>cluster id, idempotency keys")]
+            MEM["in memory, under one lock:<br/>workers, block map, pending copies,<br/>command queues, safe mode"]
+            LOOPS["health loop (1 s)<br/>replication monitor (3 s)"]
         end
-        W1["worker1 :8001<br/>volume: worker1_data"]
-        W2["worker2 :8002<br/>volume: worker2_data"]
-        W3["worker3 :8003<br/>volume: worker3_data"]
-        W4["worker4 :8004<br/>volume: worker4_data"]
+        W1["worker1 :8001<br/>chunks + .meta, VERSION"]
+        W2["worker2 :8002"]
+        W3["worker3 :8003"]
+        W4["worker4 :8004"]
     end
 
-    C1 & C2 & C3 -->|"HTTP, public API"| API
-    CL -->|"HTTP, public API"| API
-    ctrl -->|"PUT / GET / DELETE chunk, list chunks"| W1 & W2 & W3 & W4
-    W1 & W2 & W3 & W4 -.->|"register, heartbeat every 2 s"| REG
+    C1 -->|HTTP| API
+    ctrl -->|"upload / download / fsck:<br/>PUT, GET, list chunks"| W1 & W2 & W3 & W4
+    W1 & W2 & W3 & W4 -.->|"register, heartbeat (2 s),<br/>full block report (30 s),<br/>incremental reports (0.5 s)"| ctrl
+    ctrl -.->|"commands in heartbeat replies:<br/>REPLICATE, DELETE"| W1 & W2 & W3 & W4
+    W1 ==>|"REPLICATE: copy straight to another worker"| W3
 ```
 
-**The controller is the only component that thinks.** It receives uploads, cuts them into chunks,
-decides which workers hold each chunk, remembers everything in its metadata database, reassembles
-objects on download, watches the workers, and repairs what breaks.
+**The controller decides; workers act.** The controller keeps the namespace (which objects exist,
+their metadata, which chunks they consist of) durably in SQLite. Everything about *where* copies
+are and *how healthy* workers are lives in memory and is rebuilt from what the workers report,
+exactly like the HDFS NameNode's block map. Repairs and deletions are commands the controller hands
+out in heartbeat replies; workers execute them, copying chunks **directly to each other**.
 
-**A worker is deliberately dumb.** It stores a chunk, returns it, deletes it, and lists what is on
-its disk. It does not know what an object is, which other workers exist, or how many copies there
-are. All the logic that has to be right lives in exactly one place.
-
-**Workers never talk to each other.** A repair copy travels worker → controller → worker, so the
-internal protocol is just the six endpoints the assignment specifies.
+**Workers are DataNodes.** Each stores chunk files with a `.meta` sidecar holding the checksum,
+verifies every chunk it serves, scans its disk for silent corruption, checks that its volume is
+writable, and tells the controller about every change over an ordered, acknowledged report channel.
+It knows nothing about objects.
 
 | Module | What it is |
 |---|---|
-| [`common/`](common) | The wire contract shared by controller and workers: DTOs, SHA-256 helpers, chunk-id format, uniform JSON error handling |
-| [`worker/`](worker) | Spring Boot service: chunk store on a volume, the chunk endpoints, register + heartbeat loop |
-| [`controller/`](controller) | Spring Boot service: public API, chunking, placement, metadata DB, failure detection, repair, scrubbing, dashboard |
-| [`client/`](client) | `oscli`, a plain-Java command-line client for the public API |
+| [`common/`](common) | The wire contract: protocol messages, SHA-256 and chunk-id helpers, JSON error handling, fault-injecting HTTP clients |
+| [`worker/`](worker) | The DataNode: chunk store with sidecars, reporter, heartbeat lifeline, command executor, block scanner, disk check |
+| [`controller/`](controller) | The NameNode: public API, namespace, cluster state, registry, block reports, replication monitor, safe mode, fsck, dashboard |
+| [`client/`](client) | `oscli`, a command-line client with idempotent, retrying uploads |
+| [`system-tests/`](system-tests) | The real controller and four real workers in one JVM, for end-to-end tests |
+| [`tests/`](tests) | Docker scenario scripts per acceptance-criteria block, and the chaos test |
+
+---
+
+## What is re-created from HDFS
+
+| HDFS | Here |
+|---|---|
+| NameNode persists the namespace (fsimage + edit log) | SQLite (WAL, `synchronous=FULL`): `objects`, `object_metadata`, `chunks`, `idempotency_keys`, `cluster_meta`, plus `upload_intents` and `deleted_objects` (see [orphans](#orphans-and-the-safety-valve)) |
+| NameNode keeps block locations and DataNode state **in memory**, rebuilt from reports | [`ClusterState`](controller/src/main/java/com/objectstore/controller/cluster/ClusterState.java): workers, block map and its reverse index, pending copies, command queues |
+| `clusterID` in each DataNode's `VERSION` file; mismatched DataNodes are refused | `cluster_id` in `cluster_meta` and in `/data/VERSION` on each worker |
+| DataNode registration; the NameNode tells unknown or dead DataNodes to re-register (`DNA_REGISTER`) | `POST /internal/workers/register`; other messages answer 404 `unknown_worker` and the worker re-registers |
+| Heartbeats with statistics on a separate lifeline that never queues behind reports | the worker's heartbeat runs on its own thread and HTTP client |
+| Stale DataNode: avoided for reads and writes, replicas still count | `STALE` after 6 s of silence |
+| Stale ratio: if more than half are stale, stop avoiding them for writes | `STALE_RATIO = 0.5` |
+| Dead DataNode: its replicas leave the block map | `DEAD` after 12 s of silence |
+| Full block report + incremental block reports (IBR), processed in order | full report every 30 s and after registering, IBR every 0.5 s, on one ordered, acknowledged channel per worker (sequence numbers) |
+| `.meta` checksum file per block; DataNode verifies on read and transfer | `<chunk_id>.meta`; the worker verifies on GET and before every REPLICATE |
+| DataNode block scanner; `reportBadBlocks` | worker scanner every 10 s; the controller also marks a copy corrupt when a read proves it bad |
+| Disk checker; the DataNode shuts down on volume failure | worker disk check every 30 s; on failure the process exits, goes DEAD and is repaired |
+| RedundancyMonitor with priority by replica count | replication monitor every 3 s, chunks with the fewest live copies first |
+| PendingReconstructionBlocks with a time-out | pending copies, 15 s time-out, then retried with another target |
+| `DNA_TRANSFER`: DataNode copies directly to DataNode | `REPLICATE` command in the heartbeat reply; the worker PUTs to the target worker |
+| `DNA_INVALIDATE` | `DELETE` command |
+| `max-streams` per DataNode | `MAX_STREAMS = 2` copies in flight per source |
+| Excess replicas trimmed, postponed while replicas sit on stale nodes | `EXCESS` state; postponed while any holder is STALE or its copy unconfirmed |
+| A corrupt replica is deleted only after a good one is restored | a `CORRUPT` copy is deleted only once RF live copies exist |
+| Safe mode: read-only until 99.9 % of blocks are reported, plus an extension | `SAFE_MODE_THRESHOLD = 0.999`, `SAFE_MODE_EXTENSION = 5 s`, `SAFE_MODE_TIMEOUT = 30 s` |
+| Start-up delay before deleting blocks | no orphan deletion during the first `ORPHAN_GC_DELAY = 60 s` after a controller start |
+| Write-pipeline recovery: replace a failed DataNode mid-write | an upload replaces a failed target and retries that chunk |
+| `completeFile` only after blocks reach minimum replication | 201 only after both copies are fsynced **and** the namespace commit is durable |
+| `hdfs fsck` | `GET /api/v1/fsck` |
+
+**Deliberately not re-created**
+
+| HDFS feature | Why not |
+|---|---|
+| Rack awareness | One host, one "rack". |
+| Client → DN1 → DN2 write pipeline | The assignment requires that clients never see workers. The controller acts as the HDFS client and writes both copies in parallel. |
+| Generation stamps, leases, append | Chunks are **immutable and never reused** (ids embed a fresh UUID), so stale versions and competing writers cannot occur. |
+| NameNode high availability (standby, journal nodes, ZooKeeper failover) | The assignment fixes one controller. We guarantee no loss and automatic recovery, not availability while it is down. |
+| Balancer, erasure coding, storage policies, security | Out of scope. |
 
 ---
 
@@ -140,15 +173,15 @@ internal protocol is just the six endpoints the assignment specifies.
 
 ### With the CLI
 
-`./oscli` runs the client. By default it executes inside the `client` container (so you need
-nothing but Docker); the project directory is mounted there, so **file arguments must be paths
-inside this directory**. Use `OSCLI_MODE=local ./oscli …` to run it with a local JVM instead
-(after `mvn -pl client -am package -DskipTests`), in which case any path works.
+`./oscli` runs the client inside the `client` container by default (so only Docker is needed);
+the project directory is mounted there, so **file arguments must be paths inside this directory**.
+`OSCLI_MODE=local ./oscli …` runs it with a local JVM instead (after
+`mvn -pl client -am package -DskipTests`), where any path works.
 
 ```text
 Usage: oscli [--base URL] <command> [arguments]
 
-  upload PATH [--name NAME] [--type MIME] [--meta key=value ...]
+  upload PATH [--name NAME] [--type MIME] [--key KEY] [--meta key=value ...]
   download ID OUT_PATH      fetch an object and verify it against its checksum
   meta ID                   show system + custom metadata and chunk locations
   patch ID [key=value ...] [--remove key ...]
@@ -158,90 +191,69 @@ Usage: oscli [--base URL] <command> [arguments]
   status                    cluster overview (workers, replication health, repairs)
 ```
 
-Exit codes: `0` success · `1` the server answered with an error (its JSON goes to stderr) ·
-`2` server unreachable or transfer broken · `3` downloaded bytes do not match the announced
-checksum · `64` wrong usage.
-
-`oscli where` is the quickest way to see chunking, distribution and replication at once:
-
-```text
-object  6f7b94b7-ed56-4c5b-8a49-8770976575d7
-name    big.bin   (3500000 bytes, application/octet-stream)
-chunks  4   replication_ok=true
-
-IDX  CHUNK_ID                                       SIZE  COPIES
-0    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00000  1048576  worker1(OK)  worker4(OK)
-1    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00001  1048576  worker1(OK)  worker2(OK)
-2    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00002  1048576  worker2(OK)  worker3(OK)
-3    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00003   354272  worker3(OK)  worker4(OK)
-
-copies per worker: worker1=2  worker2=2  worker3=2  worker4=2
-```
+The client is built for an unreliable service: every upload carries an `Idempotency-Key` (random,
+or `--key`), and connection errors and 503 answers (safe mode, too few workers, a chunk briefly
+without a readable copy) are retried with back-off 0.5, 1, 2, 4, 5, 5 … s for up to
+`OSCLI_RETRY_SECONDS` (default 60). A download that breaks off is retried; a completed download is
+verified against the `ETag`. Exit codes: `0` success · `1` the server answered with an error ·
+`2` unreachable, or the transfer kept breaking · `3` downloaded bytes do not match the checksum ·
+`64` wrong usage.
 
 ### With curl
 
 ```bash
 API=http://localhost:8000/api/v1
-
-# Upload (multipart/form-data: required "file", optional "metadata" JSON)          -> 201
-curl -F "file=@report.pdf" -F 'metadata={"owner":"alice","project":"cloud"}' $API/objects
-
-# Download: the original bytes, with the stored Content-Type                       -> 200
-curl -o report.pdf $API/objects/$ID
-
-# Metadata only (system + custom), nothing is downloaded                           -> 200
-curl $API/objects/$ID/metadata
-
-# Add / update custom metadata; a null value removes a key                         -> 200
-curl -X PATCH -H 'Content-Type: application/json' \
-     -d '{"owner":"team","tag":"v1","project":null}' $API/objects/$ID/metadata
-
-# List, newest first, paginated                                                    -> 200
-curl "$API/objects?limit=50&offset=0"
-
-# Delete the object and its stored data                                            -> 204
-curl -X DELETE $API/objects/$ID
-
-# Cluster overview (workers, replication health, recent repairs)                   -> 200
-curl $API/cluster/status
+curl -H "Idempotency-Key: my-upload-1" -F "file=@report.pdf" -F 'metadata={"owner":"alice"}' $API/objects   # 201
+curl -o report.pdf $API/objects/$ID                                         # 200, the original bytes
+curl $API/objects/$ID/metadata                                              # 200, system + custom metadata
+curl -X PATCH -H 'Content-Type: application/json' -d '{"owner":"team","old":null}' $API/objects/$ID/metadata
+curl "$API/objects?limit=50&offset=0"                                       # 200, newest first
+curl -X DELETE $API/objects/$ID                                             # 204
+curl $API/cluster/status                                                    # 200, the cluster at a glance
+curl $API/fsck                                                              # 200, consistency check
 ```
 
 ### Dashboard
 
-<http://localhost:8000/dashboard> polls the status endpoint every 2 seconds and shows the workers
-(ALIVE/DEAD, last heartbeat, number of chunk copies), object/chunk/copy counts, under- and
-over-replicated chunks, the chunk-by-worker placement grid of the newest object, and the last 20
-actions of the repair loop. Keep it open while running `make demo`.
+<http://localhost:8000/dashboard> polls the status every 2 s: a safe-mode banner; KPIs (objects,
+chunks, copies, under-replicated, pending copies, missing chunks, corrupt and excess copies,
+invariant violations); worker cards (ALIVE green, STALE amber, DEAD red; process id, last
+heartbeat, copies, free space, queued commands, copies being sent); the chunk-by-worker grid of the
+newest object (`OK`, `C` corrupt, `E` excess); an **fsck** button; and the monitor's last 20 events.
 
 ---
 
 ## Client REST API
 
-Base path `/api/v1`. Structured data is JSON with `snake_case` keys. Object data is binary:
-`multipart/form-data` on upload, the object's own content type on download.
+Base path `/api/v1`. Structured data is JSON with `snake_case` keys; object data is binary.
 
 | Method | Endpoint | Purpose | Success |
 |---|---|---|---|
-| `POST` | `/api/v1/objects` | Upload an object | `201` |
+| `POST` | `/api/v1/objects` | Upload an object | `201` (`200` for an idempotent replay) |
 | `GET` | `/api/v1/objects/{object_id}` | Download an object | `200` |
 | `GET` | `/api/v1/objects/{object_id}/metadata` | Retrieve metadata | `200` |
 | `PATCH` | `/api/v1/objects/{object_id}/metadata` | Update custom metadata | `200` |
 | `DELETE` | `/api/v1/objects/{object_id}` | Delete an object | `204` |
 | `GET` | `/api/v1/objects` | List stored objects | `200` |
 | `GET` | `/api/v1/cluster/status` | Cluster overview *(extra)* | `200` |
+| `GET` | `/api/v1/fsck` | Consistency check *(extra)* | `200` |
 | `GET` | `/health`, `/dashboard` | Liveness probe, dashboard page *(extra)* | `200` |
 
 ### Upload — `POST /api/v1/objects`
 
-`multipart/form-data` with a required `file` part and an optional `metadata` field containing a
-JSON object of custom key/value pairs. The controller assigns a UUID as object id.
+`multipart/form-data` with a required `file` part and an optional `metadata` field (a JSON object of
+custom key/value pairs). The controller assigns a UUID. The name is the uploaded file name (or
+`unnamed`); the content type is the one declared for the part, or inferred from the extension if
+none or only `application/octet-stream` was declared. An empty file is a valid object (0 chunks).
 
-- **Name** = the uploaded file name (client-side directories stripped), or `unnamed`.
-- **Content type** = the type declared for the file part. If none is declared, or only the generic
-  `application/octet-stream`, it is inferred from the file extension (`.jpg` → `image/jpeg`,
-  `.mp4` → `video/mp4`, …).
-- An empty file is a valid object: 0 bytes, 0 chunks.
-- Responds `201` with a `Location` header and the full object description (below).
+- **`Idempotency-Key`** (optional header, 1–128 visible ASCII characters): if an earlier upload with
+  the same key succeeded, the answer is `200` with that object and `Idempotent-Replay: true`, even
+  in safe mode, and nothing is stored again. The same key with a file of a different size is
+  `409 conflict`. Two concurrent uploads with one key create exactly one object.
+- **201 means durable**: every chunk is fsynced on two workers and the namespace commit is durable
+  (`synchronous=FULL`). The object survives a controller crash and the loss of any one worker.
+- Refused before the body is read: `503 safe_mode` (with `Retry-After: 5`) and
+  `503 insufficient_workers` (fewer than 2 workers can take writes).
 
 ### The object description
 
@@ -274,639 +286,716 @@ Returned by upload, `GET …/metadata` and `PATCH …/metadata`:
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `object_id` | unique id (UUID v4) assigned at upload |
-| `name`, `size`, `content_type` | object name, size in bytes, MIME type |
-| `checksum` | SHA-256 of the whole object, lowercase hex |
-| `chunk_count` | number of chunks |
-| `created_at`, `updated_at` | creation time and last-modified time (UTC, ISO-8601, milliseconds); `updated_at` moves whenever custom metadata changes |
-| `replication_ok` | `true` if every chunk currently has at least 2 good copies |
-| `custom_metadata` | the user-defined key/value pairs |
-| `chunks[]` | per chunk: unique `chunk_id`, `index` (its order in the object), `size`, SHA-256 `checksum`, and `locations` |
-| `chunks[].locations[]` | where each copy is stored: `worker_id`, the copy's `status` (`OK`, `CORRUPT`, `MISSING`) and the worker's `worker_status` (`ALIVE`, `DEAD`) |
+`checksum` is the SHA-256 of the whole object; each chunk has a unique id (`<object_id>-<index>`),
+its `index` (order in the object), size, SHA-256 and `locations`. A location's `status` is the
+copy's state (`OK`, `CORRUPT`, `EXCESS`), `worker_status` the worker's (`ALIVE`, `STALE`).
+`replication_ok` is true when every chunk has at least 2 live copies.
 
-### Download — `GET /api/v1/objects/{object_id}`
+### Download, metadata, delete, list
 
-Streams the complete original object. Response headers: `Content-Type` (as stored),
-`Content-Length`, `Content-Disposition: attachment; filename="…"`, `ETag: "<sha256 of the object>"`
-and `X-Object-Id`. The client never learns worker addresses. `404` if the object does not exist;
-`503 chunk_unavailable` if some chunk currently has no intact copy on a live worker (decided before
-the first byte is sent, so it is a clean error, never a truncated download).
-
-### Metadata — `GET` / `PATCH /api/v1/objects/{object_id}/metadata`
-
-`GET` returns the object description without touching any worker. `PATCH` takes a JSON object:
-a string value adds or overwrites a key, `null` removes it. Only the metadata tables change; the
-object's data is not read, moved or re-uploaded. `404` if the object does not exist.
-
-Rules for custom metadata (upload and patch): a flat JSON object; keys are 1–64 characters from
-`A-Z a-z 0-9 _ . -`; values are strings of at most 1024 characters; at most 64 keys per object.
-Anything else is `400 invalid_metadata`.
-
-### Delete — `DELETE /api/v1/objects/{object_id}`
-
-Deletes the chunk files on every live worker, then the object with its metadata, chunk and copy
-records. `204` with an empty body, `404` if the object does not exist. Copies on a worker that is
-down at that moment are garbage-collected by the scrubber when the worker returns.
-
-### List — `GET /api/v1/objects?limit=&offset=`
-
-`limit` 1–500 (default 50), `offset` ≥ 0 (default 0). Newest first.
-
-```json
-{
-  "items": [
-    { "object_id": "0c32e95a-…", "name": "integrity.bin", "size": 3500000,
-      "content_type": "application/octet-stream", "chunk_count": 4,
-      "created_at": "2026-11-16T16:44:15.823Z", "updated_at": "2026-11-16T16:44:15.823Z" }
-  ],
-  "total": 5, "limit": 50, "offset": 0
-}
-```
+- **Download** streams the original bytes with the stored `Content-Type`, `Content-Length`,
+  `Content-Disposition`, `ETag: "<sha256>"` and `X-Object-Id`. `404` if unknown; `503
+  chunk_unavailable` if some chunk has no readable copy right now (decided before the first byte).
+- **PATCH metadata**: a string sets a key, `null` removes it; only the metadata tables change.
+  Keys: 1–64 characters from `A-Z a-z 0-9 _ . -`; values: strings of at most 1024 characters; at
+  most 64 keys. Anything else is `400 invalid_metadata`. `503 safe_mode` in safe mode.
+- **DELETE**: `204`; the namespace row is deleted durably and every known copy gets a DELETE
+  command (workers delete the files with their next heartbeat, within ~2 s). Copies the controller
+  could not know about (on a DEAD worker) become orphans and are collected from block reports.
+  `404` if unknown, `503 safe_mode` in safe mode.
+- **List**: `limit` 1–500 (default 50), `offset` ≥ 0; newest first; `{items, total, limit, offset}`.
 
 ### Status codes and errors
 
-Every error response, without exception, is JSON of the form
-`{"error": "<machine_readable_code>", "detail": "<human sentence>"}`.
+Every error is JSON: `{"error": "<code>", "detail": "<sentence>"}`.
 
 | Status | When | `error` codes |
 |---|---|---|
-| `200` | successful download, metadata read/update, list, status | |
+| `200` | download, metadata, list, status, fsck; an idempotent upload replay | |
 | `201` | object created | |
 | `204` | object deleted | |
-| `400` | invalid request: no `file` part, not multipart, bad `limit`/`offset`, invalid metadata | `bad_request`, `invalid_metadata`, `checksum_mismatch` *(internal)* |
-| `404` | object not found; unknown route | `object_not_found`, `not_found`, `chunk_not_found` and `unknown_worker` *(internal)* |
-| `409` | conflict: a second delete, or a metadata update, for an object that is being deleted right now; a worker asked to overwrite a chunk id with different content *(internal)* | `conflict` |
+| `400` | no `file` part, not multipart, bad `limit`/`offset`, invalid metadata, bad `Idempotency-Key` | `bad_request`, `invalid_metadata` |
+| `404` | object not found; unknown route | `object_not_found`, `not_found` |
+| `409` | an `Idempotency-Key` reused for a file of a different size | `conflict` |
 | `500` | unexpected server error (stack trace in the log only) | `internal_error` |
-| `503` | required storage unavailable: fewer than 2 live workers for an upload, a chunk that could not be stored twice, a chunk with no readable copy | `insufficient_workers`, `upload_failed`, `chunk_unavailable` |
+| `503` | safe mode (with `Retry-After: 5`), too few writable workers, a chunk that could not be stored twice, a chunk with no readable copy | `safe_mode`, `insufficient_workers`, `upload_failed`, `chunk_unavailable` |
 
-Beyond the required set, three standard codes are used where they are the precise answer:
-`405 method_not_allowed`, `413 payload_too_large` (object larger than `MAX_UPLOAD_SIZE`, or a
-chunk body larger than 1 MB on a worker) and `415 unsupported_media_type`.
+Also used where they are the precise answer: `405 method_not_allowed`, `413 payload_too_large`,
+`415 unsupported_media_type`.
 
-```console
-$ curl -s http://localhost:8000/api/v1/objects/00000000-0000-0000-0000-000000000000
-{"error":"object_not_found","detail":"object 00000000-0000-0000-0000-000000000000 does not exist"}
-$ curl -s "http://localhost:8000/api/v1/objects?limit=abc"
-{"error":"bad_request","detail":"parameter 'limit' must be of type int"}
-```
+### Cluster status — `GET /api/v1/cluster/status`
 
-### Cluster status — `GET /api/v1/cluster/status` *(extra)*
+`safe_mode`, `cluster_id`; per worker `state`, `boot_id` (8 chars), `has_reported`, `last_seen_s_ago`,
+`chunk_count`, `queued_commands`, `pending_as_source`, `stats{chunks, used_bytes, free_bytes,
+active_transfers}`; `replicas{ok, corrupt, excess}`, `under_replicated`, `over_replicated`,
+`missing_chunks`, `pending_replications`, `blocked` (chunks the last monitor tick could not
+schedule); `counters{invariant_violations, orphan_gc_refused, stale_messages, duplicates, blocked, …}`;
+and `repair_log`, the monitor's last 200 events (`replicate`, `copied`, `timeout`, `trimmed`,
+`invalidated`, `deleted`, `restored`, `orphan`, `unrecoverable`).
+
+### fsck — `GET /api/v1/fsck`
+
+Asks every ALIVE worker, in parallel, for its chunks with checksums **recomputed from the files**,
+and compares that with the block map and the namespace; runs the invariant checks plus I7 (memory
+mirrors the `chunks` table).
 
 ```json
-{
-  "config": { "chunk_size": 1048576, "replication_factor": 2, "heartbeat_timeout": 6.0,
-              "repair_interval": 10.0, "scrub_interval": 15.0 },
-  "workers": [ { "worker_id": "worker1", "url": "http://worker1:8001", "status": "ALIVE",
-                 "last_seen": "2026-11-16T16:48:28.570Z", "chunk_count": 8 } ],
-  "objects": 5, "chunks": 15,
-  "replicas": { "ok": 30, "corrupt": 0, "missing": 0 },
-  "under_replicated": 0, "over_replicated": 0,
-  "repair_log": [ { "time": "2026-11-16T16:44:43.281Z", "event": "copied",
-                    "chunk_id": "0c32e95a-…-00002", "source": "worker1", "target": "worker2",
-                    "reason": "under-replicated: 1 of 2 good copies" } ]
-}
+{"status": "HEALTHY",
+ "objects": {"total": 12, "healthy": 12, "under_replicated": 0, "corrupt_replicas": 0, "missing": 0},
+ "disk_vs_map": {"on_disk_not_in_map": [], "in_map_not_on_disk": [], "checksum_mismatch": []},
+ "orphans_on_disk": 0, "unreachable_workers": [], "invariant_violations": [], "quiescent": true}
 ```
 
-`repair_log` holds the last 100 actions of the repair loop (`copied`, `trimmed`, `purged`,
-`unrecoverable`), newest last. It is kept in memory and starts empty after a controller restart.
+`CORRUPT` if some object has a chunk without any live copy; `DEGRADED` if anything is
+under-replicated, a copy is corrupt, a worker is unreachable, an invariant is violated, or (while
+quiescent) disks and the map differ or orphans exist; otherwise `HEALTHY`. `quiescent` means no
+pending copies, no queued commands and not in safe mode; only then are differences meaningful.
 
 ---
 
-## Internal worker APIs
+## The worker protocol
 
-Used only between the controller and the workers, inside the Docker network.
+### Endpoints
 
 | Method | Endpoint | Served by | Purpose |
 |---|---|---|---|
-| `POST` | `/internal/workers/register` | controller | Register a worker with the controller |
-| `POST` | `/internal/workers/heartbeat` | controller | Report worker availability |
-| `PUT` | `/internal/chunks/{chunk_id}` | worker | Store a chunk on a worker |
-| `GET` | `/internal/chunks/{chunk_id}` | worker | Retrieve a chunk from a worker |
-| `DELETE` | `/internal/chunks/{chunk_id}` | worker | Delete a chunk from a worker |
-| `GET` | `/internal/workers/{worker_id}/chunks` | worker | Retrieve information about chunks stored by a worker |
+| `POST` | `/internal/workers/register` | controller | Register a worker (process) |
+| `POST` | `/internal/workers/heartbeat` | controller | Report availability; receive commands |
+| `POST` | `/internal/workers/blockreport` | controller | Full block report |
+| `POST` | `/internal/workers/ibr` | controller | Incremental block report |
+| `PUT` | `/internal/chunks/{chunk_id}` | worker | Store a chunk (from the controller, or from another worker for a repair) |
+| `GET` | `/internal/chunks/{chunk_id}` | worker | Retrieve a chunk, verified against its `.meta` |
+| `DELETE` | `/internal/chunks/{chunk_id}` | worker | Delete a chunk (idempotent: always 204) |
+| `GET` | `/internal/workers/{worker_id}/chunks` | worker | Every chunk on disk with a freshly computed checksum (fsck) |
 
-| Endpoint | Request | Responses |
-|---|---|---|
-| `POST …/register` | `{"worker_id":"worker1","url":"http://worker1:8001"}` | `200 {"ok":true,"worker_id":"worker1","status":"ALIVE"}`. Insert-or-update, safe to repeat. `400` on a malformed id or URL. |
-| `POST …/heartbeat` | `{"worker_id":"worker1"}` | `200` (same body). `404 unknown_worker` if the controller does not know the worker, which makes the worker register again. |
-| `PUT /internal/chunks/{id}` | raw bytes, header `X-Checksum: <sha256>` | `201 {"chunk_id","size","checksum"}` when written; `200` if identical content is already there (idempotent); `400 bad_request` for a malformed id or missing header; `400 checksum_mismatch` if the body does not hash to the header (nothing is written); `409 conflict` if the id exists with different content; `413` if the body exceeds one chunk. |
-| `GET /internal/chunks/{id}` | – | `200` raw bytes, with `X-Checksum` computed from the bytes just read from disk (never cached); `404 chunk_not_found`. |
-| `DELETE /internal/chunks/{id}` | – | `204` if removed, `404 chunk_not_found` if absent. |
-| `GET …/{worker_id}/chunks` | – | `200 {"worker_id","chunks":[{"chunk_id","size","checksum"}]}`, every checksum recomputed from the file; `404 unknown_worker` if the id is not this worker's. |
-
-A chunk id must match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-\d{5}$`.
-Anything else is rejected before a path is ever built, so a request can never read or write
+Worker answers: **PUT** (raw bytes, header `X-Checksum: <sha256>`) → `201` written · `200` identical
+content already there (idempotent) · `400 bad_request` (malformed id, missing header) · `400
+checksum_mismatch` (nothing written) · `409 conflict` (the id holds different content) · `413` (more
+than one chunk) · `507 insufficient_storage`. **GET** → `200` bytes with `X-Checksum` · `404
+chunk_not_found` · `409 chunk_corrupt` (the bytes no longer match `.meta`; never served).
+**DELETE** → `204`. **List** → `200 {"worker_id", "chunks": [{"chunk_id", "size", "checksum"}]}` ·
+`404 unknown_worker` for another worker's id. Chunk ids must match
+`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-\d{5}$`, so no request can reach a path
 outside `/data/chunks`.
+
+### The envelope and the acceptance rules
+
+Every heartbeat and report carries `{"worker_id", "boot_id", "seq", "sent_at"}`: `boot_id` is a
+UUID generated once per worker *process*; heartbeats and reports each have their own `seq`
+counter; `sent_at` is the wall-clock time of the (re)send. The controller checks, in this order:
+
+| Condition | Answer | Effect |
+|---|---|---|
+| worker unknown, or DEAD | 404 `unknown_worker` | the worker registers again (HDFS `DNA_REGISTER`) |
+| `boot_id` is not the current process | 409 `stale_boot` | ignored: a message from a dead old process |
+| sent more than `MAX_MESSAGE_AGE` ago | 409 `too_old` | ignored |
+| heartbeat with `seq` ≤ the last one | 200 `{"ignored":"duplicate"}` | no commands are delivered |
+| report with `seq` = the last one | 200 `{"ignored":"duplicate"}` | nothing applied: the worker retried after a lost answer |
+| report with `seq` < the last one | 409 `stale_seq` | ignored: a delayed old copy |
+| otherwise | apply | |
+
+**Registration** carries `url`, `boot_id`, the `cluster_id` from `/data/VERSION` (or `null` for a
+new volume), the last used sequence numbers and statistics. A `cluster_id` that is not the
+controller's is refused with 409 `cluster_id_mismatch`: the worker keeps its data and stops
+trying (it retries only every 60 s). With `null`, the worker records the controller's cluster id
+durably in `VERSION` before its first report. A worker re-registering with a new `boot_id` (or after
+being DEAD) is ALIVE again, its command queue is cleared, copies it was sending are dropped, and its
+replicas are kept until its full report reconciles them. Three new boot ids for one id within a
+minute look like two containers with the same `WORKER_ID`: newcomers get 409 `duplicate_worker` for
+60 s.
+
+**Commands** in heartbeat replies:
+
+```json
+{"cmd_id": "…", "type": "REPLICATE", "chunk_id": "…", "checksum": "…", "target_url": "http://worker3:8003", "expires_at": 1763350030.0}
+{"cmd_id": "…", "type": "DELETE", "chunk_id": "…", "reason": "excess|corrupt|orphan|object_deleted", "expires_at": 1763350030.0}
+```
+
+A worker executes a `cmd_id` at most once and drops a command whose `expires_at` has passed, both
+on arrival and right before running it. A lost heartbeat reply loses its commands; the pending
+time-out (REPLICATE) and the DELETE retry rule recover them, as in HDFS.
+
+### The ordered report channel
+
+One thread on each worker sends reports **one at a time, stop-and-wait**: the next message is built
+only after the previous one was acknowledged, and an unacknowledged message is resent unchanged
+(same `seq`, fresh `sent_at`) with back-off 0.5, 1, 2, 4, 5 … s. So reports can never be applied
+out of order or twice. A full report is built atomically: snapshot of the disk, clear the IBR
+buffer (the snapshot supersedes it), take the next `seq`. Full reports are sent after registering,
+every 30 s, on the controller's request, and when the IBR buffer overflows.
 
 ---
 
 ## Configuration
 
-Everything is set through environment variables in [`docker-compose.yml`](docker-compose.yml).
+Everything is an environment variable, set in [`docker-compose.yml`](docker-compose.yml).
 
-| Variable | Default | Service | Meaning |
+| Variable | Default | Where | Meaning |
 |---|---|---|---|
-| `CHUNK_SIZE` | `1048576` | both | Bytes per chunk; workers reject larger chunk bodies |
-| `REPLICATION_FACTOR` | `2` | controller | Good copies wanted per chunk |
-| `HEARTBEAT_INTERVAL` | `2` s | worker | Time between heartbeats |
-| `HEARTBEAT_TIMEOUT` | `6` s | controller | Silence after which a worker is DEAD |
-| `HEALTH_INTERVAL` | `1` s | controller | Period of the health monitor |
-| `STARTUP_GRACE` | `20` s | controller | After a controller start, how long before any worker may be declared DEAD |
-| `REPAIR_INTERVAL` | `10` s | controller | Period of the repair loop |
-| `SCRUB_INTERVAL` | `15` s | controller | Period of the scrubber |
-| `WORKER_TIMEOUT_S` | `10` s | controller | Time limit of one HTTP call to a worker |
-| `REPAIR_CONCURRENCY` | `4` | controller | Chunks repaired in parallel |
-| `MAX_UPLOAD_SIZE` | `10GB` | controller | Largest accepted object |
-| `DB_PATH` | `/data/meta.db` | controller | SQLite metadata file (on the `controller_data` volume) |
-| `DATA_DIR` | `/data` | worker | Volume mount; chunks live in `DATA_DIR/chunks`, one file per chunk |
+| `HEARTBEAT_INTERVAL` | 2 | worker | heartbeat period (s) |
+| `STALE_AFTER` | 6 | controller | silence → STALE |
+| `DEAD_AFTER` | 12 | controller | silence → DEAD |
+| `STALE_RATIO` | 0.5 | controller | above this fraction of STALE workers, stop avoiding STALE workers for writes |
+| `HEALTH_INTERVAL` | 1 | controller | liveness check period |
+| `MONITOR_INTERVAL` | 3 | controller | replication monitor period |
+| `PENDING_TIMEOUT` | 15 | controller | a pending copy, or an unconfirmed DELETE, is retried after this |
+| `TARGET_BACKOFF` | 30 | controller | after a failed copy, avoid that (chunk, target) pair for this long |
+| `MAX_STREAMS` | 2 | controller | copies in flight per source worker |
+| `COMMAND_TTL` | 30 | controller | a command carries `expires_at = issued + TTL` |
+| `MAX_COMMANDS_PER_WORKER` | 1000 | controller | queue cap (oldest DELETEs dropped first; they are re-planned) |
+| `MAX_MESSAGE_AGE` | 10 | controller | reject worker messages sent longer ago than this |
+| `SAFE_MODE_THRESHOLD` | 0.999 | controller | fraction of chunks with a reported OK copy needed to leave safe mode |
+| `SAFE_MODE_EXTENSION` | 5 | controller | stay in safe mode this long after the threshold is reached |
+| `SAFE_MODE_TIMEOUT` | 30 | controller | leave safe mode after this regardless |
+| `ORPHAN_GC_DELAY` | 60 | controller | no orphan deletion during the first N s after a controller start |
+| `ORPHAN_GC_MAX_FRACTION` | 0.5 | controller | refuse orphan GC if one report would delete more than this fraction of a worker's chunks (when > 10) |
+| `MIN_FREE_BYTES` | 16777216 | controller | minimum free space for a write or repair target |
+| `FULL_REPORT_INTERVAL` | 30 | both | full block report period (the controller uses it to spot overdue reports) |
+| `IBR_INTERVAL` | 0.5 | worker | incremental report flush period |
+| `IBR_BUFFER_MAX` | 10000 | worker | on overflow, drop the buffer and send a full report |
+| `SCAN_INTERVAL` | 10 | worker | block scanner period |
+| `DISK_CHECK_INTERVAL` | 30 | worker | volume probe period |
+| `HEARTBEAT_HTTP_TIMEOUT` | 3 | worker | heartbeat request time-out (below `STALE_AFTER`) |
+| `CONNECT_TIMEOUT` | 2 | both | HTTP connect time-out |
+| `READ_TIMEOUT` | 10 | both | HTTP read time-out for chunk transfers |
+| `INVARIANT_CHECKS` | 1 | controller | run the invariant checks every monitor tick |
+| `FAULT_DELAY_MS` | 0 | both | fault injection: random delay 0..N ms before each internal call |
+| `FAULT_DROP_RATE` | 0 | both | fault injection: probability a call is lost (half before sending, half after: a lost answer) |
+| `FAULT_DUP_RATE` | 0 | both | fault injection: probability a call is sent twice |
+| `CHUNK_SIZE` | 1048576 | both | bytes per chunk; workers reject larger chunk bodies |
+| `REPLICATION_FACTOR` | 2 | controller | live copies wanted per chunk |
+| `DB_PATH` | `/data/meta.db` | controller | SQLite namespace |
+| `DATA_DIR` | `/data` | worker | volume mount: `chunks/`, `VERSION` |
 | `WORKER_ID` | *(required)* | worker | `worker1` … `worker4`; also the container name |
-| `CONTROLLER_URL` | `http://controller:8000` | worker | Where to register and send heartbeats |
-| `ADVERTISE_URL` | `http://<WORKER_ID>:<PORT>` | worker | The address the controller should use for this worker |
-| `PORT` | `8000` / `8001`–`8004` | both | Listen port |
-| `LOG_LEVEL` | `INFO` | both | Root log level |
-| `CONTROLLER_PORT` | `8000` | compose | Host port the controller is published on |
+| `CONTROLLER_URL` / `ADVERTISE_URL` | `http://controller:8000` / `http://<WORKER_ID>:<PORT>` | worker | where to register / how the controller and peers reach this worker |
+| `MAX_UPLOAD_SIZE` | `10GB` | controller | largest accepted object |
+| `PORT`, `LOG_LEVEL` | 8000 / 8001–8004, `INFO` | both | |
 
-| Container | Port in the network | Port on the host | Volume → mount |
-|---|---|---|---|
-| `controller` | 8000 | 8000 | `objectstore_controller_data` → `/data` |
-| `worker1` … `worker4` | 8001 … 8004 | – (not reachable) | `objectstore_worker1_data` … `objectstore_worker4_data` → `/data` |
-| `client` | – | – | project directory → `/work` |
+All services have `restart: unless-stopped` (a crashed process comes back by itself; `docker
+stop` still keeps it stopped) and `stop_grace_period: 5s`. [`docker-compose.chaos.yml`](docker-compose.chaos.yml)
+turns fault injection on (300 ms, 5 % drops, 5 % duplicates).
 
-Log lines start with a component tag: `[api]`, `[upload]`, `[download]`, `[registry]`,
-`[integrity]`, `[repair]`, `[scrub]` (controller) and `[store]`, `[heartbeat]` (worker).
+Log tags: controller `[api]`, `[upload]`, `[download]`, `[registry]`, `[report]`, `[ibr]`,
+`[monitor]`, `[safemode]`, `[integrity]`, `[invariant]`, `[fsck]`; worker `[register]`,
+`[heartbeat]`, `[report]`, `[ibr]`, `[cmd]`, `[store]`, `[scanner]`, `[diskcheck]`, `[version]`.
 
 ---
 
 ## Demonstrations
 
-`make demo` runs all six and checks every claim; the output ends with:
+`make demo` runs all seven and checks every claim; it ends with:
 
 ```text
- PASS  1/6  Object storage - upload an object, retrieve it, verify it is identical
- PASS  2/6  Chunking and distribution - an object larger than 1 MB
- PASS  3/6  Replication - every chunk has two copies; where they are
- PASS  4/6  Metadata - custom metadata on upload; read and modify it without re-uploading
- PASS  5/6  Worker failure - docker stop worker2, then docker start worker2
- PASS  6/6  Data integrity - corrupt stored data on purpose
- 6/6 PASS
+ PASS  1/7  Object storage - upload an object, retrieve it, verify it is identical
+ PASS  2/7  Chunking and distribution - an object larger than 1 MB
+ PASS  3/7  Replication - every chunk has two copies; where they are
+ PASS  4/7  Metadata - custom metadata on upload; read and modify it without re-uploading
+ PASS  5/7  Worker failure - docker stop worker2, then docker start worker2
+ PASS  6/7  Data integrity - corrupt stored data on purpose
+ PASS  7/7  Controller crash - docker kill controller in the middle of an upload
+ 7/7 PASS
 ```
 
-A run takes about a minute. The script never sleeps for a fixed time: every wait polls until the
-expected state is reached, so it is as fast as the system and not timing-sensitive. Each run first
-deletes the objects of the previous run, and leaves its own behind for inspection on the dashboard.
-
-The sections below show how to do each demonstration by hand. They assume:
-
-```bash
-API=http://localhost:8000/api/v1
-mkdir -p .demo       # scratch directory; inside the project so that ./oscli can see it
-```
+Nothing in the script waits for a fixed time: every wait polls until the expected state is reached.
+The sections below show what each demonstration does and how to do it by hand
+(`API=http://localhost:8000/api/v1`, scratch files in `.demo/`).
 
 ### 1. Object storage
-
-Upload an object, retrieve it, verify the retrieved object matches the original.
 
 ```bash
 head -c 307200 /dev/urandom > .demo/small.bin
 ID=$(curl -s -F "file=@.demo/small.bin" $API/objects | jq -r .object_id)
-curl -s -D - -o .demo/small.out $API/objects/$ID | grep -iE '^(HTTP|content-|etag)'
-shasum -a 256 .demo/small.bin .demo/small.out      # Linux: sha256sum
+curl -s -o .demo/small.out $API/objects/$ID
+shasum -a 256 .demo/small.bin .demo/small.out        # identical; equal to the ETag and to .checksum
 ```
 
-```text
-HTTP/1.1 200
-Content-Disposition: attachment; filename="small.bin"
-ETag: "9c26a3d4e05a34763bdc372b9d20d612114a1ea1b27383e261938574e8269d28"
-Content-Type: application/octet-stream
-Content-Length: 307200
-9c26a3d4e05a34763bdc372b9d20d612114a1ea1b27383e261938574e8269d28  .demo/small.bin
-9c26a3d4e05a34763bdc372b9d20d612114a1ea1b27383e261938574e8269d28  .demo/small.out
-```
-
-The two hashes are equal, and equal to the `ETag` and to the `checksum` in the metadata. For a real
-file type: `./oscli upload samples/sample.jpg` reports `"content_type": "image/jpeg"`, and the
-download is served with `Content-Type: image/jpeg`.
+A real image (`samples/sample.jpg`) is stored as `image/jpeg` and served back with that type.
 
 ### 2. Chunking and distribution
-
-Upload an object larger than 1 MB; show how it was chunked and where the chunks went.
 
 ```bash
 head -c 3500000 /dev/urandom > .demo/big.bin
 BIG=$(./oscli upload .demo/big.bin | jq -r .object_id)
 ./oscli where $BIG
-for w in worker1 worker2 worker3 worker4; do
-  echo "$w: $(docker exec $w sh -c "ls /data/chunks | grep -c ^$BIG") chunk files"
-done
 ```
-
-3,500,000 bytes become 4 chunks: three of 1,048,576 bytes and a last one of 354,272. `oscli where`
-prints the table shown [above](#with-the-cli); on disk there are 8 files (4 chunks × 2 copies),
-exactly 2 on each of the four workers:
 
 ```text
-worker1: 2 chunk files
-worker2: 2 chunk files
-worker3: 2 chunk files
-worker4: 2 chunk files
+IDX  CHUNK_ID                                       SIZE  COPIES
+0    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00000  1048576  worker1(OK)  worker4(OK)
+1    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00001  1048576  worker1(OK)  worker2(OK)
+2    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00002  1048576  worker2(OK)  worker3(OK)
+3    6f7b94b7-ed56-4c5b-8a49-8770976575d7-00003   354272  worker3(OK)  worker4(OK)
+
+copies per worker: worker1=2  worker2=2  worker3=2  worker4=2
 ```
+
+3,500,000 bytes become three 1 MiB chunks and one of 354,272 bytes; on disk there are 8 chunk
+files, 2 per worker, each with its `.meta` sidecar.
 
 ### 3. Replication
 
-Show that each chunk has two copies, and where they are stored.
-
-```bash
-curl -s $API/objects/$BIG/metadata | jq -r '.chunks[] | "\(.chunk_id)  \([.locations[] | "\(.worker_id)=\(.status)"] | join("  "))"'
-curl -s $API/cluster/status | jq -c '{chunks, replicas, under_replicated, over_replicated}'
-# the two files of a chunk are byte-identical: compare their hashes on the two workers
-C=$BIG-00000
-docker exec worker1 sha256sum /data/chunks/$C; docker exec worker4 sha256sum /data/chunks/$C
-```
-
-```text
-6f7b94b7-…-00000  worker1=OK  worker4=OK
-6f7b94b7-…-00001  worker1=OK  worker2=OK
-6f7b94b7-…-00002  worker2=OK  worker3=OK
-6f7b94b7-…-00003  worker3=OK  worker4=OK
-{"chunks":5,"replicas":{"ok":10,"corrupt":0,"missing":0},"under_replicated":0,"over_replicated":0}
-```
-
-Every chunk has exactly two copies on two different workers, `replicas.ok` is `2 × chunks`, and
-both files of a chunk hash to the checksum recorded at upload. (Use the two workers that
-`oscli where` lists for the chunk you pick.)
+Each chunk has exactly two copies on two different workers, both `OK`; both files hash to the
+checksum recorded at upload; `replicas.ok = 2 × chunks` and nothing is under- or over-replicated.
 
 ### 4. Metadata
-
-Upload custom metadata; retrieve and modify it without re-uploading the object.
 
 ```bash
 MID=$(curl -s -F "file=@.demo/big.bin;filename=report.pdf;type=application/pdf" \
            -F 'metadata={"owner":"ansh","course":"cloud-computing"}' $API/objects | jq -r .object_id)
-curl -s $API/objects/$MID/metadata | jq '{name, size, content_type, checksum, chunk_count, created_at, updated_at, custom_metadata}'
-curl -s -X PATCH -H 'Content-Type: application/json' -d '{"owner":"team","tag":"v1"}' \
-     $API/objects/$MID/metadata | jq '{custom_metadata, created_at, updated_at}'
-./oscli patch $MID --remove tag | jq '{custom_metadata, updated_at}'
+curl -s -X PATCH -H 'Content-Type: application/json' -d '{"owner":"team","tag":"v1"}' $API/objects/$MID/metadata
+./oscli patch $MID --remove tag
 ```
 
-```text
-{"custom_metadata":{"course":"cloud-computing","owner":"team","tag":"v1"},"created_at":"2026-11-16T16:43:50.268Z","updated_at":"2026-11-16T16:43:50.594Z"}
-{"custom_metadata":{"course":"cloud-computing","owner":"team"},"updated_at":"2026-11-16T16:43:50.981Z"}
-```
-
-Keys are added, updated and removed; `updated_at` moves forward while `created_at`, `size`,
-`checksum` and the chunk layout stay exactly as they were, and no request reaches a worker.
+Keys are added, updated and removed; `updated_at` moves forward; size, checksum and chunk layout
+stay the same; no worker is contacted.
 
 ### 5. Worker failure
 
-Stop a worker container; show failure handling and retrieval from the other copy; restart it and
-show whether the replication factor is maintained.
-
 ```bash
-FID=$(./oscli upload .demo/big.bin | jq -r .object_id)
-
-# BEFORE
-make status | jq -c '{workers: [.workers[] | "\(.worker_id)=\(.status)"], under_replicated, over_replicated}'
-./oscli where $FID
-
-# DURING
 docker stop worker2
-sleep 8
-make status | jq -c '{workers: [.workers[] | "\(.worker_id)=\(.status)"], under_replicated}'
-./oscli download $FID .demo/during.bin && cmp .demo/big.bin .demo/during.bin && echo identical
-sleep 12
-make status | jq -c '{under_replicated, copied: [.repair_log[] | select(.event == "copied") | "\(.source)->\(.target)"]}'
-./oscli where $FID
-
-# AFTER
-docker start worker2
-sleep 25
-make status | jq -c '{workers: [.workers[] | "\(.worker_id)=\(.status)"], under_replicated, over_replicated}'
-./oscli where $FID
 ```
 
-What you see (timings from a real run):
-
-| Moment | Observation |
+| Time | What happens |
 |---|---|
-| before | 4 workers `ALIVE`, `under_replicated=0`; worker2 holds a copy of 2 of the object's 4 chunks |
-| +6 s after `docker stop` | log: `[registry] worker2 marked DEAD (last seen …)`; status: `worker2=DEAD`, `under_replicated=7` (every chunk that had a copy there) |
-| during | the download still succeeds and is identical: the controller reads only from live workers |
-| about +14 s | log: `[repair] copied chunk=…-00002 src=worker1 dst=worker4 (under-replicated: 1 of 2 good copies)`; `under_replicated=0` again, while worker2 is **still down**. `oscli where` now shows three entries for the affected chunks: `worker1(OK)  worker2(OK,DEAD)  worker4(OK)` |
-| after `docker start` | log: `[registry] worker2 is back`. Its chunk files survived on the volume; the scrubber verifies them, which makes the affected chunks over-replicated (3 good copies) |
-| about 8 s later | log: `[repair] trimmed chunk=…-00002 src=worker4 …`; `over_replicated=0`, every chunk has **exactly two** copies again and the object is still identical |
+| ~6 s of silence | `worker2` is **STALE**: avoided for reads and writes, but its copies still count; nothing is re-replicated (a GC pause or a network blip must not trigger mass copying) |
+| ~12 s of silence | **DEAD**: `[registry] worker2 DEAD after 12.0s - N replicas removed`; `under_replicated` > 0; downloads keep working from the other copies |
+| within ~3 s | the monitor orders copies: `[monitor] REPLICATE chunk=… copies=1 worker1->worker4` |
+| within ~2 s more | the source picks the command up with its heartbeat and copies the chunk **directly to the target**: `[cmd] replicate ok chunk=…` in the source's log; the target's incremental report confirms it: `[monitor] copied …` |
 
-So the replication factor is maintained throughout: it drops to 1 for the affected chunks for a
-few seconds, is restored to 2 on the remaining workers without the failed one, and is brought back
-to exactly 2 (not 3) after the worker returns.
+```bash
+docker start worker2
+```
+
+It registers again, sends a full block report listing the chunks still on its volume, and those
+chunks now have 3 copies. Once every holder is ALIVE and confirmed, the monitor marks the copy on the
+busiest worker `EXCESS` and orders its deletion: `[monitor] trimmed …`. Every chunk ends with exactly
+two copies; at no point did any chunk have fewer than one.
 
 ### 6. Data integrity
 
-Corrupt stored data on purpose; show that it is detected and handled.
+```bash
+make corrupt W=worker1 C=<chunk_id>        # 4 bytes overwritten inside the data file
+./oscli download <object_id> .demo/x.bin   # still byte-identical
+```
+
+- **Found on read:** the worker re-hashes a chunk before serving it, refuses with
+  `409 chunk_corrupt` and reports it bad; the controller marks the copy `CORRUPT` and reads the
+  other copy. The client gets correct data.
+- **Found without anyone reading:** the worker's block scanner (every 10 s) re-hashes every chunk:
+  `[scanner] CORRUPT chunk=…`, reported to the controller in the next incremental report.
+- **Restored, HDFS-style:** the corrupt copy is kept as a last resort while a healthy holder copies
+  the chunk to a third worker; only after that copy is confirmed is the corrupt one deleted
+  (`replicate` → `copied` → `invalidated` in the monitor log).
+
+### 7. Controller crash
 
 ```bash
-IID=$(./oscli upload .demo/big.bin | jq -r .object_id)
-C=$IID-00000
-W=$(./oscli meta $IID | jq -r '.chunks[0].locations[0].worker_id')
-
-# A) found by a download
-make corrupt W=$W C=$C
-./oscli download $IID .demo/int.bin && cmp .demo/big.bin .demo/int.bin && echo identical
-docker logs controller 2>&1 | grep -E "\[(integrity|scrub)\] chunk=$C"
-sleep 12; ./oscli where $IID
-
-# B) found by the scrubber, without anybody reading the object
-C2=$IID-00002
-W2=$(./oscli meta $IID | jq -r '.chunks[2].locations[1].worker_id')
-make corrupt W=$W2 C=$C2
-sleep 30
-docker logs controller 2>&1 | grep -E "chunk=$C2"
-./oscli where $IID
+./oscli upload .demo/crash.bin --key demo7 &      # a 100 MB upload
+docker kill controller                            # while its chunks are being written
+docker start controller
 ```
 
-```text
-[integrity] chunk=3208f8ac-…-00000 worker=worker1 -> CORRUPT (checksum mismatch on read)
-[repair] purged chunk=3208f8ac-…-00000 src=worker1 dst=- (copy was CORRUPT)
-[repair] copied chunk=3208f8ac-…-00000 src=worker2 dst=worker1 (under-replicated: 1 of 2 good copies)
-
-[scrub] chunk=3208f8ac-…-00002 worker=worker4 -> CORRUPT (checksum on disk ecd69e51… != recorded …)
-[repair] purged chunk=3208f8ac-…-00002 src=worker4 dst=- (copy was CORRUPT)
-[repair] copied chunk=3208f8ac-…-00002 src=worker3 dst=worker4 (under-replicated: 1 of 2 good copies)
-```
-
-- **Detection:** every chunk carries a SHA-256. In A the controller re-hashes what the worker
-  returns and notices the mismatch; in B the scrubber notices that the hash of the file on disk no
-  longer matches the database, without any download.
-- **Corrupted data is not returned:** in A the download falls back to the other copy and the result
-  is byte-identical to the original.
-- **Restoration:** the corrupt file is deleted, a new copy is made from the valid one, and
-  `replication_ok` is `true` again. (If the damaged copy happens not to be the one the controller
-  reads first, A is detected by the scrubber instead; the outcome is the same.)
+The client's connection drops; it keeps retrying with the same `Idempotency-Key`. The restarted
+controller is in **safe mode** (writes refused with `503 safe_mode`, nothing repaired or deleted)
+until the workers have re-registered and reported. The retried upload then succeeds and **exactly
+one object** exists. The chunks the killed attempt had written are orphans: workers keep listing
+them, and once `ORPHAN_GC_DELAY` has passed since the controller start, the next full report gets
+them deleted. `fsck` is `HEALTHY`.
 
 ---
 
 ## How it works
 
-### Chunking
+### State and invariants
 
-The upload is read in pieces of exactly `CHUNK_SIZE` bytes; only the last piece can be shorter and
-an empty piece is never produced (2 MiB → 2 chunks, 0 bytes → 0 chunks). Chunk `i` of an object
-gets the id `<object_id>-<i as 5 digits>`, for example `3f1c…-00003`. The id is unique (the object
-id is a UUID) and encodes the chunk's position; the `chunks` table additionally stores the index
-with a unique constraint per object, and downloads concatenate in index order. For every chunk the
-controller computes a SHA-256, and a running SHA-256 over the whole stream becomes the object's
-checksum. At most one chunk is in memory at any time, however large the object is.
+The controller's in-memory state ([`ClusterState`](controller/src/main/java/com/objectstore/controller/cluster/ClusterState.java)):
+workers (state, boot id, sequence numbers, statistics, command queue), a mirror of the `chunks`
+table, the **block map** (chunk → worker → copy) with its exact reverse index, pending copies,
+uploads in progress, recent failures, safe mode and counters. A copy is `OK`, `CORRUPT` or `EXCESS`,
+and remembers whether it was confirmed by the worker's reports and whether a DELETE for it was
+queued or already delivered.
 
-### Placement and replication
+**Live copies** of a chunk are its `OK` copies on non-DEAD workers (a STALE worker's copies still
+count, as in HDFS). The status, `replication_ok`, the dashboard and fsck call a chunk
+under-replicated when it has fewer than 2 live copies (a copy that is merely on its way does not
+protect anything yet; those are shown as `pending_replications`), over-replicated with more than 2,
+missing with none. The monitor *schedules* a copy when `live + pending < 2`, so it never orders the
+same copy twice.
 
-The live workers, sorted by id, form a ring. Chunk `i` starts at ring position
-`(offset + i) mod n`, where `offset` comes from the object id, and its two copies go to that
-worker and the next one. Therefore the two copies of a chunk are always on different workers,
-consecutive chunks rotate around the ring (four chunks on four workers give every worker exactly
-two copies), and different objects start at different positions, so a store full of small
-one-chunk objects still fills all workers evenly. The two writes of a chunk happen in parallel.
-The worker re-hashes the bytes it received and refuses a mismatch, writes to a temporary file,
-flushes it to the device, and renames it into place, so a crash can never leave a half-written
-file under a chunk id.
+`checkInvariants()` runs every monitor tick and from fsck; a violation is counted, logged as
+`ERROR [invariant] …` and never thrown:
 
-If a write fails (the worker may have died a moment ago and not been declared dead yet), the next
-worker on the ring is used instead. If fewer than two workers are alive the upload is refused with
-`503 insufficient_workers`; if a chunk cannot be stored twice, everything written so far is deleted
-and the answer is `503 upload_failed`. The database is written exactly once, at the very end, in a
-single transaction: a half-uploaded object can never be observed.
-
-### The metadata database
-
-SQLite, on the controller's volume, schema in
-[`V1__init.sql`](controller/src/main/resources/db/migration/V1__init.sql) (applied by Flyway):
-
-| Table | One row per | Holds |
-|---|---|---|
-| `workers` | worker | url, `ALIVE`/`DEAD`, last heartbeat |
-| `objects` | object | name, size, content type, checksum, chunk count, created/updated time |
-| `object_metadata` | custom key of an object | key, value |
-| `chunks` | chunk | object, index, size, checksum |
-| `chunk_replicas` | physical copy of a chunk | worker, `OK`/`CORRUPT`/`MISSING` |
-
-One definition is used everywhere: a **good copy** is a `chunk_replicas` row with status `OK` whose
-worker is `ALIVE`. A chunk is *under-replicated* with fewer than 2 good copies and
-*over-replicated* with more. The status endpoint, `replication_ok`, the download pre-check, repair
-and trimming all count with this rule, so they cannot disagree.
-
-### Failure detection
-
-Each worker registers when it starts and then sends a heartbeat every 2 s. The controller's health
-monitor runs every second and marks a worker `DEAD` once it has been silent for more than 6 s; the
-next heartbeat or registration marks it `ALIVE` again.
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> ALIVE: register
-    ALIVE --> ALIVE: heartbeat (every 2 s)
-    ALIVE --> DEAD: silent for more than 6 s
-    DEAD --> ALIVE: heartbeat or register
-```
-
-A dead worker's copy records are kept, they simply stop counting as good copies. That alone makes
-its chunks under-replicated, without any special case.
-
-### Repair
-
-Every 10 s the repair loop does three things, in this order:
-
-1. **Purge** copies known to be bad (`CORRUPT`/`MISSING`) on live workers: delete the file and the
-   record. A bad copy is only discarded while the chunk still has a good copy to rebuild from.
-2. **Repair** every under-replicated chunk: read a good copy, verify its hash (a repair must never
-   spread corruption), and write it to a live worker that holds no copy of that chunk yet, choosing
-   the one with the fewest copies overall.
-3. **Trim** every over-replicated chunk, which happens when a worker returns after its chunks were
-   re-replicated: remove the copy on the worker with the most copies overall, until two remain.
-   Trimming waits until the scrubber has verified the returned worker, so a fresh, known-good copy
-   is never deleted in favour of an old one that nobody has looked at.
-
-The loop does not care why a chunk is short of copies. A dead worker, a corrupt file found by the
-scrubber, a failed read during a download: each just leaves fewer good copies than required, and
-the same code fixes it. If a chunk has no good copy at all, it is reported once as `unrecoverable`
-and repaired automatically as soon as a worker holding a copy comes back.
-
-### Integrity
-
-Checksums are verified at three points:
-
-| Where | What happens on a mismatch |
+| | Invariant |
 |---|---|
-| **on write** (worker) | the chunk is rejected with `400 checksum_mismatch`; nothing touches the disk |
-| **on read** (controller, every chunk of every download and every repair) | the copy is marked `CORRUPT`, its file is deleted, and the next copy is used; the client receives correct data |
-| **in the background** (scrubber, every 15 s, and immediately when a worker comes online) | the controller asks each live worker for the ids, sizes and hashes of the files really on its disk and compares them with the database |
+| I1 | every worker in the block map is known and not DEAD |
+| I2 | the reverse index is exactly the inverse of the block map |
+| I3 | every chunk in the block map, the pending copies and the reverse index is known |
+| I4 | a pending copy is between non-DEAD workers, to a worker without the chunk, and a source has at most `MAX_STREAMS` |
+| I5 | a copy whose DELETE was delivered is `EXCESS` or `CORRUPT`, never `OK` |
+| I6 | no excess or corrupt DELETE is queued for a chunk with fewer than 2 live copies |
+| I7 | the in-memory chunk table equals the database's (fsck only) |
+| I8 | a chunk never has two pending copies to the same worker |
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> OK: upload or repair wrote the copy
-    OK --> CORRUPT: hash mismatch on read or in a scrub
-    OK --> MISSING: file not on the worker or not servable
-    MISSING --> OK: scrub finds the intact file
-    CORRUPT --> [*]: purged, a new copy is made elsewhere
-    MISSING --> [*]: purged, a new copy is made elsewhere
-    OK --> [*]: object deleted, or surplus copy trimmed
-```
+### The concurrency rule
 
-The scrubber's comparison has four outcomes: intact file → `OK` (this also restores a copy that
-was marked bad earlier); wrong hash → `CORRUPT` and the file is deleted; no file → `MISSING`; a file
-the database does not know → an orphan, deleted. Orphans arise when an object is deleted while a
-worker is down. The scrubber only detects; making the replacement copy is the repair loop's job.
+All cluster state is guarded by **one lock** (the HDFS namesystem lock). Every operation that reads
+and then modifies it runs as one synchronous block under that lock, with **no network I/O
+inside**: network calls happen before the block (parsing a request, writing chunks) or after it
+(answering). After any network call, state is looked up again by id and re-checked (for example: is
+this still the worker process we wrote to?). A database commit and the matching in-memory update
+happen in the same block, commit first. The only background threads are the health loop and the
+monitor, each a "sleep, then one pass under the lock" cycle.
 
-### Concurrency
+If the controller itself was paused or starved (more than `STALE_AFTER / 2` between health passes),
+every worker's `last_seen` is refreshed before liveness is evaluated
+(`[registry] controller stalled 20.0s - liveness grace applied`), so a frozen controller never
+declares the whole cluster dead.
 
-- **One lock for copy records.** Repairing, trimming, purging, scrubbing, marking a copy bad after
-  a failed read, and deleting an object all change existing `chunk_replicas` rows together with
-  something on a worker. They run under one fair lock, so "check the database, act on the worker,
-  update the database" is atomic with respect to all the others.
-- **Uploads and the scrubber.** While an upload is running, chunk files exist on workers that the
-  database does not know yet, which to the scrubber looks exactly like orphans. The controller
-  therefore tracks uploads in flight and the scrubber skips their files. Without this, the scrubber
-  would delete the chunks of any upload that takes longer than a scrub interval.
-- **Scrubbing does not block.** A worker is listed without holding the lock (hashing every file
-  takes time). A copy record is only judged if it is identical before and after the listing, so a
-  copy created or changed meanwhile is simply left for the next pass.
-- **No transaction spans a network call**, so the database is never held while waiting for a worker.
+### Liveness
 
-### What happens when things fail
+ALIVE → STALE after 6 s of silence → DEAD after 12 s. DEAD forgets every copy the worker held,
+clears its command queue and drops the copies it was sending or receiving. The next message from
+it is answered 404, it registers again, and its full report puts back whatever is still on its disk.
 
-| Event | Noticed by | Downloads | Uploads | Recovery |
-|---|---|---|---|---|
-| One worker stops | health monitor, within ~7 s | keep working (other copy) | keep working (3 workers) | new second copies within ~16 s |
-| The worker comes back | register / heartbeat, at once | its copies are usable again | it is back in the ring | scrubbed at once; surplus copies trimmed to exactly 2 within ~10 s |
-| Two workers stop | health monitor | work unless a chunk had both copies on those two → that object answers `503` | keep working (2 workers) | chunks with one copy left are repaired; the rest recover when a worker returns |
-| Three workers stop | health monitor | only objects fully on the last worker | refused: `503 insufficient_workers` | waits for workers |
-| A worker dies during an upload | the failed write | – | the next worker on the ring is used; `503 upload_failed` only if two copies are impossible | – |
-| A chunk file is damaged | scrubber within 15 s, or the next download at once | never served; other copy used | – | bad file deleted, new copy made |
-| A chunk file is deleted by hand | scrubber or download | other copy used | – | marked `MISSING`, then repaired |
-| The controller restarts | – | unavailable for a few seconds | same | the database is on a volume; workers keep heartbeating; loops resume |
-| Object deleted while a worker was down | scrubber, when it returns | – | – | leftover files removed (`[scrub] gc orphan …`) |
+### Block reports
+
+- **Full report:** chunks of an upload in progress are skipped; unknown chunks are orphans (see
+  below); a checksum that differs from the namespace makes
+  the copy `CORRUPT`; a confirmed copy that is no longer reported is removed (an unconfirmed one only
+  once it is older than `PENDING_TIMEOUT`, because an upload may have added it after the worker took
+  its snapshot); copies completing a pending copy are recorded as `copied`.
+- **Incremental report:** `received` adds or confirms copies and completes pending copies;
+  `deleted` removes copies (`trimmed`, `invalidated`, `deleted`); `bad` marks copies `CORRUPT`.
+
+### Orphans and the safety valve
+
+A chunk on a worker that the namespace does not know is an **orphan**. Orphans are deleted only
+after safe mode and `ORPHAN_GC_DELAY` (60 s) after a controller start, and are split in two:
+
+- **Known garbage:** chunks of an upload that never committed, or of a deleted object. Before an
+  upload writes its first chunk it records an *upload intent* durably, and the commit transaction
+  removes it; a delete leaves a *tombstone* in its transaction. Both survive a controller crash, so
+  the leftovers of a failed upload, of an upload cut short by a crash, and the copies of a deleted
+  object on a worker that was down at the time are always recognised and deleted.
+- **Unaccountable:** chunks of an object the controller has never heard of. This should not happen,
+  so if more than 10 of them would be deleted from one worker and they are more than half its
+  chunks (`ORPHAN_GC_MAX_FRACTION`), nothing is deleted and `[report] orphan GC refused` is logged:
+  that pattern points to a bug or a restored old database, not to garbage.
+
+### The replication monitor
+
+Every 3 s, as one block under the lock: expire pending copies that were not confirmed in time
+(and avoid that target for `TARGET_BACKOFF`), evaluate safe mode (and stop there while it is on),
+then for every chunk, fewest live copies first:
+
+1. **Under-replicated:** keep a surplus copy whose DELETE was not delivered yet; if no OK copy exists,
+   record `unrecoverable` once and wait; otherwise pick a source (an ALIVE, reported holder with
+   fewer than `MAX_STREAMS` copies in flight) and a target (a write-eligible worker with no copy of
+   the chunk in any state, the least loaded), queue `REPLICATE` on the source, record the copy as
+   pending.
+2. **Over-replicated** (and nothing pending, no holder STALE or unconfirmed): mark the copies on the
+   busiest workers `EXCESS` and queue their DELETE.
+3. **Clean-up** on ALIVE workers: re-send a DELETE not confirmed within `PENDING_TIMEOUT`; delete a
+   `CORRUPT` copy only once 2 live copies exist.
+
+Then it asks workers whose full report is overdue for one, and checks the invariants.
+
+### Placement
+
+A worker is **write-eligible** if it is ALIVE (or STALE while more than half the workers are STALE),
+has sent a full report, and has at least `MIN_FREE_BYTES` free. An upload's chunk `i` goes to the
+ring of write-eligible workers (sorted by id) starting at position `(offset + i) mod n`, where the
+offset comes from the object id; the copies go to consecutive positions, so they are always on
+different workers and spread evenly.
+
+### The upload path
+
+Per chunk: choose two targets, PUT in parallel, recording each target's boot id. A target that fails
+is excluded for the rest of the upload and the next worker on the ring takes its place (pipeline
+recovery). If two copies are impossible: best-effort delete of everything written, `503
+upload_failed`. Finally, in one block under the lock: the namespace transaction (object, metadata,
+chunks, idempotency key), then the in-memory chunks, then the copies, each only if its worker is
+still the same process that acknowledged the write; otherwise the monitor simply repairs that chunk.
+
+### The download path
+
+Every chunk must have a readable copy before the first byte is sent. Then each chunk is read with
+candidates computed at that moment (ALIVE before STALE, no recent data error first, least loaded
+first), and each answer is classified:
+
+| Worker's answer | Meaning | Action |
+|---|---|---|
+| connection error, time-out, 5xx, 404 | transient | note the error; next candidate |
+| 409 `chunk_corrupt` | the worker's own check failed: disk corruption | mark `CORRUPT`; next |
+| 200, wrong length | truncated transfer | next candidate |
+| 200, the worker's checksum differs from ours | disk corruption | mark `CORRUPT`; next |
+| 200, bytes do not hash to the worker's (correct) checksum | corrupted in transit | retry the same copy once, then next |
+| 200, all checks pass | good | send it |
+
+A transient error never marks a copy corrupt. If every candidate fails, the candidates are
+recomputed after a second for one more round; if that fails too, the connection is dropped (the
+client sees fewer bytes than `Content-Length` and retries).
+
+### Safe mode
+
+After every controller start: no writes (`503 safe_mode`, `Retry-After: 5`), no repairs, no
+deletions, until 99.9 % of the chunks have an OK copy on a worker whose full report has been
+processed, plus 5 s; at the latest after 30 s. Reads work as soon as reports arrive.
+
+### On the worker
+
+- **Store:** PUT checks the id, the size, free space (`507 insufficient_storage`) and the checksum;
+  writes data and `.meta` to unique temporary names, fsyncs both, renames them, fsyncs the
+  directory, then reports `received`. GET verifies the data against `.meta`. DELETE removes both and
+  reports `deleted`. At start-up, temporary files are removed, a missing sidecar is rebuilt from its
+  (already verified) data, and a stray sidecar is dropped.
+- **VERSION:** a volume whose `worker_id` is another worker's makes the worker refuse to register
+  and its health check fail (`misconfigured`), so the data stays untouched.
+- **Executor:** at most 4 commands at a time; REPLICATE reads the local copy, verifies it against
+  the sidecar and the command's checksum (bad bytes are reported, never sent) and PUTs it to the
+  target.
+- **Scanner:** every 10 s, one chunk at a time; a mismatch is reported once, and once more after each
+  full report. It never deletes.
+- **Disk check:** every 30 s, write/fsync/read/delete `/data/.probe`; on failure the process exits.
 
 ---
 
-## Requirements traceability
+## Failure model
 
-Every requirement of the assignment, where it is implemented, and how it is shown.
+**Must be handled** (no acknowledged data or metadata lost, no wrong data served, automatic
+convergence):
 
-| § | Requirement | Implemented in | Shown by |
-|---|---|---|---|
-| 1 | Store and retrieve arbitrary binary objects across multiple nodes, chunked and replicated | `UploadService`, `DownloadService` | demos 1–3 |
-| 2 | 1 controller, 4 workers, 1+ clients, 1 MB chunks, replication factor 2, Docker, persistent worker storage, no Kubernetes | `docker-compose.yml`, `Dockerfile` | `docker compose ps`; data survives `make down && make up` |
-| 3 | Unique object id; name, size, content type, creation and last-modified time, checksum, number of chunks, chunk information and storage locations | tables `objects`, `chunks`, `chunk_replicas`; `ObjectViewAssembler` | `GET …/metadata`, demo 4 |
-| 3 | Custom user-defined key/value metadata | table `object_metadata`; `MetadataValidator` | demo 4 |
-| 4 | 1 MB chunks, last may be smaller; unique chunk id; order preserved | `UploadService`, `ChunkIds` | demo 2 |
-| 4 | Two copies per chunk on different workers; distributed across workers | `PlacementPolicy` | demos 2, 3 |
-| 4 | Detect when the replication factor is no longer maintained, and restore it | `ChunkRepository.findUnderReplicated`, `RepairService` | demos 5, 6 |
-| 5 | The six client endpoints with their success codes; JSON; binary with the right content type | `ObjectsController` | all demos; [API](#client-rest-api) |
-| 5.7 | Status codes 200/201/204/400/404/409/500/503 with a meaningful JSON message | `GlobalExceptionHandler`, `ApiException` | [status codes](#status-codes-and-errors) |
-| 6 | The six internal endpoints | worker `ChunkController`; controller `InternalWorkersController` | container logs; [internal API](#internal-worker-apis) |
-| 7 | Detect an unavailable worker; keep serving while copies remain; detect lost replication; `docker stop` / `docker start worker2` | `WorkerRegistry`, `MaintenanceLoops`, `DownloadService`, `RepairService` | demo 5 |
-| 8 | Detect corruption; do not return corrupted data when a valid copy exists; restore | `ChunkStore` (write), `DownloadService` + `IntegrityReporter` (read), `ScrubService`, `RepairService` | demo 6 |
-| 9 | Instructions to build, start and interact | this README, `Makefile`, `oscli`, `demo.sh` | [Quick start](#quick-start) |
-| 10 | The six demonstrations | `demo.sh` | `make demo` → `6/6 PASS` |
+- **Processes:** a controller crash at any instruction (`docker kill`, `docker stop`, OOM); a
+  controller pause; a worker crash, stop, restart (fast or slow), pause, permanent loss, loss of its
+  volume.
+- **Network:** messages delayed by any amount, lost (request or answer), duplicated, reordered;
+  full partition of a worker; asymmetric partitions; time-outs where the remote side still acted.
+- **Storage:** bit rot in a chunk or its `.meta`; partially written files after a crash; a full
+  disk; a volume that becomes unwritable.
+- **Concurrency:** any interleaving of requests, heartbeats, reports, monitor ticks and commands.
+- **Misconfiguration:** a worker volume from another cluster or worker; two containers with the
+  same `WORKER_ID`; the controller's database wiped while workers keep data.
+
+**Out of scope:** malicious or Byzantine nodes; losing *every* copy of a chunk at once (RF = 2
+survives one simultaneous loss, not two); losing the controller's disk; clock skew between
+containers (they share the host clock; a multi-host deployment needs NTP); serving requests while
+the controller is down (clients retry until it is back).
+
+---
+
+## Edge-case catalogue
+
+**Liveness and network**
+
+| Situation | Behaviour |
+|---|---|
+| Worker silent 6–12 s (GC pause, `docker pause`, network blip) | STALE, then ALIVE again. Its copies still count; no repair; trimming its chunks is postponed. |
+| More than half the workers STALE at once | STALE workers become write-eligible again, so uploads keep working. Still no repair until DEAD. |
+| Worker partitioned (`docker network disconnect`) | DEAD after 12 s → copies forgotten → repaired from the other copies. On reconnect: 404 → re-register → full report → surplus trimmed. |
+| Worker reaches the controller but not other workers | Copies from or to it time out → that (chunk, target) pair is avoided → other pairs chosen. Reads try it last. |
+| Controller cannot reach a worker for data, but heartbeats arrive | Uploads replace it chunk by chunk; reads fall back; repairs avoid it. |
+| Very late heartbeat from a dead worker | Rejected as `too_old` or by sequence number; it never revives a DEAD worker. |
+| Heartbeat answer lost | Its commands are lost: a REPLICATE is re-planned after `PENDING_TIMEOUT`, a DELETE re-sent. |
+| Report answer lost | The worker resends the same `seq`; the controller answers `duplicate` and applies nothing twice. |
+| Old report delivered after a newer one | Lower `seq` → `stale_seq`, ignored. |
+| Message from a dead old worker process | Different `boot_id` → `stale_boot`, ignored. |
+| Command delivered twice | Heartbeat `seq` dedup on the controller, `cmd_id` dedup on the worker; PUT and DELETE are idempotent anyway. |
+| Command executed very late | Dropped once `expires_at` has passed. Inside the TTL: a late REPLICATE makes an extra copy (trimmed later); a late orphan or object DELETE is harmless (ids are never reused). |
+
+**Replication**
+
+| Situation | Behaviour |
+|---|---|
+| A repair copy landed but the target's report was lost | The pending copy times out; the target's next full report adds the copy; any extra copy is trimmed. |
+| A late receipt after a time-out, while a second copy is in flight | Both copies are accepted; the surplus is trimmed on a later tick. |
+| The source's copy turns out corrupt during REPLICATE | The worker reports it bad instead of sending it; another source is used after the time-out. |
+| The target already has different bytes under that id (409) | The copy times out; that pair is avoided; the stray file is an orphan → collected. |
+| A holder dies while an excess DELETE is only queued | The DELETE is cancelled at once and the copy counts again; no new copy is needed. |
+| A holder dies after the excess DELETE was delivered | It is not taken back (I5); the chunk is repaired normally. Residual risk: data loss only if every other copy is lost inside the command's TTL, the same window HDFS has. |
+| Worker returns after being DEAD | Its full report re-adds its copies → 3 copies → EXCESS on the busiest worker → deleted → exactly 2. |
+| Fast worker restart (< 12 s) | New boot id: its queue and its outgoing copies are dropped, its copies kept and reconciled by its full report. No repair. |
+| Worker returns with an empty volume | Its full report lists nothing → its copies are removed → repair. Its `VERSION` is gone too, so it adopts the cluster id again. |
+| Both copies of a chunk gone (holders dead) | `missing_chunks`; `unrecoverable` recorded once; the download answers 503. Recovers automatically when a holder returns. |
+| Only corrupt copies remain | Same as missing. Corrupt files are **kept** (never served) until a good copy exists. |
+| No eligible target (e.g. 2 workers alive and both hold the chunk) | `blocked`; nothing spins; retried every tick. |
+
+**Data path**
+
+| Situation | Behaviour |
+|---|---|
+| Worker fails mid-upload | Pipeline recovery replaces it for that chunk; only if no replacement exists: cleanup and `503 upload_failed`. |
+| An upload PUT timed out but landed | That worker holds an extra file: a third copy (trimmed) if the object was committed, an orphan (collected) if not. |
+| Client disconnects mid-upload | The multipart body is received completely before any chunk is written, so nothing was written; no metadata. |
+| Client retries an upload whose answer was lost | Same `Idempotency-Key` → 200 with the original object; no duplicate. |
+| Two concurrent uploads with one key | One commits; the others delete their chunks and return the winner (or 409 if the size differs). |
+| Download while a holder dies or turns corrupt | Per-chunk fallback; the client gets identical bytes. |
+| Download while the object is deleted | Chunks may vanish mid-stream → truncated body; `oscli` retries and gets 404. Accepted. |
+| Bytes corrupted in transit | The hash differs from the worker's (correct) checksum → retried; the copy is **not** marked corrupt. |
+
+**Controller crash and restart**
+
+| Situation | Behaviour |
+|---|---|
+| Crash during an upload, before the commit | No metadata; written chunks are orphans → collected after `ORPHAN_GC_DELAY`. The client retries with the same key → a fresh upload. |
+| Crash after the commit, before the 201 | The object exists; the client's retry with the same key gets 200 with it. |
+| Crash during a delete, after the commit, before queueing DELETEs | Orphans → collected after the restart. |
+| Crash during a repair or trim | Pending copies and queues are lost; workers finish or drop (TTL) what they hold; reports rebuild the state; the monitor re-plans; extra copies are trimmed. |
+| Controller paused or frozen | Stall detection gives every worker a fresh `last_seen`; no mass false DEAD. |
+| Controller down for a long time | Workers keep their data, heartbeat quietly, keep scanning and buffering reports (overflow → full report). Clients retry. On restart: safe mode → re-registration → reports → normal. |
+| A worker dies while the controller is down | It never registers; after safe mode its chunks have 1 copy → repaired. |
+| Controller database wiped (new cluster id) | Workers answer `cluster_id_mismatch`, keep all data and refuse to join, so orphan GC can never delete the old data. An operator must decide. |
+| Controller restarts during safe mode | Safe mode starts again; nothing is deleted or repaired until reports arrive. |
+
+**Misconfiguration and storage**
+
+| Situation | Behaviour |
+|---|---|
+| Wrong volume mounted (`VERSION` names another worker) | The worker refuses to register; its data is untouched; its health check fails. |
+| Two containers with the same `WORKER_ID` | Boot-id flips are detected → `ERROR [registry] duplicate WORKER_ID` and 409 `duplicate_worker` for 60 s. |
+| Disk full | PUT answers 507 → pipeline recovery / repair back-off; the worker is not a target while it has less than `MIN_FREE_BYTES`. |
+| Volume unwritable | The disk check fails → the worker exits → DEAD → repair. |
+| One report would delete many "orphans" (a bug, a wrong database) | The safety valve refuses the GC and logs an ERROR. Chunks of failed uploads and deleted objects are not affected: they are known garbage. |
+| `.meta` damaged | The copy is treated as corrupt: replaced, then deleted. |
+
+---
+
+## Guarantees and limits
+
+**Guarantees**
+
+- A `201` survives a controller crash and the loss of any single worker.
+- Corrupt data is never served while a good copy exists.
+- Once failures stop, the cluster converges to exactly 2 good copies of every chunk, no orphans,
+  and disks that match the controller's block map.
+
+**Limits**
+
+- No service while the controller is down (it restarts in about a second; clients retry).
+- Data loss if every copy of a chunk fails within one repair window (RF = 2 survives one loss).
 
 ---
 
 ## Testing
 
+| Layer | How to run | What it covers |
+|---|---|---|
+| Unit tests | `make test` | chunk store and sidecars, scanner, IBR buffer; cluster state and invariants; the protocol's acceptance rules; liveness and stall detection; block report processing; the replication planner (repair, trim, invalidate, postpone, protect); placement; download classification (including corruption in transit); metadata rules; the CLI (retries, idempotency keys, exit codes) |
+| In-process system tests | `make test` | [`system-tests`](system-tests): the real controller and four real workers in one JVM, real HTTP, timers scaled down tenfold. Cluster formation, STALE/DEAD/return, quick restarts, replay protection over raw HTTP, scanner, orphan GC, safe mode after a controller restart, wiped controller database; worker-to-worker repair and trimming with a watchdog that no chunk ever drops below one OK copy, `MAX_STREAMS`, corrupt-copy replacement order, missing chunks, a copy target dying; pipeline recovery, `upload_failed`, idempotency (including 4 concurrent uploads with one key), a controller crash after a 201, deletes via commands; fsck |
+| Scenario scripts | `make scenarios` | [`tests/scenarios/`](tests/scenarios): every acceptance criterion of blocks 6–9 against the real Docker stack: `docker stop/start/restart/pause/kill`, `docker network disconnect`, a wiped controller volume, network faults |
+| Chaos test | `make chaos` | [`tests/chaos.py`](tests/chaos.py), below |
+
+**The chaos test** starts the stack with fault injection on every internal call (up to 300 ms
+delay, 5 % of calls lost, 5 % duplicated), runs four concurrent clients for `CHAOS_MINUTES`
+(default 5) uploading 0–5 MB objects with idempotency keys, downloading and verifying them,
+deleting some and patching metadata, while a disruptor every 15–40 s stops, pauses or partitions one
+worker (never more than one at a time), restarts, kills or pauses the controller, or corrupts a
+random chunk file. Then it stops the disruption and requires: the status converged (nothing
+under/over-replicated, missing or pending, no queued commands, no corrupt copies) within 180 s;
+fsck `HEALTHY`, quiescent, no orphans, disks matching the map; every acknowledged object
+downloadable with the right SHA-256; every deleted object 404 with no chunk on any disk; zero
+invariant violations.
+
 ```bash
-make test        # 110 tests: mvn verify, with local Maven + JDK 21, or else in a Maven container
+make up && python3 tests/chaos.py              # or: CHAOS_MINUTES=10 make chaos
 ```
 
-| Module | Tests | What they cover |
-|---|---|---|
-| `common` | 18 | SHA-256 against known vectors; chunk-id format and rejection of anything path-like |
-| `worker` | 22 | the chunk store on a real directory (atomic write, idempotence, conflict, traversal attempts, leftover temp files) and the internal API over real HTTP |
-| `controller` | 58 | placement and metadata rules as unit tests, and 20 end-to-end tests |
-| `client` | 12 | the CLI against a stub server: multipart encoding, checksum verification, exit codes |
+### Measured results
 
-The controller's end-to-end tests
-([`ObjectStoreIntegrationTest`](controller/src/test/java/com/objectstore/controller/ObjectStoreIntegrationTest.java))
-start the real application (HTTP layer, SQLite, background loops) against four in-memory workers
-that speak the internal API and can be stopped, restarted and damaged. With the timers shortened
-they cover, in about 20 seconds: chunking and placement of a 3.5 MB object, awkward sizes (0 bytes,
-1 MiB ± 1), metadata, listing, deletion, every error code, a worker dying and returning
-(re-replication, then trimming back to two), an upload surviving a worker that just died, loss of
-both copies and automatic recovery, corruption found on read and by the scrubber, orphan
-collection, a download that loses every copy mid-stream, the 409 conflict, and the scrubber
-leaving an upload in progress alone.
+| Run | Result |
+|---|---|
+| `make test` | 145 tests, 0 failures |
+| Scenario scripts | block 6: 34/34 · block 7: 32/32 · block 8: 24/24 · block 9: 7/7 |
+| `make demo` | 7/7 PASS, twice in a row on the same stack (~2 min each) |
+| Chaos, 3 runs in a row | each 6/6 checks passed (table below) |
+
+| Chaos run | Uploads | Downloads | Deletes | Patches | Client retries | Disruptions | Problems | Converged | fsck HEALTHY |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1359 | 1367 | 332 | 673 | 69 | 8: controller restart, kill and pause; worker stop, pause, 2 partitions; a corrupted chunk | 0 | 6 s | 41 s |
+| 2 | 1135 | 1051 | 290 | 553 | 114 | 9: 2 controller kills, 2 restarts, 1 pause; 2 worker stops, 2 pauses | 0 | 0 s | 33 s |
+| 3 | 1217 | 1148 | 306 | 621 | 79 | 9: controller kill, 2 restarts, 5 pauses; a corrupted chunk | 0 | 10 s | 42 s |
+
+"fsck HEALTHY" includes the orphan delay: leftovers of uploads cut short by a controller kill are
+collected only `ORPHAN_GC_DELAY` after the last controller start. After every run, all acknowledged
+objects (845–1027) downloaded with the right SHA-256, every deleted object (290–332) was gone from
+every disk, and `invariant_violations` was 0.
 
 ---
 
-## Design decisions
+## Requirements traceability
 
-The project follows the two design documents it was planned with (*Architecture & Project Flow v2*
-and *Implementation Specification v2*). Those describe a Python/FastAPI build; this implementation
-is **Java 21 with Spring Boot 4.1**. The architecture is unchanged, and everything visible from
-outside is as specified there: endpoint paths, JSON keys, status strings, error codes, environment
-variable names, timers and log tags.
+| § | Requirement | Implemented in | Shown by |
+|---|---|---|---|
+| 1 | Arbitrary binary objects across multiple nodes, chunked and replicated | `UploadService`, `DownloadService` | demos 1–3 |
+| 2 | 1 controller, 4 workers, 1+ clients, 1 MB chunks, RF 2, Docker, persistent worker storage, no Kubernetes | `docker-compose.yml`, `Dockerfile` | `docker compose ps`; data survives restarts |
+| 3 | Object id; name, size, type, created/modified time, checksum, chunk count, chunk information and locations; custom metadata | namespace tables; `ObjectViewAssembler` | `GET …/metadata`, demo 4 |
+| 4 | 1 MB chunks, unique ids, order kept; 2 copies on different workers, spread; detect and restore lost replication | `UploadService`, `PlacementPolicy`, `ReplicationPlanner` | demos 2, 3, 5, 6 |
+| 5 | The six client endpoints, JSON, binary with the right content type, status codes with JSON errors | `ObjectsController`, `GlobalExceptionHandler` | all demos |
+| 6 | Internal APIs: register, heartbeat, PUT/GET/DELETE chunk, list a worker's chunks (extended with block reports) | `InternalWorkersController`, worker `ChunkController` | logs; scenario scripts |
+| 7 | Detect unavailable workers; keep serving; detect and restore replication; `docker stop/start worker2` | `Registry`, `Reports`, `ReplicationPlanner`, worker `Reporter`/`Lifeline`/`CommandExecutor` | demo 5 |
+| 8 | Detect corruption, never return it when a good copy exists, restore; intentional corruption | worker `ChunkStore` + `BlockScanner`, `DownloadService`, `ReplicationPlanner` | demo 6 |
+| 9 | Build, start and interact instructions | this README, `Makefile`, `oscli`, `demo.sh` | Quick start |
+| 10 | The demonstrations | `demo.sh` | `make demo` → `7/7 PASS` |
 
-**Choices carried over**
+---
+
+## Decisions
+
+The implementation follows *Architecture & Project Flow v2*, *Implementation Specification v2* and
+the HDFS amendment that supersedes their blocks 6–9. Every decision taken where those documents were
+silent, contradicted each other, or did not fit the chosen stack:
+
+**Stack and structure**
 
 | Decision | Reason |
 |---|---|
-| SQLite rather than a database server | No extra container. The project needs durability, not heavy concurrency, and a file on a volume provides it. |
-| The controller chunks the object, not the client | Keeps the client trivial and all checksums in one trusted place. |
-| The controller pushes copies; workers never copy to each other | Matches the internal API of the assignment; no worker-to-worker protocol is needed. |
-| SHA-256 per chunk and per object | The chunk hash pinpoints the damaged piece; the object hash is the checksum the assignment asks for and doubles as the `ETag`. |
-| Bad copy records are deleted after repair, not reused | "Good copies = `OK` rows on live workers" stays trivially correct. |
-| Timers 2 / 6 / 10 / 15 s | Fast enough to watch recovery happen in a demo, slow enough not to flap on a laptop. |
+| Java 21 + Spring Boot 4.1 instead of Python + FastAPI | The project owner's choice. Every name visible from outside (endpoints, JSON keys, error codes, environment variables, states, log tags) is as specified. |
+| One namesystem lock instead of "one asyncio event loop" | Java has threads, so the equivalent of "no `await` between read and write" is "no network I/O while holding the lock", which is exactly how the HDFS NameNode works. The health loop and the monitor are two threads that each run one pass under the lock; there is no state outside it. Lock ordering is fixed: cluster lock before a database connection, never the reverse. |
+| Worker work on threads instead of `asyncio.to_thread` | The scanner, disk check, reporter and heartbeat each have their own thread, so none can delay another, which is the property the "50 ms" rule protects. |
+| Blocks 5.1 and 6 in one commit | Block 5.1 alone would delete the replica tables while leaving the controller no way to learn replica locations. |
+| `oscli` (Java) instead of `client.py`; the chaos test in Python | `oscli` is the project's existing client. The chaos test is an external harness and uses only the Python standard library, so it runs on any machine with Python 3. |
+| In-process system tests (`system-tests`) | They run the real protocol between real controller and worker code in seconds, in CI, without Docker. The Docker scenario scripts cover what needs real containers. |
+| Config files named `controller.yml` / `worker.yml` | Both applications share one classpath in the system tests; two `application.yml` files would collide. |
 
-**Where this implementation deliberately differs from the specification**
+**Where the HDFS amendment had to be resolved**
 
-| Topic | Specification | Here | Why |
-|---|---|---|---|
-| Language and framework | Python 3.12, FastAPI, SQLAlchemy | Java 21, Spring Boot 4.1, Spring JDBC (`JdbcClient`), Flyway | Team preference. Virtual threads give the same "blocking code, many concurrent calls" simplicity as `async`. |
-| Client | `client.py` | `oscli`, a Java CLI, also shipped as a `client` container | Same commands and exit codes; needs nothing but Docker on the host. |
-| **Uploads vs. the scrubber** | not addressed | uploads in flight are tracked and skipped by the scrubber | In the specified design the scrubber deletes "files without a database row" every 15 s, while an upload records its rows only at the end. An upload longer than 15 s would lose its chunks. A test reproduces this. |
-| Placement | ring position = chunk index | ring position = chunk index + an offset derived from the object id | With the plain rule, chunk 0 always lands on worker1 and worker2, so a store of small one-chunk objects never uses worker3 and worker4. |
-| A worker failing during an upload | fail the whole upload | try the next worker on the ring; fail only if two copies are impossible | An upload should not fail just because a worker died within the last 6 s. |
-| Trimming after a worker returns | as soon as counts say "3 copies" | only after the scrubber has verified the returned worker | Otherwise a fresh, verified copy could be deleted in favour of an old one that may no longer be intact. |
-| Purging bad copies | always | only while the chunk still has a good copy | A copy marked `MISSING` after a transient error may be intact; if it is the last one, it must not be deleted. The scrubber restores it. |
-| Scrubbing | compare under the global lock | list without the lock, judge only records unchanged before and after | A slow listing no longer blocks deletes and read-path bookkeeping. |
-| Start-up | – | no worker is declared dead for `STARTUP_GRACE` (20 s) after a controller start | On a cold start the workers boot after the controller; without this they are all marked DEAD and "come back" seconds later. |
-| `unrecoverable` events | logged every repair pass | logged once per chunk until the situation changes | Keeps the repair log readable. |
-| Timestamps | whole seconds | milliseconds, fixed width | A metadata update within the same second as the upload must still show a later `updated_at`. |
-| `503 insufficient_workers` | before reading the request body | after the body has been received | The servlet container spools the multipart body to a temporary file before the application sees it. Memory use stays constant either way. |
-| Verification | pytest smoke tests against a running stack; fixed `sleep`s in the demo | JUnit tests against in-memory workers; a polling demo | Runs in CI without Docker; the demo cannot be broken by a slow machine. |
-| Last chunk of 3,500,000 bytes | 354,304 | 354,272 | 3,500,000 − 3 × 1,048,576 = 354,272. |
+| Topic | Decision | Reason |
+|---|---|---|
+| Re-sending a delivered DELETE | `delete_delivered` stays true once set | §6.5 says `send_delete` resets it, but §6.5 and I5 also say a delivered DELETE is never taken back. Resetting it could turn a copy that a worker may still delete back into `OK`. |
+| When undelivered DELETEs are cancelled | As soon as a chunk has fewer than 2 live copies, from any cause (a worker DEAD, a report, a copy found corrupt) | Step 3a only reacts on the next monitor tick and only when `live + pending < 2`, which leaves I6 violated in between, observable by fsck. |
+| Idempotent replay and a different size | The replay reads the multipart part to learn its size (no worker is contacted) | §6.7 says "without reading the body", AC-8.3 requires 409 for a different size; the size is in the body. |
+| Copies confirmed during an upload | A worker report mentioning a chunk of an upload in progress is remembered; the copy is recorded as confirmed at commit | Otherwise every freshly uploaded copy stays "unconfirmed" until the next full report (up to 30 s) and postpones trimming. |
+| Orphans the controller can account for | Upload intents and deletion tombstones in the namespace; their chunks are deleted even when the orphan safety valve would refuse | The valve as specified blocks AC-8.2 for good: a worker stopped during a large failed upload comes back with *most* of its chunks belonging to that upload, and the valve refuses every report. The same happens to a large object deleted while a worker is down. The valve still applies to chunks nobody can account for. |
+| A chunk file without a valid `.meta` | Listed with checksum `unverified` once it has not changed for 5 s; the scanner reports it bad | Otherwise a planted file or a sidecar damaged at runtime would be invisible until the next worker restart. The 5 s keep a write in progress (data renamed just before its sidecar) from being misread. |
+| Registration and `MAX_MESSAGE_AGE` | Registrations are also rejected when too old | A delayed registration from an old process would otherwise reset the worker's state to that old process. |
+| Worker DELETE of an absent chunk | 204, and reported as deleted | Specified in §7.2; v2 had 404. |
+| A misconfigured worker's `/health` | 503 with `{"status":"misconfigured"}` | So Docker marks the container unhealthy and the operator notices. |
+| Placement ring | Offset by the object id | With the plain ring, chunk 0 of every object lands on worker1 and worker2. |
+| `under_replicated` in the status and fsck | Fewer than 2 *live* copies; copies on their way are shown as `pending_replications` | The monitor schedules on `live + pending` (§6.5) so that it never orders a copy twice, but a copy that is merely ordered protects nothing yet: counting it would report a chunk as healthy while its only copy is at risk. |
+| A disk probe interrupted by shutdown | Not a disk failure: the check simply stops | Otherwise every `docker stop` that interrupts the probe's file I/O would end with the "volume failed" exit path. |
+| `blocked` in the status | Chunks blocked in the last tick (the cumulative count is in `counters.blocked`) | A cumulative counter grows for ever while one chunk is blocked. |
+| Extra monitor events | `replicate` (copy ordered), `restored` (surplus copy kept), `orphan` (orphan DELETE queued) | They make the order of events checkable (AC-7.2, AC-7.5, AC-7.8). |
+| A worker 404 on download | Transient | The file is gone (deleted by hand); the worker's next full report removes the copy. It is not corrupt. |
+| "Recent data error" for read ordering | Within `TARGET_BACKOFF` (30 s) | Not specified. |
+| Client retries | All 503 answers and connection errors, for up to 60 s | Includes `upload_failed` and `chunk_unavailable`, both transient during a restart. |
+| Tomcat swallows up to 64 MB of a refused body | | So a client refused before its body was read (safe mode) still gets the JSON answer. |
+| STALE/DEAD timing in the scenario scripts | Judged by the silence the controller measured (`last_seen_s_ago` at the transition) | The worker's last heartbeat came 0–2 s before `docker stop`, so timing from the stop command is off by up to 2 s. |
 
-**Other implementation notes**
-
-- **One database connection.** SQLite allows one writer at a time. The connection pool holds a
-  single connection, which serialises all statements in-process instead of relying on lock
-  time-outs between connections. This is safe because transactions are tiny and never wait on I/O.
-- **A download that breaks after it started.** If every copy of a later chunk fails once the first
-  bytes are on the wire, the status code can no longer change. The controller then drops the
-  connection, so the client sees fewer bytes than `Content-Length` (and `oscli` exits with 2),
-  never a silently truncated "200 OK".
-- **Images.** One multi-stage `Dockerfile` with three targets. Services run as a non-root user;
-  `/data` is owned by that user, and a named volume mounted there inherits the ownership.
-- **Deleting while a download is streaming** is not guarded; that download may be cut off.
+**Carried over from v2:** SQLite rather than a database server; SHA-256 per chunk and per object
+(the object checksum is the `ETag`); the controller chunks objects (clients stay simple);
+millisecond timestamps (an update in the same second must show a later `updated_at`).
 
 ---
 
-## Limitations
+## Future work
 
-- **The controller is a single point of failure.** The assignment fixes the number of controllers
-  at one. Its state is durable and it restarts in about a second, but while it is down the store is
-  unavailable.
-- **No authentication, TLS or multi-tenancy.** The internal endpoints the controller serves
-  (`/internal/workers/*`) share its published port; a real deployment would put them on a separate,
-  unpublished listener.
-- **The scrubber re-hashes every chunk on every pass.** Fine at this scale; a real system would
-  sample, or checkpoint its progress.
-- **No rebalancing.** A new or returning worker only receives new chunks and repair copies;
-  existing chunks are not moved to even out the load.
-- **Uploads are spooled to the controller's local disk** before being chunked, so the controller
-  needs free temporary space equal to the largest upload in flight.
-- **An object can have at most 100,000 chunks** (about 97 GiB), because the chunk index has five
-  digits; `MAX_UPLOAD_SIZE` (10 GB by default) is the practical limit.
+- **Decommissioning** (HDFS): drain a worker before removing it.
+- **NameNode high availability**: a standby controller with a shared edit log.
+- **Balancer**: move existing chunks to new or empty workers.
+- Streaming multipart parsing, so an upload does not need to be spooled to the controller's disk.
+- A separate listener for the internal endpoints, and authentication.
+- The scanner re-hashes every chunk every pass; a real system would rate-limit it.
+- Upload intents and tombstones are kept for ever; they could be pruned once no worker reports
+  chunks of them any more.
 
 ---
 
@@ -914,54 +1003,40 @@ variable names, timers and log tags.
 
 ```text
 .
-├── docker-compose.yml        1 controller, 4 workers, 1 client; volumes and network
-├── Dockerfile                multi-stage build with three targets: controller, worker, client
-├── Makefile                  up / down / status / stop / start / corrupt / test / demo
-├── demo.sh                   the six required demonstrations, self-checking
-├── oscli                     wrapper that runs the CLI (in the client container, or locally)
-├── samples/sample.jpg        a real image for the demo
-├── pom.xml                   Maven parent (Spring Boot 4.1, Java 21)
-├── common/                   shared wire contract
-│   └── src/main/java/com/objectstore/common/
-│       ├── Checksums.java, ChunkIds.java, InternalApi.java
-│       ├── dto/              ApiError, ChunkInfo, RegisterRequest, HeartbeatRequest, ...
-│       └── web/              ApiException, ErrorCodes, GlobalExceptionHandler, JsonErrorController
-├── worker/
+├── docker-compose.yml          1 controller, 4 workers, 1 client; volumes, network, restart policy
+├── docker-compose.chaos.yml    fault injection on (used by the chaos test)
+├── Dockerfile                  multi-stage build: controller, worker, client
+├── Makefile                    up / down / status / fsck / stop / start / pause / corrupt / test / scenarios / chaos / demo
+├── demo.sh                     the seven demonstrations, self-checking
+├── oscli                       runs the CLI (in the client container, or locally)
+├── samples/sample.jpg          a real image for the demo
+├── common/                     protocol messages, checksums, chunk ids, JSON errors, fault-injecting HTTP clients
+├── worker/                     the DataNode
 │   └── src/main/java/com/objectstore/worker/
-│       ├── api/              ChunkController (PUT/GET/DELETE chunk, list), HealthController
-│       ├── storage/          ChunkStore (atomic, checksum-verified disk operations)
-│       ├── registration/     ControllerLink (register with retry, heartbeat loop)
-│       └── config/           WorkerProperties
-├── controller/
-│   └── src/main/
-│       ├── java/com/objectstore/controller/
-│       │   ├── api/          ObjectsController, InternalWorkersController, ClusterController, dto/
-│       │   ├── objects/      UploadService, DownloadService, ObjectService, PlacementPolicy,
-│       │   │                 MetadataValidator, InFlightUploads, ObjectViewAssembler
-│       │   ├── cluster/      WorkerRegistry, WorkerClient, ClusterStatusService
-│       │   ├── replication/  RepairService, ScrubService, IntegrityReporter, ReplicaGuard,
-│       │   │                 RepairLog, MaintenanceLoops
-│       │   ├── repository/   WorkerRepository, ObjectRepository, ChunkRepository
-│       │   ├── domain/       Worker, StoredObject, Chunk, ReplicaLocation, ...
-│       │   └── config/       ControllerProperties, InfrastructureConfig, WorkerIo
-│       └── resources/
-│           ├── application.yml
-│           ├── db/migration/V1__init.sql
-│           └── static/dashboard.html
-└── client/
-    └── src/main/java/com/objectstore/client/   ObjectStoreCli, Arguments, ContentTypes
+│       ├── api/                ChunkController (PUT/GET/DELETE/list), HealthController
+│       ├── storage/            ChunkStore (.meta sidecars, fsync), VersionFile, BlockScanner, DiskCheck
+│       ├── reporting/          Reporter (register + ordered reports), Lifeline (heartbeats), IbrBuffer
+│       └── commands/           CommandExecutor (REPLICATE, DELETE)
+├── controller/                 the NameNode
+│   └── src/main/java/com/objectstore/controller/
+│       ├── api/                ObjectsController, InternalWorkersController, ClusterController
+│       ├── cluster/            ClusterState, Registry, Reports, SafeMode, Fsck, WorkerClient, ClusterBootstrap
+│       ├── replication/        Monitor, ReplicationPlanner, MaintenanceLoops
+│       ├── objects/            UploadService, DownloadService, ObjectService, PlacementPolicy, MetadataValidator
+│       └── repository/         ObjectRepository, ChunkRepository, ClusterMetaRepository (+ db/migration)
+├── client/                     oscli
+├── system-tests/               InProcessCluster and the end-to-end tests
+└── tests/
+    ├── scenarios/              block6_protocol.sh … block9_fsck.sh, lib.sh
+    └── chaos.py
 ```
 
-For readers coming from the specification, the modules it names map as follows:
-`routes_objects.py` → `ObjectsController` + `UploadService`/`DownloadService`/`ObjectService` ·
-`routes_internal.py` → `InternalWorkersController` · `routes_cluster.py` → `ClusterController` ·
-`registry.py` → `WorkerRegistry` · `chunker.py` → `UploadService` + `ChunkIds` ·
-`placement.py` → `PlacementPolicy` · `workers_client.py` → `WorkerClient` ·
-`replicas.py` → `ChunkRepository` + `ReplicaGuard` + `IntegrityReporter` ·
-`repair.py` → `RepairService` + `RepairLog` · `scrub.py` → `ScrubService` ·
-`errors.py` → `ApiException` + `GlobalExceptionHandler` · `models.py` → `V1__init.sql` + `domain/` ·
-`schemas.py` → `api/dto/` + `common/dto/` · `store.py` → `ChunkStore` · worker `main.py` →
-`ChunkController` + `ControllerLink`.
+Module names from the specification: `cluster.py` → `ClusterState` · `registry.py` → `Registry` ·
+`reports.py` → `Reports` · `monitor.py` → `Monitor` + `ReplicationPlanner` · `placement.py` →
+`PlacementPolicy` · `safemode.py` → `SafeMode` · `fsck.py` → `Fsck` · `faults.py` →
+`FaultInjectingRequestFactory` · worker `store.py` → `ChunkStore` · `version.py` → `VersionFile` ·
+`reporter.py` → `Reporter` + `IbrBuffer` · `executor.py` → `CommandExecutor` · `scanner.py` →
+`BlockScanner` · `diskcheck.py` → `DiskCheck`.
 
 ---
 
@@ -969,10 +1044,11 @@ For readers coming from the specification, the modules it names map as follows:
 
 | Symptom | Cause and fix |
 |---|---|
-| `make up` fails with "port is already allocated" | Something else uses port 8000. `CONTROLLER_PORT=9000 make up`, then pass `BASE=http://localhost:9000` to `make status` / `make demo`. |
-| `oscli: in docker mode, run this from inside …` | The client container only sees the project directory. Copy the file into it (for example into `.demo/`), or use `OSCLI_MODE=local`. |
-| `oscli` says a file "is not a readable file" although it exists | Same reason: an absolute path on your machine does not exist inside the container. Use a path relative to the project directory. |
-| Upload answers `503 insufficient_workers` | Fewer than two workers are `ALIVE`. Check `make status` and `docker compose ps`; start the stopped ones. |
-| Download answers `503 chunk_unavailable` | Both workers holding some chunk are down. The object becomes available again as soon as one returns. |
-| A worker stays `DEAD` after `docker start` | Check `docker logs <worker>`: it logs every registration attempt and why it failed. |
-| Start with a clean slate | `make down-v && make up` wipes all volumes. |
+| `make up` fails with "port is already allocated" | Port 8000 is in use: `CONTROLLER_PORT=9000 make up`, and `BASE=http://localhost:9000` for `make status` / `make demo`. |
+| Writes answer `503 safe_mode` | The controller started less than ~10 s ago and is waiting for block reports. Retry (`oscli` does). |
+| Workers log `cluster_id_mismatch` and the controller shows no workers | The controller's database was wiped or replaced. The workers protect their data on purpose. To start over: `make down-v && make up`. |
+| A worker is unhealthy with `misconfigured` | Its volume belongs to another worker (`/data/VERSION`). Mount the right volume. |
+| `oscli: in docker mode, run this from inside …` | The client container only sees the project directory: copy the file into it, or use `OSCLI_MODE=local`. |
+| Upload answers `503 insufficient_workers` | Fewer than two workers can take writes. Check `make status`. |
+| Download answers `503 chunk_unavailable` | Every copy of some chunk is on a DEAD worker. It is back as soon as one returns. |
+| Orphan files stay on a worker | Deletion waits `ORPHAN_GC_DELAY` (60 s) after a controller start, then the next full report (30 s). `make fsck` shows `orphans_on_disk`. |
