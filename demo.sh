@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# demo.sh - runs the six required demonstrations against a running stack (start it with "make up")
-# and checks every claim it makes. Prints PASS/FAIL per demonstration and "N/6 PASS" at the end;
-# the exit code is 0 only if all six passed.
+# demo.sh - runs the required demonstrations against a running stack (start it with "make up")
+# and checks every claim it makes. Prints PASS/FAIL per demonstration and "N/7 PASS" at the end;
+# the exit code is 0 only if all seven passed.
 #
-#   1. Object storage            4. Metadata
+#   1. Object storage            4. Metadata         7. Controller crash (docker kill mid-upload)
 #   2. Chunking and distribution 5. Worker failure   (docker stop / docker start worker2)
 #   3. Replication               6. Data integrity   (a stored chunk is corrupted on purpose)
 #
@@ -113,9 +113,10 @@ field() { jq -r "$2" < "$1"; }   # field <file> <jq expression>
 worker_is() { [ "$(status | jq -r --arg w "$1" '.workers[] | select(.worker_id == $w) | .status')" = "$2" ]; }
 no_chunk_under_replicated() { status | jq -e '.under_replicated == 0'; }
 cluster_healthy() {
-    status | jq -e '([.workers[] | select(.status == "ALIVE")] | length) == 4
-        and .under_replicated == 0 and .over_replicated == 0
-        and .replicas.corrupt == 0 and .replicas.missing == 0'
+    status | jq -e '.safe_mode == false
+        and ([.workers[] | select(.state == "ALIVE" and .has_reported)] | length) == 4
+        and .under_replicated == 0 and .over_replicated == 0 and .missing_chunks == 0
+        and .pending_replications == 0 and .replicas.corrupt == 0 and .replicas.excess == 0'
 }
 # every chunk of the object has exactly two copies, both intact, on two different live workers
 exactly_two_good_copies() {
@@ -124,7 +125,8 @@ exactly_two_good_copies() {
           and ([.locations[].worker_id] | unique | length) == 2
           and ([.locations[] | select(.status == "OK" and .worker_status == "ALIVE")] | length) == 2] | all)'
 }
-files_on_worker() { docker exec "$1" sh -c "ls /data/chunks | grep -c '^$2' || true"; }
+# Chunk data files of an object on a worker (each also has a <chunk_id>.meta sidecar, not counted).
+files_on_worker() { docker exec "$1" sh -c "ls /data/chunks | grep -v '\.meta\$' | grep -c '^$2' || true"; }
 disk_sha256() { docker exec "$1" sha256sum "/data/chunks/$2" 2> /dev/null | cut -d' ' -f1; }
 # the file of every recorded copy of every chunk hashes to the checksum recorded at upload
 copies_on_disk_are_intact() {
@@ -137,8 +139,8 @@ corrupt_chunk() {
     docker exec "$1" sh -c "printf 'XXXX' | dd of=/data/chunks/$2 bs=1 seek=100 conv=notrunc status=none"
 }
 show_workers() {
-    status | jq -r '.workers[] | "\(.worker_id)  \(.status)  copies=\(.chunk_count)"' | indent
-    status | jq -r '"under_replicated=\(.under_replicated)  over_replicated=\(.over_replicated)  copies: ok=\(.replicas.ok) corrupt=\(.replicas.corrupt) missing=\(.replicas.missing)"' | indent
+    status | jq -r '.workers[] | "\(.worker_id)  \(.state)  copies=\(.chunk_count)  last heartbeat \(.last_seen_s_ago) s ago"' | indent
+    status | jq -r '"under_replicated=\(.under_replicated)  over_replicated=\(.over_replicated)  pending=\(.pending_replications)  missing=\(.missing_chunks)  copies: ok=\(.replicas.ok) corrupt=\(.replicas.corrupt) excess=\(.replicas.excess)"' | indent
 }
 repair_events() { # repair_events <event> <object_id>
     status | jq -r --arg e "$1" --arg o "$2" '.repair_log[] | select(.event == $e and (.chunk_id | startswith($o)))
@@ -175,7 +177,7 @@ if [ "$DEMO_OK" != 1 ]; then
 fi
 
 # ============================================================================================
-banner "1/6  Object storage - upload an object, retrieve it, verify it is identical"
+banner "1/7  Object storage - upload an object, retrieve it, verify it is identical"
 
 head -c 307200 /dev/urandom > "$WORK/small.bin"
 step "Upload a 300 KB file:  POST $API/objects  (multipart/form-data, field 'file')"
@@ -216,7 +218,7 @@ check "the object is gone: 404 with a JSON error" equal "$CODE $(field "$WORK/go
 finish
 
 # ============================================================================================
-banner "2/6  Chunking and distribution - an object larger than 1 MB"
+banner "2/7  Chunking and distribution - an object larger than 1 MB"
 
 head -c 3500000 /dev/urandom > "$WORK/big.bin"
 LAST_CHUNK=$((3500000 - 3 * MIB))   # 354272
@@ -235,14 +237,14 @@ oscli where "$BIG_ID" | indent
 check "every chunk is stored on two different workers" \
     file_has "$WORK/big.json" '[.chunks[] | ([.locations[].worker_id] | unique | length) == 2] | all'
 
-step "The chunk files as they exist on each worker's volume (docker exec <worker> ls /data/chunks)"
+step "The chunk files as they exist on each worker's volume (each also has a .meta sidecar with its checksum)"
 TOTAL_FILES=0
 SPREAD_OK=1
 for worker in "${WORKERS[@]}"; do
     count=$(files_on_worker "$worker" "$BIG_ID")
     TOTAL_FILES=$((TOTAL_FILES + count))
     [ "$count" = 2 ] || SPREAD_OK=0
-    note "$worker: $count chunk files of this object: $(docker exec "$worker" sh -c "ls /data/chunks | grep '^$BIG_ID' | sed 's/.*-/…-/' | tr '\n' ' '")"
+    note "$worker: $count chunk files of this object: $(docker exec "$worker" sh -c "ls /data/chunks | grep -v '\.meta\$' | grep '^$BIG_ID' | sed 's/.*-/…-/' | tr '\n' ' '")"
 done
 check "8 chunk files exist in total (4 chunks x 2 copies)" equal "$TOTAL_FILES" 8
 check "they are spread evenly: every worker holds exactly 2" equal "$SPREAD_OK" 1
@@ -253,7 +255,7 @@ check "the reassembled object is identical to the original" cmp -s "$WORK/big.bi
 finish
 
 # ============================================================================================
-banner "3/6  Replication - every chunk has two copies; where they are"
+banner "3/7  Replication - every chunk has two copies; where they are"
 
 step "Copies of each chunk of $BIG_ID, with the SHA-256 of the file on each worker's disk"
 while read -r chunk_id checksum worker_a worker_b; do
@@ -271,7 +273,7 @@ check "the object reports replication_ok = true" meta_has "$BIG_ID" '.replicatio
 finish
 
 # ============================================================================================
-banner "4/6  Metadata - custom metadata on upload; read and modify it without re-uploading"
+banner "4/7  Metadata - custom metadata on upload; read and modify it without re-uploading"
 
 head -c 1500000 /dev/urandom > "$WORK/report.bin"
 step "Upload with custom metadata:  -F 'metadata={\"owner\":\"ansh\",\"course\":\"cloud-computing\"}'"
@@ -317,7 +319,7 @@ check "400 with a JSON error message" equal "$CODE $(field "$WORK/bad.json" .err
 finish
 
 # ============================================================================================
-banner "5/6  Worker failure - docker stop $VICTIM, then docker start $VICTIM"
+banner "5/7  Worker failure - docker stop $VICTIM, then docker start $VICTIM"
 
 head -c 3500000 /dev/urandom > "$WORK/failure.bin"
 oscli upload "$WORK/failure.bin" > "$WORK/failure.json"
@@ -332,14 +334,23 @@ check "$VICTIM holds a copy of $AFFECTED chunks of the test object" test "$AFFEC
 check "the replication factor is maintained (2 good copies of every chunk)" exactly_two_good_copies "$FAIL_ID"
 
 step "docker stop $VICTIM"
-docker stop "$VICTIM" > /dev/null
 STOPPED_AT=$SECONDS
-# Poll quickly so that the degraded state is observed before the repair loop gets to it.
+docker stop "$VICTIM" > /dev/null
+# Poll quickly so that each phase is observed: STALE (silent > 6 s: avoided, but its copies still
+# count, nothing is repaired) and DEAD (silent > 12 s: its copies are forgotten and re-replicated).
 UNDER_SEEN=0
 DETECTED=0
-while [ $((SECONDS - STOPPED_AT)) -lt 30 ]; do
+STALE_SEEN=0
+PENDING_WHILE_STALE=0
+while [ $((SECONDS - STOPPED_AT)) -lt 40 ]; do
     SNAPSHOT=$(status)
-    if [ "$(echo "$SNAPSHOT" | jq -r --arg w "$VICTIM" '.workers[] | select(.worker_id == $w) | .status')" = "DEAD" ]; then
+    STATE=$(echo "$SNAPSHOT" | jq -r --arg w "$VICTIM" '.workers[] | select(.worker_id == $w) | .state')
+    if [ "$STATE" = "STALE" ] && [ "$STALE_SEEN" = 0 ]; then
+        STALE_SEEN=1
+        note "$((SECONDS - STOPPED_AT)) s: $VICTIM is STALE - avoided for reads and writes, its copies still count, no repair"
+        [ "$(echo "$SNAPSHOT" | jq .pending_replications)" = 0 ] || PENDING_WHILE_STALE=1
+    fi
+    if [ "$STATE" = "DEAD" ]; then
         DETECTED=1
         UNDER_SEEN=$(echo "$SNAPSHOT" | jq -r .under_replicated)
         break
@@ -348,9 +359,10 @@ while [ $((SECONDS - STOPPED_AT)) -lt 30 ]; do
 done
 
 step "DURING the failure"
-note "$VICTIM was declared DEAD $((SECONDS - STOPPED_AT)) s after it stopped (heartbeat time-out: 6 s)"
-controller_log | grep -F "[registry] $VICTIM marked DEAD" | tail -1 | indent
+note "$VICTIM was declared DEAD $((SECONDS - STOPPED_AT)) s after it stopped (STALE after 6 s, DEAD after 12 s of silence)"
+controller_log | grep -F "[registry] $VICTIM DEAD after" | tail -1 | cut -c1-160 | indent
 show_workers
+check "while only STALE, nothing was re-replicated" equal "$PENDING_WHILE_STALE" 0
 check "the controller detected that $VICTIM is unavailable" equal "$DETECTED" 1
 REPAIRED_ALREADY=$(count_repair_events copied "$FAIL_ID")
 note "under-replicated chunks seen at the moment of detection: $UNDER_SEEN (re-replicated so far: $REPAIRED_ALREADY)"
@@ -359,10 +371,14 @@ check "the controller detected that the replication factor is no longer maintain
 oscli download "$FAIL_ID" "$WORK/failure.during" | jq -c '{bytes, etag_match}' | indent
 check "the object is still served, from the remaining copies, and is identical" cmp -s "$WORK/failure.bin" "$WORK/failure.during"
 
-step "Automatic re-replication onto the remaining workers (repair loop, every 10 s)"
+step "Automatic re-replication: the monitor (every 3 s) orders a surviving holder to copy each chunk directly to another worker"
 wait_until 60 "no chunk is under-replicated any more" no_chunk_under_replicated
 repair_events copied "$FAIL_ID" | indent
+SAMPLE=$(status | jq -r --arg p "$FAIL_ID" '[.repair_log[] | select(.event == "copied" and (.chunk_id | startswith($p)))][0] | "\(.chunk_id) \(.source)"')
+docker logs "${SAMPLE#* }" 2>&1 | grep -F "replicate ok chunk=${SAMPLE% *}" | tail -1 | cut -c1-160 | indent
 oscli where "$FAIL_ID" | indent
+check "the copies went worker to worker (the source logged '[cmd] replicate ok')" \
+    sh -c "docker logs ${SAMPLE#* } 2>&1 | grep -q 'replicate ok chunk=${SAMPLE% *}'"
 check "one new copy was made for each of the $AFFECTED affected chunks" equal "$(count_repair_events copied "$FAIL_ID")" "$AFFECTED"
 check "the replication factor is restored while $VICTIM is still down" \
     meta_has "$FAIL_ID" --arg w "$VICTIM" '.replication_ok and ([.chunks[]
@@ -379,7 +395,7 @@ controller_log | grep -F "[registry] $VICTIM is back" | tail -1 | indent
 repair_events trimmed "$FAIL_ID" | indent
 show_workers
 oscli where "$FAIL_ID" | indent
-check "$VICTIM's data survived the restart (persistent volume): its copies were verified and reused or trimmed" \
+check "$VICTIM's copies survived on its volume and came back in its block report; the surplus was trimmed" \
     test "$(count_repair_events trimmed "$FAIL_ID")" -eq "$AFFECTED"
 check "the replication factor is exactly 2 again: no chunk under- or over-replicated" cluster_healthy
 check "the files on the workers' disks match the database" copies_on_disk_are_intact "$FAIL_ID"
@@ -388,7 +404,7 @@ check "the object is still identical" cmp -s "$WORK/failure.bin" "$WORK/failure.
 finish
 
 # ============================================================================================
-banner "6/6  Data integrity - corrupt stored data on purpose"
+banner "6/7  Data integrity - corrupt stored data on purpose"
 
 head -c 3500000 /dev/urandom > "$WORK/integrity.bin"
 oscli upload "$WORK/integrity.bin" > "$WORK/integrity.json"
@@ -408,30 +424,34 @@ note "after:  sha256 on disk $(disk_sha256 "$WORKER_A" "$CHUNK_A")"
 note "recorded at upload     $SUM_A"
 oscli download "$INT_ID" "$WORK/integrity.out" | jq -c '{bytes, etag_match}' | indent
 check "the corrupted copy was NOT returned: the download is identical to the original" cmp -s "$WORK/integrity.bin" "$WORK/integrity.out"
-wait_until 30 "the controller log shows the detection" \
-    sh -c "docker logs controller 2>&1 | grep -E '\[(integrity|scrub)\] chunk=$CHUNK_A worker=$WORKER_A -> CORRUPT'"
-controller_log | grep -E "\[(integrity|scrub)\] chunk=$CHUNK_A" | tail -2 | cut -c1-200 | indent
-check "the corruption was detected and logged" \
-    sh -c "docker logs controller 2>&1 | grep -qE '\[(integrity|scrub)\] chunk=$CHUNK_A worker=$WORKER_A -> CORRUPT'"
+# The worker re-hashes the chunk before serving it, refuses (409 chunk_corrupt) and reports it bad;
+# the controller marks the copy CORRUPT and reads the other copy instead.
+DETECT_A="\[integrity\] chunk=$CHUNK_A (worker=|on )$WORKER_A"
+wait_until 30 "the controller log shows the detection" sh -c "docker logs controller 2>&1 | grep -qE '$DETECT_A'"
+docker logs "$WORKER_A" 2>&1 | grep -F "get chunk=$CHUNK_A" | tail -1 | cut -c1-160 | indent
+controller_log | grep -E "$DETECT_A" | tail -1 | cut -c1-160 | indent
+check "the corruption was detected and logged" sh -c "docker logs controller 2>&1 | grep -qE '$DETECT_A'"
 
-step "Restoration from the valid copy (repair loop)"
+step "Restoration: replace first, then delete the corrupt copy (as HDFS does)"
+wait_until 60 "the corrupt copy is replaced and invalidated" \
+    sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event == \"invalidated\" and .chunk_id == \"$CHUNK_A\")] | length') -ge 1 ]"
 wait_until 60 "chunk 0 has two good copies again" exactly_two_good_copies "$INT_ID"
-repair_events purged "$INT_ID" | indent
-repair_events copied "$INT_ID" | indent
-check "the corrupt copy was discarded and a new copy made from the valid one" \
-    test "$(count_repair_events purged "$INT_ID")" -ge 1 -a "$(count_repair_events copied "$INT_ID")" -ge 1
+status | jq -r --arg c "$CHUNK_A" '.repair_log[] | select(.chunk_id == $c) | "\(.time)  \(.event)  \(.source // "-") -> \(.target // "-")  (\(.reason))"' | indent
+SEQ_A=$(status | jq -r --arg c "$CHUNK_A" '[.repair_log[] | select(.chunk_id == $c) | .event] | join(" ")')
+check "a new copy was made from the valid one before the corrupt copy was deleted" sh -c "echo '$SEQ_A' | grep -q 'copied.*invalidated'"
 check "every copy on disk hashes to the recorded checksum again" copies_on_disk_are_intact "$INT_ID"
 
 # --- B: found by the scrubber, nobody reads the object ------------------------------------
 CHUNK_B=$(meta "$INT_ID" | jq -r '.chunks[2].chunk_id')
 WORKER_B=$(meta "$INT_ID" | jq -r '.chunks[2].locations[1].worker_id')
-step "B) Corrupt chunk 2 on $WORKER_B and do NOT read the object: the scrubber must find it (every 15 s)"
+step "B) Corrupt chunk 2 on $WORKER_B and do NOT read the object: the worker's block scanner must find it (every 10 s)"
 corrupt_chunk "$WORKER_B" "$CHUNK_B"
-wait_until 60 "the scrubber reports the corrupt copy" \
-    sh -c "docker logs controller 2>&1 | grep -F '[scrub] chunk=$CHUNK_B worker=$WORKER_B -> CORRUPT'"
-controller_log | grep -F "[scrub] chunk=$CHUNK_B" | tail -1 | cut -c1-200 | indent
-check "the scrubber detected the corruption without any download" \
-    sh -c "docker logs controller 2>&1 | grep -qF '[scrub] chunk=$CHUNK_B worker=$WORKER_B -> CORRUPT'"
+wait_until 40 "the block scanner reports the corrupt copy" \
+    sh -c "docker logs controller 2>&1 | grep -qF '[integrity] chunk=$CHUNK_B on $WORKER_B CORRUPT (reported by worker)'"
+docker logs "$WORKER_B" 2>&1 | grep -F "[scanner] CORRUPT chunk=$CHUNK_B" | tail -1 | cut -c1-140 | indent
+controller_log | grep -F "[integrity] chunk=$CHUNK_B" | tail -1 | cut -c1-160 | indent
+check "the block scanner detected the corruption without any download" \
+    sh -c "docker logs $WORKER_B 2>&1 | grep -qF '[scanner] CORRUPT chunk=$CHUNK_B'"
 wait_until 60 "the chunk has two good copies again" exactly_two_good_copies "$INT_ID"
 wait_until 60 "the whole cluster is healthy" cluster_healthy
 repair_events copied "$INT_ID" | tail -1 | indent
@@ -440,6 +460,54 @@ check "replication_ok is true again" meta_has "$INT_ID" '.replication_ok'
 check "every copy on disk hashes to the recorded checksum" copies_on_disk_are_intact "$INT_ID"
 oscli download "$INT_ID" "$WORK/integrity.final" > /dev/null
 check "the object is still identical to the original" cmp -s "$WORK/integrity.bin" "$WORK/integrity.final"
+finish
+
+# ============================================================================================
+banner "7/7  Controller crash - docker kill controller in the middle of an upload"
+
+head -c $((100 * MIB)) /dev/urandom > "$WORK/crash.bin"
+KEY="demo7-$(date +%s)-$RANDOM"
+OBJECTS_BEFORE=$(curl -fsS "$API/objects?limit=500" | jq '[.items[] | select(.name == "crash.bin")] | length')
+step "Upload 100 MB with Idempotency-Key $KEY, and kill the controller while chunks are being written"
+FILES_BEFORE=$(docker exec worker1 sh -c 'ls /data/chunks | wc -l')
+OSCLI_RETRY_SECONDS=120 oscli upload "$WORK/crash.bin" --key "$KEY" > "$WORK/crash.json" 2> "$WORK/crash.err" &
+UPLOAD_PID=$!
+# Wait until the controller is writing this upload's chunks to the workers, then kill it.
+for _ in $(seq 1 300); do
+    [ "$(docker exec worker1 sh -c 'ls /data/chunks | wc -l')" -gt "$FILES_BEFORE" ] && break
+    sleep 0.05
+done
+docker kill controller > /dev/null
+note "docker kill controller: the upload was in progress (the client sees its connection drop)"
+sleep 2
+step "docker start controller: it comes back in safe mode"
+docker start controller > /dev/null
+wait_until 60 "the controller answers" curl -fsS -m 2 "$BASE_URL/health"
+SAFE=$(status | jq .safe_mode)
+note "safe_mode = $SAFE  (no writes, no repairs, no deletions until the workers have reported their chunks)"
+check "the restarted controller is in safe mode" equal "$SAFE" true
+wait_until 60 "safe mode is over" sh -c "[ \$(curl -fsS $API/cluster/status | jq .safe_mode) = false ]"
+controller_log | grep -F "[safemode] OFF" | tail -1 | cut -c1-140 | indent
+
+step "The client retried with the same Idempotency-Key"
+if wait "$UPLOAD_PID"; then UPLOAD_OK=1; else UPLOAD_OK=0; fi
+grep -E '^note:' "$WORK/crash.err" | sort | uniq -c | sed 's/^ */  /' | indent
+CRASH_ID=$(jq -r .object_id "$WORK/crash.json" 2>/dev/null || echo "")
+remember "$CRASH_ID"
+OBJECTS_AFTER=$(curl -fsS "$API/objects?limit=500" | jq '[.items[] | select(.name == "crash.bin")] | length')
+check "the upload eventually succeeded" equal "$UPLOAD_OK" 1
+check "exactly one object exists for it (no duplicate, no half-written object)" equal "$((OBJECTS_AFTER - OBJECTS_BEFORE))" 1
+curl -fsS -o "$WORK/crash.out" "$API/objects/$CRASH_ID"
+check "it downloads byte-identical" cmp -s "$WORK/crash.bin" "$WORK/crash.out"
+
+step "fsck: the chunks the killed attempt had written are orphans; workers report them and they are deleted"
+note "(orphan deletion waits ORPHAN_GC_DELAY = 60 s after a controller start, then the next full block report, every 30 s)"
+fsck_healthy() { curl -fsS -m 60 "$API/fsck" | jq -e '.status == "HEALTHY" and .quiescent and .orphans_on_disk == 0
+    and (.disk_vs_map | [.[] | length] | add) == 0' > /dev/null; }
+wait_until 180 "fsck reports HEALTHY with no orphans" fsck_healthy
+curl -fsS "$API/fsck" | jq -c '{status, quiescent, objects, orphans_on_disk, unreachable_workers, invariant_violations}' | indent
+check "fsck is HEALTHY: every disk matches the controller's map" fsck_healthy
+check "no invariant was ever violated" sh -c "[ \$(curl -fsS $API/cluster/status | jq .counters.invariant_violations) = 0 ]"
 finish
 
 # ============================================================================================
