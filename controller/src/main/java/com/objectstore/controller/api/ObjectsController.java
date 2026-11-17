@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
 import java.util.List;
+import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
@@ -43,6 +44,8 @@ public class ObjectsController {
 
     private static final Logger log = LoggerFactory.getLogger(ObjectsController.class);
     public static final String OBJECT_ID_HEADER = "X-Object-Id";
+    public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+    public static final String IDEMPOTENT_REPLAY_HEADER = "Idempotent-Replay";
 
     private final UploadService uploads;
     private final DownloadService downloads;
@@ -58,12 +61,26 @@ public class ObjectsController {
      * Upload an object. multipart/form-data with a required {@code file} part and an optional
      * {@code metadata} field holding a JSON object of custom key/value pairs.
      *
-     * <p>Multipart parsing is lazy: safe mode and the number of writable workers are checked
-     * before the request body is read.
+     * <p>An optional {@code Idempotency-Key} header makes retries safe: the same key again
+     * returns the original object with 200 and {@code Idempotent-Replay: true}; the same key with
+     * a file of a different size is 409. Multipart parsing is lazy: safe mode and the number of
+     * writable workers are checked before the request body is read.
      */
     @PostMapping
     public ResponseEntity<ObjectResponse> upload(HttpServletRequest request) {
+        String key = UploadService.validateIdempotencyKey(request.getHeader(IDEMPOTENCY_KEY_HEADER));
+        // A retry of an upload that already succeeded is answered from the namespace, even in safe mode.
+        Optional<UploadService.UploadResult> replay = uploads.replay(key, () -> filePart(request).getSize());
+        if (replay.isPresent()) {
+            return respond(replay.get());
+        }
         uploads.checkWritable();
+        MultipartFile file = filePart(request);
+        String metadata = ((MultipartHttpServletRequest) request).getParameter("metadata");
+        return respond(uploads.upload(file, metadata, key));
+    }
+
+    private static MultipartFile filePart(HttpServletRequest request) {
         if (!(request instanceof MultipartHttpServletRequest multipart)) {
             throw ApiException.badRequest("expected a multipart/form-data request with a 'file' part");
         }
@@ -71,8 +88,15 @@ public class ObjectsController {
         if (file == null) {
             throw ApiException.badRequest("the multipart request has no 'file' part");
         }
-        ObjectResponse created = uploads.upload(file, multipart.getParameter("metadata"), null);
-        return ResponseEntity.created(URI.create("/api/v1/objects/" + created.objectId())).body(created);
+        return file;
+    }
+
+    private static ResponseEntity<ObjectResponse> respond(UploadService.UploadResult result) {
+        ObjectResponse object = result.object();
+        if (result.replay()) {
+            return ResponseEntity.ok().header(IDEMPOTENT_REPLAY_HEADER, "true").body(object);
+        }
+        return ResponseEntity.created(URI.create("/api/v1/objects/" + object.objectId())).body(object);
     }
 
     /** List stored objects, newest first. {@code limit} 1-500 (default 50), {@code offset} &ge; 0. */

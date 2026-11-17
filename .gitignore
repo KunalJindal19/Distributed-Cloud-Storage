@@ -29,3 +29,7 @@ dependency-reduced-pom.xml
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# --- Python bytecode (tests/chaos.py) ---
+__pycache__/
+*.pyc
