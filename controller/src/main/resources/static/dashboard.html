@@ -8,7 +8,7 @@
   :root {
     --bg: #f5f6f8; --card: #ffffff; --ink: #1c2330; --muted: #5b6577; --line: #dfe3ea;
     --accent: #2456d6; --ok: #15803d; --ok-bg: #dcfce7; --bad: #b91c1c; --bad-bg: #fee2e2;
-    --warn: #b45309; --warn-bg: #fef3c7; --idle: #6b7280; --idle-bg: #eceef2;
+    --warn: #b45309; --warn-bg: #fef3c7; --idle: #6b7280; --idle-bg: #eceef2; --info: #1d4ed8; --info-bg: #dbeafe;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -17,24 +17,26 @@
   header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; margin-bottom: 14px; }
   h1 { margin: 0; font-size: 26px; }
   h1 span { color: var(--accent); }
-  h2 { margin: 26px 0 10px; font-size: 18px; }
+  h2 { margin: 26px 0 10px; font-size: 18px; display: flex; align-items: center; gap: 12px; }
   .muted { color: var(--muted); font-size: 15px; }
   #updated { margin-left: auto; }
-  #banner { display: none; background: var(--bad); color: #fff; padding: 10px 14px; border-radius: 8px;
-            font-weight: 600; margin-bottom: 14px; }
+  .banner { display: none; color: #fff; padding: 10px 14px; border-radius: 8px; font-weight: 600; margin-bottom: 14px; }
+  #banner { background: var(--bad); }
+  #safemode { background: var(--warn); }
   .grid { display: grid; gap: 12px; }
-  .kpis { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .workers { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
   .kpi .label { color: var(--muted); font-size: 14px; }
   .kpi .value { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .kpi.alert .value { color: var(--bad); }
-  .kpi .sub { font-size: 14px; color: var(--muted); }
-  .kpi .sub b.alert { color: var(--bad); }
+  .kpi.warn .value { color: var(--warn); }
   .worker h3 { margin: 0 0 6px; font-size: 19px; display: flex; justify-content: space-between; align-items: center; }
-  .worker.dead { border-color: var(--bad); background: #fff8f8; }
+  .worker.DEAD { border-color: var(--bad); background: #fff8f8; }
+  .worker.STALE { border-color: var(--warn); background: #fffbeb; }
   .pill { font-size: 13px; font-weight: 700; padding: 3px 10px; border-radius: 999px; letter-spacing: .03em; }
   .pill.ALIVE { background: var(--ok-bg); color: var(--ok); }
+  .pill.STALE { background: var(--warn-bg); color: var(--warn); }
   .pill.DEAD { background: var(--bad-bg); color: var(--bad); }
   .worker dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 15px; }
   .worker dt { color: var(--muted); }
@@ -46,17 +48,20 @@
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   td.cell { text-align: center; width: 110px; }
   code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
-  .tag { display: inline-block; min-width: 46px; padding: 2px 8px; border-radius: 6px; font-weight: 700; font-size: 13px; }
-  .tag.OK { background: var(--ok-bg); color: var(--ok); }
-  .tag.CORRUPT { background: var(--bad-bg); color: var(--bad); }
-  .tag.MISSING { background: var(--warn-bg); color: var(--warn); }
-  .tag.offline { background: var(--idle-bg); color: var(--idle); }
-  .tag.copied { background: var(--ok-bg); color: var(--ok); }
-  .tag.trimmed { background: var(--idle-bg); color: var(--idle); }
-  .tag.purged { background: var(--warn-bg); color: var(--warn); }
-  .tag.unrecoverable { background: var(--bad-bg); color: var(--bad); }
+  .tag { display: inline-block; min-width: 40px; padding: 2px 8px; border-radius: 6px; font-weight: 700; font-size: 13px; text-align: center; }
+  .tag.OK, .tag.copied, .tag.HEALTHY, .tag.restored { background: var(--ok-bg); color: var(--ok); }
+  .tag.C, .tag.unrecoverable, .tag.CORRUPT { background: var(--bad-bg); color: var(--bad); }
+  .tag.E, .tag.trimmed, .tag.deleted, .tag.orphan, .tag.down { background: var(--idle-bg); color: var(--idle); }
+  .tag.invalidated, .tag.timeout, .tag.DEGRADED { background: var(--warn-bg); color: var(--warn); }
+  .tag.replicate { background: var(--info-bg); color: var(--info); }
   .empty { color: var(--muted); padding: 6px 0; }
   .reason { white-space: normal; color: var(--muted); }
+  button { font: inherit; font-size: 15px; padding: 5px 14px; border-radius: 8px; border: 1px solid var(--accent);
+           background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #fsck-result dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 0; }
+  #fsck-result dt { color: var(--muted); }
+  #fsck-result dd { margin: 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -66,7 +71,8 @@
     <span class="muted" id="config">connecting&hellip;</span>
     <span class="muted" id="updated"></span>
   </header>
-  <div id="banner">controller unreachable &mdash; retrying every 2 s</div>
+  <div class="banner" id="banner">controller unreachable &mdash; retrying every 2 s</div>
+  <div class="banner" id="safemode">SAFE MODE &mdash; waiting for block reports; writes are refused and nothing is repaired or deleted</div>
 
   <section class="grid kpis" id="kpis"></section>
 
@@ -79,7 +85,10 @@
     <div class="scroll"><table id="placement"></table></div>
   </section>
 
-  <h2>Repair log <span class="muted">(last 20 actions, newest first)</span></h2>
+  <h2>fsck <button id="fsck-button" type="button">Run fsck</button></h2>
+  <section class="card" id="fsck-result"><div class="empty">Compares every live worker's disk with the controller's block map and checks the invariants.</div></section>
+
+  <h2>Monitor log <span class="muted">(last 20 events, newest first)</span></h2>
   <section class="card scroll">
     <table id="repairs"></table>
     <div class="empty" id="no-repairs">nothing has needed repairing yet</div>
@@ -91,7 +100,7 @@
 const POLL_MS = 2000;
 const $ = (id) => document.getElementById(id);
 
-/** el("td", {class: "num"}, "text" | Node, ...) -- all text goes through textContent, never innerHTML. */
+/** el("td", {class: "num"}, "text" | Node, ...) -- all text goes through text nodes, never innerHTML. */
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
@@ -99,48 +108,56 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
-function kpi(label, value, alert, sub) {
-  const card = el("div", {class: "card kpi" + (alert ? " alert" : "")},
+function kpi(label, value, level) {
+  return el("div", {class: "card kpi" + (level ? " " + level : "")},
       el("div", {class: "label"}, label), el("div", {class: "value"}, value));
-  if (sub) card.append(sub);
-  return card;
 }
 
-function ago(iso) {
-  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
-  return seconds < 90 ? seconds + " s ago" : Math.round(seconds / 60) + " min ago";
+function bytes(n) {
+  if (n == null) return "?";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + " " + units[i];
 }
 
 function renderStatus(status) {
   const c = status.config;
-  $("config").textContent = `chunk ${(c.chunk_size / 1048576).toFixed(c.chunk_size % 1048576 ? 2 : 0)} MiB · ` +
-      `replication factor ${c.replication_factor} · worker dead after ${c.heartbeat_timeout} s · ` +
-      `repair every ${c.repair_interval} s · scrub every ${c.scrub_interval} s`;
+  $("config").textContent = `cluster ${status.cluster_id.slice(0, 8)} · chunk ${c.chunk_size / 1048576} MiB · ` +
+      `replication factor ${c.replication_factor} · STALE after ${c.stale_after} s · DEAD after ${c.dead_after} s · ` +
+      `monitor every ${c.monitor_interval} s`;
+  $("safemode").style.display = status.safe_mode ? "block" : "none";
 
   const r = status.replicas;
-  const replicaSub = el("div", {class: "sub"},
-      el("b", {class: r.corrupt > 0 ? "alert" : ""}, r.corrupt + " corrupt"), " · ",
-      el("b", {class: r.missing > 0 ? "alert" : ""}, r.missing + " missing"));
+  const violations = status.counters.invariant_violations || 0;
   $("kpis").replaceChildren(
       kpi("Objects", status.objects),
       kpi("Chunks", status.chunks),
-      kpi("Copies OK", r.ok, r.corrupt + r.missing > 0, replicaSub),
-      kpi("Under-replicated", status.under_replicated, status.under_replicated > 0),
-      kpi("Over-replicated", status.over_replicated, status.over_replicated > 0));
+      kpi("Copies OK", r.ok),
+      kpi("Under-replicated", status.under_replicated, status.under_replicated > 0 ? "alert" : ""),
+      kpi("Pending copies", status.pending_replications, status.pending_replications > 0 ? "warn" : ""),
+      kpi("Missing chunks", status.missing_chunks, status.missing_chunks > 0 ? "alert" : ""),
+      kpi("Corrupt copies", r.corrupt, r.corrupt > 0 ? "alert" : ""),
+      kpi("Excess copies", r.excess, r.excess > 0 ? "warn" : ""),
+      kpi("Invariant violations", violations, violations > 0 ? "alert" : ""));
 
   const workers = [...status.workers].sort((a, b) => a.worker_id.localeCompare(b.worker_id, undefined, {numeric: true}));
   $("workers").replaceChildren(...workers.map((w) =>
-      el("div", {class: "card worker" + (w.status === "DEAD" ? " dead" : "")},
-          el("h3", {}, w.worker_id, el("span", {class: "pill " + w.status}, w.status)),
+      el("div", {class: "card worker " + w.state},
+          el("h3", {}, w.worker_id, el("span", {class: "pill " + w.state}, w.state)),
           el("dl", {},
               el("dt", {}, "address"), el("dd", {class: "mono"}, w.url),
-              el("dt", {}, "last heartbeat"), el("dd", {}, ago(w.last_seen)),
-              el("dt", {}, "chunk copies"), el("dd", {}, w.chunk_count)))));
+              el("dt", {}, "process"), el("dd", {class: "mono"}, w.boot_id + (w.has_reported ? "" : " (not reported)")),
+              el("dt", {}, "last heartbeat"), el("dd", {}, w.last_seen_s_ago.toFixed(1) + " s ago"),
+              el("dt", {}, "chunk copies"), el("dd", {}, w.chunk_count),
+              el("dt", {}, "free space"), el("dd", {}, w.stats ? bytes(w.stats.free_bytes) : "?"),
+              el("dt", {}, "commands queued"), el("dd", {}, w.queued_commands),
+              el("dt", {}, "copies sending"), el("dd", {}, w.pending_as_source)))));
 
   const events = [...status.repair_log].reverse().slice(0, 20);
   $("no-repairs").style.display = events.length ? "none" : "";
   $("repairs").replaceChildren(...(events.length ? [
-    el("tr", {}, ...["time (UTC)", "event", "chunk", "from → to", "reason"].map((h) => el("th", {}, h))),
+    el("tr", {}, ...["time (UTC)", "event", "chunk", "from → to", "detail"].map((h) => el("th", {}, h))),
     ...events.map((e) => el("tr", {},
         el("td", {class: "mono"}, e.time.slice(11, 19)),
         el("td", {}, el("span", {class: "tag " + e.event}, e.event)),
@@ -159,8 +176,9 @@ function renderPlacement(object, workers) {
   $("object").replaceChildren(
       el("b", {}, object.name), ` · ${object.size.toLocaleString()} bytes · ${object.content_type} · `,
       el("code", {}, object.object_id), " · replication ",
-      el("span", {class: "tag " + (object.replication_ok ? "OK" : "CORRUPT")}, object.replication_ok ? "OK" : "DEGRADED"));
-  const alive = Object.fromEntries(workers.map((w) => [w.worker_id, w.status === "ALIVE"]));
+      el("span", {class: "tag " + (object.replication_ok ? "OK" : "C")}, object.replication_ok ? "OK" : "DEGRADED"));
+  const state = Object.fromEntries(workers.map((w) => [w.worker_id, w.state]));
+  const letter = {OK: "OK", CORRUPT: "C", EXCESS: "E"};
   const header = el("tr", {}, el("th", {}, "#"), el("th", {}, "chunk"), el("th", {}, "bytes"),
       ...workers.map((w) => el("th", {style: "text-align:center"}, w.worker_id)));
   const rows = object.chunks.map((chunk) => {
@@ -172,10 +190,11 @@ function renderPlacement(object, workers) {
         ...workers.map((w) => {
           const location = byWorker[w.worker_id];
           if (!location) return el("td", {class: "cell"}, "");
-          const offline = !alive[w.worker_id];
+          const short = letter[location.status] || location.status;
+          const live = state[w.worker_id] !== "DEAD";
           return el("td", {class: "cell"}, el("span",
-              {class: "tag " + (offline ? "offline" : location.status), title: offline ? "worker is DEAD" : ""},
-              offline ? location.status + " (down)" : location.status));
+              {class: "tag " + (live ? short : "down"), title: location.status + " on a " + state[w.worker_id] + " worker"},
+              short));
         }));
   });
   $("placement").replaceChildren(header, ...rows);
@@ -202,6 +221,37 @@ async function refresh() {
     setTimeout(refresh, POLL_MS);
   }
 }
+
+async function runFsck() {
+  const button = $("fsck-button");
+  button.disabled = true;
+  button.textContent = "running…";
+  try {
+    const r = await getJson("/api/v1/fsck");
+    const d = r.disk_vs_map;
+    const list = (items) => items.length ? items.join(", ") : "none";
+    $("fsck-result").replaceChildren(
+        el("div", {}, el("span", {class: "tag " + r.status}, r.status),
+            " ", r.quiescent ? "quiescent" : "not quiescent (copies or commands in flight: differences may be transient)"),
+        el("dl", {},
+            el("dt", {}, "objects"), el("dd", {}, `${r.objects.total} total, ${r.objects.healthy} healthy, ` +
+                `${r.objects.under_replicated} under-replicated, ${r.objects.missing} with a missing chunk`),
+            el("dt", {}, "corrupt copies"), el("dd", {}, r.objects.corrupt_replicas),
+            el("dt", {}, "orphans on disk"), el("dd", {}, r.orphans_on_disk),
+            el("dt", {}, "on disk, not in map"), el("dd", {class: "mono"}, list(d.on_disk_not_in_map)),
+            el("dt", {}, "in map, not on disk"), el("dd", {class: "mono"}, list(d.in_map_not_on_disk)),
+            el("dt", {}, "checksum mismatch"), el("dd", {class: "mono"}, list(d.checksum_mismatch)),
+            el("dt", {}, "unreachable workers"), el("dd", {}, list(r.unreachable_workers)),
+            el("dt", {}, "invariant violations"), el("dd", {}, list(r.invariant_violations))));
+  } catch (error) {
+    $("fsck-result").replaceChildren(el("div", {class: "empty"}, "fsck failed: " + error.message));
+  } finally {
+    button.disabled = false;
+    button.textContent = "Run fsck";
+  }
+}
+
+$("fsck-button").addEventListener("click", runFsck);
 refresh();
 </script>
 </body>
