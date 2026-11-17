@@ -3,6 +3,7 @@ package com.objectstore.controller.api;
 import com.objectstore.common.dto.HealthResponse;
 import com.objectstore.controller.api.dto.ClusterStatusResponse;
 import com.objectstore.controller.cluster.ClusterStatusService;
+import com.objectstore.controller.cluster.Fsck;
 import java.net.URI;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
@@ -18,9 +19,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class ClusterController {
 
     private final ClusterStatusService status;
+    private final Fsck fsck;
 
-    public ClusterController(ClusterStatusService status) {
+    public ClusterController(ClusterStatusService status, Fsck fsck) {
         this.status = status;
+        this.fsck = fsck;
     }
 
     /** Liveness probe used by the Docker health check. Touches neither the database nor a worker. */
@@ -33,6 +36,15 @@ public class ClusterController {
     @GetMapping("/api/v1/cluster/status")
     public ClusterStatusResponse clusterStatus() {
         return status.status();
+    }
+
+    /**
+     * End-to-end consistency check (HDFS fsck): every live worker's disk, re-hashed, against the
+     * block map and the namespace, plus the invariants. Read-only.
+     */
+    @GetMapping("/api/v1/fsck")
+    public Fsck.Result fsck() {
+        return fsck.run();
     }
 
     @GetMapping("/dashboard")

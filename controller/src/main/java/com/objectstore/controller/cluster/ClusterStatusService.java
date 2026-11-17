@@ -33,7 +33,10 @@ public class ClusterStatusService {
         this.clock = clock;
     }
 
-    /** Replication health, counted with the one definition everything shares: live = OK copies on non-DEAD workers. */
+    /**
+     * Replication health: under-replicated = fewer than RF live copies (including missing chunks),
+     * over-replicated = more than RF, missing = none. Live = OK copies on non-DEAD workers.
+     */
     public record Health(int underReplicated, int overReplicated, int missing, long ok, long corrupt, long excess) {
     }
 
@@ -46,12 +49,13 @@ public class ClusterStatusService {
         long corrupt = 0;
         long excess = 0;
         for (String chunkId : cluster.chunks().keySet()) {
+            // Counted on live copies only: a copy that is merely ordered (pending) does not protect
+            // anything yet. (The monitor schedules on live + pending, so it does not order twice.)
             int live = cluster.live(chunkId).size();
-            int pending = cluster.pendingOf(chunkId).size();
             if (live == 0) {
                 missing++;
             }
-            if (live + pending < rf) {
+            if (live < rf) {
                 under++;
             } else if (live > rf) {
                 over++;

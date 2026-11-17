@@ -188,6 +188,20 @@ class ChunkStoreTest {
     }
 
     @Test
+    void theDiskProbePassesOnAHealthyVolumeAndAnInterruptedProbeIsNotADiskFailure() {
+        com.objectstore.worker.storage.DiskCheck check = new com.objectstore.worker.storage.DiskCheck(properties);
+        assertThat(check.probeOnce()).isTrue();
+
+        Thread.currentThread().interrupt(); // as on shutdown: the probe's file I/O is aborted
+        try {
+            assertThat(check.probeOnce()).as("an interrupted probe must not count as a broken disk").isTrue();
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
     void theIbrBufferOverflowsIntoAFullReport() {
         WorkerProperties tiny = new WorkerProperties("worker1", dataDir, "http://c", "", 1_048_576,
                 2, 3, 30, 0.5, 2, 10, 30, 2, 10, false);
