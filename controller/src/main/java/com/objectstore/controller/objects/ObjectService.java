@@ -96,9 +96,10 @@ public class ObjectService {
         safeMode.requireWritable();
         int queued = cluster.locked(() -> {
             List<Chunk> chunkRows = chunks.findChunksByObject(objectId);
-            if (!objects.delete(objectId)) {
+            if (!objects.delete(objectId, clock.instant())) {
                 throw notFound(objectId);
             }
+            cluster.addGarbage(objectId);
             int commands = 0;
             for (Chunk chunk : chunkRows) {
                 for (String workerId : new ArrayList<>(cluster.replicasOf(chunk.chunkId()).keySet())) {

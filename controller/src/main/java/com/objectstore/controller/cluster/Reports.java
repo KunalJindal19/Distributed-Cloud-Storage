@@ -60,7 +60,8 @@ public class Reports {
                     && now - cluster.startedAt() >= properties.orphanGcDelay().toNanos();
             List<ChunkInfo> reported = request.chunks() == null ? List.of() : request.chunks();
             Set<String> seen = new HashSet<>();
-            List<String> orphans = new ArrayList<>();
+            List<String> orphans = new ArrayList<>();      // chunks of no object the controller can account for
+            List<String> garbage = new ArrayList<>();      // chunks of failed uploads and deleted objects
             int corrupt = 0;
             int added = 0;
 
@@ -78,7 +79,7 @@ public class Reports {
                         continue;
                     }
                     if (gcAllowed) {
-                        orphans.add(chunkId);
+                        (cluster.isGarbage(ChunkIds.objectIdOf(chunkId)) ? garbage : orphans).add(chunkId);
                     } else {
                         log.debug("[report] {} holds unknown chunk {} (orphan GC not yet allowed)", workerId, chunkId);
                     }
@@ -111,8 +112,13 @@ public class Reports {
                 }
             }
 
-            // Orphan safety valve: a report that would delete much of a worker's data is far more
-            // likely to be a bug or a wrong database than real garbage.
+            // Chunks of uploads that never committed and of deleted objects are certainly garbage.
+            for (String chunkId : garbage) {
+                cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunkId, null, null, "orphan");
+                cluster.record("orphan", chunkId, workerId, null, "chunk of a failed upload or a deleted object; DELETE queued");
+            }
+            // Orphan safety valve: a report that would delete much of a worker's data that the
+            // controller cannot account for is far more likely a bug or a wrong database than garbage.
             if (orphans.size() > ORPHAN_VALVE_MIN
                     && (double) orphans.size() / reported.size() > properties.orphanGcMaxFraction()) {
                 log.error("[report] orphan GC refused on {}: {} of {} chunks unknown", workerId, orphans.size(), reported.size());
@@ -146,7 +152,7 @@ public class Reports {
             worker.hasReported = true;
             worker.lastReportAt = now;
             log.info("[report] {} seq={} chunks={} added={} corrupt={} missing={} orphans={}", workerId,
-                    request.seq(), reported.size(), added, corrupt, missing, orphans.size());
+                    request.seq(), reported.size(), added, corrupt, missing, orphans.size() + garbage.size());
             return new ReportResponse(true, null);
         });
     }

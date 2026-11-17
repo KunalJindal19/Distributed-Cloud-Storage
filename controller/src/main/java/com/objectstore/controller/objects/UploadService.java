@@ -72,6 +72,25 @@ public class UploadService {
     private record StoredChunk(Chunk chunk, List<Target> holders) {
     }
 
+    /**
+     * The outcome of an upload: the object, and whether it was created by this request (201) or
+     * is the one an earlier request with the same Idempotency-Key created (200, a replay).
+     */
+    public record UploadResult(ObjectResponse object, boolean replay) {
+    }
+
+    /** Another request with the same Idempotency-Key committed first. */
+    private static final class LostIdempotencyRace extends RuntimeException {
+        final ObjectRepository.IdempotentUpload winner;
+
+        LostIdempotencyRace(ObjectRepository.IdempotentUpload winner) {
+            super(null, null, false, false);
+            this.winner = winner;
+        }
+    }
+
+    private static final int MAX_KEY_LENGTH = 128;
+
     private final ControllerProperties properties;
     private final MetadataValidator metadataValidator;
     private final ClusterState cluster;
@@ -112,7 +131,40 @@ public class UploadService {
         }
     }
 
-    public ObjectResponse upload(MultipartFile file, String rawMetadata, String idempotencyKey) {
+    /** Validates an Idempotency-Key header: 1-128 visible ASCII characters. */
+    public static String validateIdempotencyKey(String key) {
+        if (key == null) {
+            return null;
+        }
+        if (key.isEmpty() || key.length() > MAX_KEY_LENGTH || !key.chars().allMatch(c -> c > 32 && c < 127)) {
+            throw ApiException.badRequest("Idempotency-Key must be 1-" + MAX_KEY_LENGTH + " visible ASCII characters");
+        }
+        return key;
+    }
+
+    /**
+     * If an earlier upload already used this key, the object it created, provided the new
+     * request is for a file of the same size. A different size under the same key is a client
+     * error: 409 {@code conflict}. Only the multipart part's size is consulted: nothing is sent
+     * to any worker.
+     */
+    public java.util.Optional<UploadResult> replay(String idempotencyKey, java.util.function.LongSupplier newSize) {
+        if (idempotencyKey == null) {
+            return java.util.Optional.empty();
+        }
+        return objects.findIdempotent(idempotencyKey).map(previous -> {
+            long size = newSize.getAsLong();
+            if (size != previous.size()) {
+                throw ApiException.conflict("Idempotency-Key " + idempotencyKey + " was used for a "
+                        + previous.size() + "-byte upload; this one is " + size + " bytes");
+            }
+            StoredObject object = objects.findById(previous.objectId()).orElseThrow();
+            log.info("[upload] replay key={} object={}", idempotencyKey, previous.objectId());
+            return new UploadResult(views.describe(object), true);
+        });
+    }
+
+    public UploadResult upload(MultipartFile file, String rawMetadata, String idempotencyKey) {
         Map<String, String> metadata = metadataValidator.parseForUpload(rawMetadata);
         String name = objectName(file.getOriginalFilename());
         String contentType = contentType(file.getContentType(), name);
@@ -124,6 +176,9 @@ public class UploadService {
         boolean committed = false;
 
         cluster.locked(() -> cluster.beginUpload(objectId));
+        // Durable before the first chunk is written: if this upload never commits (it fails, or
+        // the controller crashes), its chunks are known garbage after any restart.
+        objects.recordUploadIntent(objectId, clock.instant());
         try (InputStream in = file.getInputStream()) {
             MessageDigest objectDigest = Checksums.newSha256();
             List<StoredChunk> stored = new ArrayList<>();
@@ -147,17 +202,34 @@ public class UploadService {
             Instant now = clock.instant();
             StoredObject object = new StoredObject(objectId, name, size, contentType, Checksums.hex(objectDigest),
                     stored.size(), now, now);
-            commit(object, metadata, stored, idempotencyKey);
+            try {
+                commit(object, metadata, stored, idempotencyKey);
+            } catch (LostIdempotencyRace race) {
+                // A concurrent request with the same key won. Ours is cleaned up below.
+                if (race.winner.size() != size) {
+                    throw ApiException.conflict("Idempotency-Key " + idempotencyKey + " was used concurrently for a "
+                            + race.winner.size() + "-byte upload; this one is " + size + " bytes");
+                }
+                StoredObject winner = objects.findById(race.winner.objectId()).orElseThrow();
+                log.info("[upload] key={} lost the race to object={}; returning that object", idempotencyKey, winner.objectId());
+                return new UploadResult(views.describe(winner), true);
+            }
             committed = true;
             log.info("[upload] object={} name={} size={} chunks={} ms={}{}", objectId, name, size, stored.size(),
                     (System.nanoTime() - startedNanos) / 1_000_000,
                     exclude.isEmpty() ? "" : " (replaced failed targets " + exclude + ")");
-            return views.describe(object);
+            return new UploadResult(views.describe(object), false);
         } catch (IOException e) {
             throw new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.BAD_REQUEST,
                     "the uploaded file could not be read completely", e);
         } finally {
-            cluster.locked(() -> cluster.endUpload(objectId));
+            boolean done = committed;
+            cluster.locked(() -> {
+                cluster.endUpload(objectId);
+                if (!done) {
+                    cluster.addGarbage(objectId);
+                }
+            });
             if (!committed) {
                 cleanUp(objectId, attempted);
             }
@@ -172,6 +244,13 @@ public class UploadService {
      */
     private void commit(StoredObject object, Map<String, String> metadata, List<StoredChunk> stored, String idempotencyKey) {
         cluster.locked(() -> {
+            // All commits run under the cluster lock, so this check and the insert cannot interleave
+            // with another commit using the same key.
+            if (idempotencyKey != null) {
+                objects.findIdempotent(idempotencyKey).ifPresent(winner -> {
+                    throw new LostIdempotencyRace(winner);
+                });
+            }
             objects.insert(object, metadata, stored.stream().map(StoredChunk::chunk).toList(), idempotencyKey);
             int refused = 0;
             for (StoredChunk entry : stored) {

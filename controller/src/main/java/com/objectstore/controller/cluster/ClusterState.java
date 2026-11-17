@@ -116,6 +116,8 @@ public class ClusterState {
     private final Map<String, Set<String>> workerBlocks = new HashMap<>();
     private final Map<String, List<PendingCopy>> pending = new HashMap<>();
     private final Set<String> pendingUploads = new HashSet<>();
+    /** Objects whose chunks are certainly garbage: failed or interrupted uploads, deleted objects. */
+    private final Set<String> garbageObjects = new HashSet<>();
     /** object id of an upload in progress -> "chunkId@workerId" copies already confirmed by a report. */
     private final Map<String, Set<String>> uploadReceipts = new HashMap<>();
     private final Map<FailureKey, Long> recentFailures = new HashMap<>();
@@ -279,6 +281,15 @@ public class ClusterState {
 
     public Set<String> pendingUploads() {
         return pendingUploads;
+    }
+
+    /** Remembers that every chunk of this object is garbage (its upload failed, or it was deleted). */
+    public void addGarbage(String objectId) {
+        garbageObjects.add(objectId);
+    }
+
+    public boolean isGarbage(String objectId) {
+        return garbageObjects.contains(objectId);
     }
 
     public void beginUpload(String objectId) {
