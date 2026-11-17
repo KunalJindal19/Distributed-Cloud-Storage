@@ -106,7 +106,7 @@ public class ClusterStatusService {
                     health.overReplicated(),
                     health.missing(),
                     cluster.pendingTotal(),
-                    cluster.counter("blocked"),
+                    cluster.blockedLastTick(),
                     counters,
                     cluster.events());
         });
