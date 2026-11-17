@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BASE  ?= http://localhost:8000
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down down-v restart ps logs status dashboard stop start corrupt test demo
+.PHONY: help build up down down-v restart ps logs status fsck dashboard stop start pause unpause corrupt test scenarios chaos demo
 
 help:            ## show this help
 	@grep -E '^[a-z-]+: .*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -35,6 +35,9 @@ logs:            ## follow the logs of all containers
 status:          ## cluster status as JSON
 	@curl -fsS $(BASE)/api/v1/cluster/status | ( jq . 2>/dev/null || cat )
 
+fsck:            ## end-to-end consistency check (disks vs. the controller's block map)
+	@curl -fsS $(BASE)/api/v1/fsck | ( jq . 2>/dev/null || cat )
+
 dashboard:       ## open the dashboard in a browser
 	@( open $(BASE)/dashboard || xdg-open $(BASE)/dashboard ) 2>/dev/null || echo "open $(BASE)/dashboard"
 
@@ -44,11 +47,17 @@ stop:            ## simulate a worker failure:   make stop W=worker2
 start:           ## bring the worker back:       make start W=worker2
 	docker start $(W)
 
+pause:           ## freeze a container (STALE):   make pause W=worker2
+	docker pause $(W)
+
+unpause:         ## unfreeze it:                  make unpause W=worker2
+	docker unpause $(W)
+
 corrupt:         ## damage a stored chunk:       make corrupt W=worker3 C=<chunk_id>
-	@# Overwrites 4 bytes in the middle of the file; its size does not change.
+	@# Overwrites 4 bytes in the middle of the data file; its size and its .meta sidecar do not change.
 	docker exec $(W) sh -c 'printf "XXXX" | dd of=/data/chunks/$(C) bs=1 seek=100 conv=notrunc status=none && echo "corrupted $(C) on $(W)"'
 
-test:            ## run all unit and integration tests (JDK 21+ and Maven, or Docker)
+test:            ## unit tests + in-process system tests (JDK 21+ and Maven, or Docker)
 	@if command -v mvn > /dev/null 2>&1; then \
 		mvn -B -ntp verify; \
 	else \
@@ -56,5 +65,11 @@ test:            ## run all unit and integration tests (JDK 21+ and Maven, or Do
 			maven:3.9-eclipse-temurin-21 mvn -B -ntp verify; \
 	fi
 
-demo:            ## run the six required demonstrations against the running stack
+scenarios:       ## the acceptance-criteria scripts against Docker (about 15 min; wipes data)
+	@for script in tests/scenarios/block*.sh; do echo "### $$script"; BASE_URL=$(BASE) $$script || exit 1; done
+
+chaos:           ## chaos test: faults on, disruptions, then convergence checks (CHAOS_MINUTES=5)
+	BASE_URL=$(BASE) python3 tests/chaos.py
+
+demo:            ## run the seven demonstrations against the running stack
 	BASE_URL=$(BASE) ./demo.sh
