@@ -25,12 +25,17 @@ public class ClusterStatusService {
     private final ControllerProperties properties;
     private final ObjectRepository objects;
     private final Clock clock;
+    private final ApplyQueue queue;
+    private final Writer writer;
 
-    public ClusterStatusService(ClusterState cluster, ControllerProperties properties, ObjectRepository objects, Clock clock) {
+    public ClusterStatusService(ClusterState cluster, ControllerProperties properties, ObjectRepository objects, Clock clock,
+                                ApplyQueue queue, Writer writer) {
         this.cluster = cluster;
         this.properties = properties;
         this.objects = objects;
         this.clock = clock;
+        this.queue = queue;
+        this.writer = writer;
     }
 
     /**
@@ -73,7 +78,8 @@ public class ClusterStatusService {
 
     public ClusterStatusResponse status() {
         long objectCount = objects.count();
-        return cluster.locked(() -> {
+        Map<String, Double> lockMaxHold = cluster.takeLockMaxHoldMs();   // reset by reading
+        return cluster.read(() -> {
             Health health = health();
             List<WorkerView> workers = new ArrayList<>();
             for (WorkerInfo worker : cluster.workersSorted()) {
@@ -93,7 +99,9 @@ public class ClusterStatusService {
                         worker.stats));
             }
             Map<String, Long> counters = cluster.counters();
-            for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked")) {
+            for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked",
+                    "changes_gap", "apply_queue_full", "writer_task_failures", "namespace_reconciled",
+                    "upload_commit_wait_timeouts")) {
                 counters.putIfAbsent(name, 0L);
             }
             return new ClusterStatusResponse(
@@ -112,7 +120,13 @@ public class ClusterStatusService {
                     cluster.pendingTotal(),
                     cluster.blockedLastTick(),
                     counters,
-                    cluster.events());
+                    cluster.events(),
+                    lockMaxHold.values().stream().mapToDouble(Double::doubleValue).max().orElse(0),
+                    lockMaxHold,
+                    queue.depth(),
+                    queue.oldestAgeMillis(),
+                    writer.takeBusyRatio(),
+                    cluster.openSessions());
         });
     }
 

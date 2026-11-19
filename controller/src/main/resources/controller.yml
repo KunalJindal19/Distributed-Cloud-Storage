@@ -60,6 +60,10 @@ objectstore:
   connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
   read-timeout-seconds: ${READ_TIMEOUT:10}
   invariant-checks: ${INVARIANT_CHECKS:true}
+  max-lock-hold-ms: ${MAX_LOCK_HOLD_MS:5}
+  apply-queue-capacity: ${APPLY_QUEUE_CAPACITY:10000}
+  upload-commit-wait-seconds: ${UPLOAD_COMMIT_WAIT:10}
+  download-settle-wait-seconds: ${DOWNLOAD_SETTLE_WAIT:5}
 
 logging:
   level:

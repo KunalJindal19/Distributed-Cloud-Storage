@@ -19,6 +19,7 @@ abstract class ClusterTest {
 
     InProcessCluster cluster;
     Api api;
+    private long violationsBefore;
 
     /** Hook for subclasses that need non-default controller settings. */
     void configure(InProcessCluster cluster) {
@@ -26,6 +27,9 @@ abstract class ClusterTest {
 
     @BeforeEach
     void startCluster() {
+        // No SQLite on the writer thread or under the cluster lock: a violation fails the request.
+        com.objectstore.controller.cluster.SqliteGuard.setStrict(true);
+        violationsBefore = com.objectstore.controller.cluster.SqliteGuard.violations();
         cluster = new InProcessCluster(4);
         configure(cluster);
         cluster.startAll();
@@ -36,6 +40,8 @@ abstract class ClusterTest {
     @AfterEach
     void stopCluster() {
         try {
+            assertThat(com.objectstore.controller.cluster.SqliteGuard.violations() - violationsBefore)
+                    .as("SQLite accessed on the writer or under the cluster lock").isZero();
             if (api != null) {
                 assertThat(api.status().get("counters").get("invariant_violations").asLong())
                         .as("invariant violations").isZero();

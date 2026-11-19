@@ -84,6 +84,11 @@ public final class InProcessCluster implements AutoCloseable {
         return this;
     }
 
+    /** A bean of the running controller, e.g. its {@code Writer} or {@code ClusterState}. */
+    public <T> T controllerBean(Class<T> type) {
+        return controller.getBean(type);
+    }
+
     /** A bean of a running worker, e.g. its {@code ControllerLink}. */
     public <T> T workerBean(String workerId, Class<T> type) {
         return workers.get(workerId).getBean(type);

@@ -25,6 +25,10 @@ import org.springframework.stereotype.Service;
  * point every copy it held is forgotten and gets re-replicated elsewhere. A message from a
  * worker the controller does not know, or from a DEAD one, is answered with 404 so that the
  * worker registers again (HDFS {@code DNA_REGISTER}).
+ *
+ * <p>Registration and DEAD are tasks on the writer's queue ({@code Register}, {@code MarkDead}),
+ * so they are ordered with everything else that worker did; the heartbeat's receipt step is one
+ * brief block under the write lock that only queues work.
  */
 @Service
 public class Registry {
@@ -35,13 +39,18 @@ public class Registry {
     private final ClusterState cluster;
     private final ControllerProperties properties;
     private final Receipts receipts;
+    private final ApplyQueue queue;
+    private final Writer writer;
     private long lastHealthRun;
     private final java.util.Map<String, Long> duplicateRefusedUntil = new java.util.HashMap<>();
 
-    public Registry(ClusterState cluster, ControllerProperties properties, Receipts receipts) {
+    public Registry(ClusterState cluster, ControllerProperties properties, Receipts receipts, ApplyQueue queue,
+                    Writer writer) {
         this.cluster = cluster;
         this.properties = properties;
         this.receipts = receipts;
+        this.queue = queue;
+        this.writer = writer;
     }
 
     // ---- registration ---------------------------------------------------------------------
@@ -51,9 +60,36 @@ public class Registry {
      * request ({@code too_old}); the duplicate-worker refusal; a delayed older attempt of the same
      * process ({@code stale_registration}); a repeat of the last accepted attempt (answered ok,
      * nothing reset: the earlier reply was lost). Anything else is accepted and starts a new epoch.
+     *
+     * <p>The registration is a {@code Register} task; the HTTP thread waits for its result.
      */
     public RegisterResponse register(RegisterRequest request) {
-        return cluster.locked(() -> {
+        Task task = Task.call("Register", () -> {
+            try {
+                return applyRegister(request);
+            } catch (ApiException refused) {
+                return refused;                 // an answer, not a failure of the task
+            }
+        });
+        Object result;
+        try {
+            queue.put(task);
+            result = writer.await(task, properties.uploadCommitWait());
+        } catch (InterruptedException | java.util.concurrent.TimeoutException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw ApiException.unavailable(ErrorCodes.SERVICE_UNAVAILABLE, "the controller is busy; register again");
+        }
+        if (result instanceof ApiException refused) {
+            throw refused;
+        }
+        return (RegisterResponse) result;
+    }
+
+    /** The {@code Register} task's body (§4.8); runs on the writer, under the write lock. */
+    RegisterResponse applyRegister(RegisterRequest request) {
+        {
             String workerId = request.workerId();
             String url = request.url().endsWith("/") ? request.url().substring(0, request.url().length() - 1) : request.url();
             if (request.clusterId() != null && !request.clusterId().equals(cluster.clusterId())) {
@@ -75,6 +111,10 @@ public class Registry {
                 log.info("[registry] registered {} url={} boot={} attempt={} change_seq={}", workerId, url,
                         shortId(request.bootId()), request.attempt(), request.changeSeq());
                 return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
+            }
+            if (worker.purging) {
+                // Impossible: MarkDead's purge is one task whose steps keep their queue position.
+                throw new IllegalStateException("registration of " + workerId + " during its DEAD purge");
             }
             Long refusedUntil = duplicateRefusedUntil.get(workerId);
             if (refusedUntil != null && now < refusedUntil && !request.bootId().equals(worker.bootId)) {
@@ -107,7 +147,7 @@ public class Registry {
                 log.info("[registry] {} is back", workerId);
             }
             return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
-        });
+        }
     }
 
     /**
@@ -128,8 +168,7 @@ public class Registry {
         worker.applied = request.changeSeq();
         worker.lastAttempt = request.attempt();
         cluster.closeSession(worker);
-        worker.closedReportId = null;
-        worker.closedLastSegment = -1;
+        worker.resetReceipt();
         worker.hasReported = false;
         worker.fullReportRequested = false;
         worker.commands.clear();
@@ -148,7 +187,7 @@ public class Registry {
      * run and the report segment ({@link Receipts}); up to 50 commands; the acknowledgements.
      */
     public HeartbeatResponse heartbeat(HeartbeatRequest request) {
-        return cluster.locked(() -> {
+        return cluster.write(() -> {
             WorkerInfo worker = accept(request.workerId(), request.bootId(), request.sentAt());
             if (request.seq() <= worker.lastHbSeq) {
                 cluster.increment("duplicates");
@@ -195,12 +234,13 @@ public class Registry {
     // ---- liveness -------------------------------------------------------------------------
 
     /**
-     * One pass of the health loop. If the controller itself was paused or starved since the last
-     * pass, every worker gets a fresh {@code last_seen} first, so a controller stall never turns
-     * into a mass declaration of death.
+     * One pass of the health loop (a brief write-lock block). If the controller itself was paused
+     * or starved since the last pass, every worker gets a fresh {@code last_seen} first, so a
+     * controller stall never turns into a mass declaration of death. ALIVE → STALE happens here;
+     * DEAD is a queued {@code MarkDead} task, which checks again when it runs.
      */
     public void healthPass() {
-        cluster.locked(() -> {
+        cluster.write(() -> {
             long now = cluster.now();
             long staleAfter = properties.staleAfter().toNanos();
             long deadAfter = properties.deadAfter().toNanos();
@@ -220,19 +260,62 @@ public class Registry {
                     worker.state = WorkerState.STALE;
                     log.warn("[registry] {} STALE after {}s of silence", worker.workerId, String.format("%.1f", silence / 1e9));
                 }
-                if (!worker.isDead() && silence > deadAfter) {
-                    worker.state = WorkerState.DEAD;
-                    worker.epoch++;                       // whatever was queued for the old epoch is dropped
-                    worker.hasReported = false;
-                    worker.commands.clear();
-                    cluster.closeSession(worker);
-                    int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
-                    cluster.purgeReceipts(worker.workerId);
-                    int removed = cluster.removeWorkerReplicas(worker.workerId);
-                    log.warn("[registry] {} DEAD after {}s - {} replicas removed, {} pending copies dropped",
-                            worker.workerId, String.format("%.1f", silence / 1e9), removed, dropped);
+                if (!worker.isDead() && !worker.deadQueued && silence > deadAfter
+                        && queue.offer(markDead(worker.workerId, worker.epoch))) {
+                    worker.deadQueued = true;
                 }
             }
+        });
+    }
+
+    /**
+     * {@code MarkDead} (§5.5), a multi-step task. It first checks again: if the epoch changed or
+     * a heartbeat arrived since it was queued, nothing happens. Otherwise the worker is DEAD: a new
+     * epoch, nothing in flight survives (commands, pending copies to or from it, receipts, its
+     * report session), and its replicas are removed in steps while it is {@code purging}.
+     */
+    Task markDead(String workerId, long epoch) {
+        List<String>[] sweep = new List[1];
+        int[] cursor = {0};
+        int[] dropped = {0};
+        double[] silenceSeconds = {0};
+        return Task.steps("MarkDead", deadline -> {
+            WorkerInfo worker = cluster.worker(workerId);
+            if (worker == null) {
+                return Task.Step.DONE;
+            }
+            if (sweep[0] == null) {
+                long silence = cluster.now() - worker.lastSeen;
+                if (worker.epoch != epoch || worker.isDead() || silence <= properties.deadAfter().toNanos()) {
+                    worker.deadQueued = false;             // it spoke (or re-registered) meanwhile
+                    return Task.Step.DONE;
+                }
+                silenceSeconds[0] = silence / 1e9;
+                worker.state = WorkerState.DEAD;
+                worker.epoch++;                            // whatever was queued for the old epoch is dropped
+                worker.purging = true;
+                worker.hasReported = false;
+                worker.commands.clear();
+                cluster.closeSession(worker);
+                worker.resetReceipt();
+                dropped[0] = cluster.dropPendingForWorker(workerId, true, true);
+                cluster.purgeReceipts(workerId);
+                sweep[0] = new java.util.ArrayList<>(cluster.chunksOn(workerId));
+            }
+            int items = 0;
+            while (cursor[0] < sweep[0].size()) {
+                cluster.removeReplica(sweep[0].get(cursor[0]++), workerId);   // runs protect()
+                if (++items >= NamespaceTasks.STEP_ITEMS || System.nanoTime() >= deadline) {
+                    if (cursor[0] < sweep[0].size()) {
+                        return Task.Step.MORE;
+                    }
+                }
+            }
+            worker.purging = false;
+            worker.deadQueued = false;
+            log.warn("[registry] {} DEAD after {}s - {} replicas removed, {} pending copies dropped", workerId,
+                    String.format("%.1f", silenceSeconds[0]), sweep[0].size(), dropped[0]);
+            return Task.Step.DONE;
         });
     }
 

@@ -41,9 +41,10 @@ class ChangeStreamSystemTest extends ClusterTest {
     @Test
     void edge9_anUploadDuringAFullReportIsRecordedWhenTheReportCompletesWithoutAnExtraCopy() {
         // Give worker1 several chunks, so that its full report has several (slow) segments.
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 30 && cluster.chunkFilesOn("worker1").size() < 3; i++) {
             api.uploadOk("pre-" + i + ".bin", Api.randomBytes(2 * MIB, 50 + i));
         }
+        assertThat(cluster.chunkFilesOn("worker1")).as("worker1's report needs several segments").hasSizeGreaterThanOrEqualTo(3);
         awaitHealthy();
         ControllerLink link = cluster.workerBean("worker1", ControllerLink.class);
         ControllerLink.delaySegmentsForTests("worker1", SEGMENT_DELAY_MS);

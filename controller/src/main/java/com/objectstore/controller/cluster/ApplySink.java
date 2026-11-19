@@ -1,28 +1,12 @@
 package com.objectstore.controller.cluster;
 
 /**
- * Where the receipt step puts work for the block map. In Block 12 the work is applied at once,
- * under the cluster lock the receipt step already holds ({@link #INLINE}); the single writer and
- * its bounded queue replace it later. {@link #hasRoom} lets the receipt step refuse to acknowledge
- * what it cannot queue.
+ * Where the receipt step puts work for the block map: the {@link ApplyQueue}. {@link #offer} is
+ * atomic (all the tasks are queued, or none) and never blocks, so the receipt step can refuse to
+ * acknowledge what it cannot queue.
  */
 public interface ApplySink {
 
-    /** True if {@code tasks} more tasks can be accepted right now. */
-    boolean hasRoom(int tasks);
-
-    /** Accepts a task; only called after {@link #hasRoom} said yes. */
-    void submit(String name, Runnable task);
-
-    ApplySink INLINE = new ApplySink() {
-        @Override
-        public boolean hasRoom(int tasks) {
-            return true;
-        }
-
-        @Override
-        public void submit(String name, Runnable task) {
-            task.run();
-        }
-    };
+    /** Queues all of {@code tasks}, in order, or none of them if there is not room for all. */
+    boolean offer(Task... tasks);
 }
