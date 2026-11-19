@@ -35,6 +35,7 @@ worker:
   ibr-interval-seconds: ${IBR_INTERVAL:0.5}
   ibr-buffer-max: ${IBR_BUFFER_MAX:10000}
   scan-interval-seconds: ${SCAN_INTERVAL:10}
+  scan-max-bytes-per-sec: ${SCAN_MAX_BYTES_PER_SEC:33554432}
   disk-check-interval-seconds: ${DISK_CHECK_INTERVAL:30}
   connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
   read-timeout-seconds: ${READ_TIMEOUT:10}
