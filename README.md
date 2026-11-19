@@ -331,15 +331,23 @@ Also used where they are the precise answer: `405 method_not_allowed`, `413 payl
 `chunk_count`, `queued_commands`, `pending_as_source`, `stats{chunks, used_bytes, free_bytes,
 active_transfers}`; `replicas{ok, corrupt, excess}`, `under_replicated`, `over_replicated`,
 `missing_chunks`, `pending_replications`, `blocked` (chunks the last monitor tick could not
-schedule); `counters{invariant_violations, orphan_gc_refused, stale_messages, duplicates, blocked, …}`;
-and `repair_log`, the monitor's last 200 events (`replicate`, `copied`, `timeout`, `trimmed`,
-`invalidated`, `deleted`, `restored`, `orphan`, `unrecoverable`).
+schedule); `counters{invariant_violations, orphan_gc_refused, stale_messages, duplicates, blocked,
+changes_gap, apply_queue_full, writer_task_failures, namespace_reconciled, upload_commit_wait_timeouts, …}`;
+`repair_log`, the monitor's last 200 events (`replicate`, `copied`, `failed`, `timeout`, `trimmed`,
+`invalidated`, `deleted`, `restored`, `orphan`, `unrecoverable`); and the writer's health:
+`lock_max_hold_ms` (the longest continuous write-lock hold since the previous status read, also per
+holder in `lock_max_hold_by`; reading resets it), `apply_queue_depth`, `apply_oldest_task_age_ms`,
+`writer_busy_ratio` (share of the time since the previous read that the writer held the lock) and
+`report_sessions_open`.
 
 ### fsck — `GET /api/v1/fsck`
 
-Asks every ALIVE worker, in parallel, for its chunks with checksums **recomputed from the files**,
-and compares that with the block map and the namespace; runs the invariant checks plus I7 (memory
-mirrors the `chunks` table).
+Takes the namespace lock, queues a barrier for the writer and waits for it (every namespace change
+queued before is applied), reads the `chunks` table and snapshots the block map, and releases the
+lock. Then it asks every ALIVE worker, in parallel, for its chunks with checksums **recomputed from
+the files**, compares that with the snapshot and the namespace, and runs the invariant checks plus
+I7 (memory mirrors the `chunks` table). `quiescent` also requires an empty apply queue, no report
+session open and no worker being purged.
 
 ```json
 {"status": "HEALTHY",
@@ -519,6 +527,10 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `CONNECT_TIMEOUT` | 2 | both | HTTP connect time-out |
 | `READ_TIMEOUT` | 10 | both | HTTP read time-out for chunk transfers |
 | `INVARIANT_CHECKS` | 1 | controller | run the invariant checks every monitor tick |
+| `MAX_LOCK_HOLD_MS` | 5 | controller | longest continuous write-lock hold by the writer before it yields (≥ 1) |
+| `APPLY_QUEUE_CAPACITY` | 10000 | controller | tasks; when full, the receipt step acknowledges nothing (the worker resends) |
+| `UPLOAD_COMMIT_WAIT` | 10 | controller | how long an upload or delete waits for its task before answering anyway |
+| `DOWNLOAD_SETTLE_WAIT` | 5 | controller | how long a download waits for a just-committed chunk to be readable in memory |
 | `FAULT_DELAY_MS` | 0 | both | fault injection: random delay 0..N ms before each internal call |
 | `FAULT_DROP_RATE` | 0 | both | fault injection: probability a call is lost (half before sending, half after: a lost answer) |
 | `FAULT_DUP_RATE` | 0 | both | fault injection: probability a call is sent twice |
@@ -703,13 +715,42 @@ same copy twice.
 
 ### The concurrency rule
 
-All cluster state is guarded by **one lock** (the HDFS namesystem lock). Every operation that reads
-and then modifies it runs as one synchronous block under that lock, with **no network I/O
-inside**: network calls happen before the block (parsing a request, writing chunks) or after it
-(answering). After any network call, state is looked up again by id and re-checked (for example: is
-this still the worker process we wrote to?). A database commit and the matching in-memory update
-happen in the same block, commit first. The only background threads are the health loop and the
-monitor, each a "sleep, then one pass under the lock" cycle.
+All cluster state is guarded by **one fair read-write lock** (the HDFS namesystem lock).
+**No network I/O, no SQLite access and no sleeping happen while it is held**, read or write; a guard
+on every database connection enforces the SQLite part (`SqliteGuard`).
+
+- **Readers** take the read lock: download candidates, metadata views, status, placement, fsck
+  snapshots.
+- **One writer.** Everything that changes the block map is a task on one bounded FIFO queue
+  (`APPLY_QUEUE_CAPACITY`), applied by one thread, `writer`, in batches of at most
+  `MAX_LOCK_HOLD_MS` per write-lock hold. A long task (a DEAD purge, a report completion, a large
+  commit or delete) works in steps of at most ~1000 items and answers `MORE`: the writer releases
+  the lock briefly and resumes **that** task before any other, so a continuation keeps its queue
+  position (a purge finishes before the worker's next registration; a report completes before the
+  worker's newer changes). The state satisfies every invariant at every step. A task that throws is
+  logged and counted (`writer_task_failures`) and the writer carries on.
+- **Brief writers** that only queue work: the heartbeat's receipt step (O(message)), the health
+  loop's STALE marking, `beginUpload`; the monitor still plans under the write lock (until the
+  priority index replaces its sort).
+- **Epochs.** Each worker's epoch grows on every accepted registration and on DEAD; every task about
+  a worker carries the epoch it was created in and is dropped if that epoch has ended.
+- **The namespace lock** is held across "SQLite transaction + putting the matching task on the
+  queue" for upload commits and deletes, so the queue order of namespace changes is the database's.
+  Lock order: never the cluster lock while holding the namespace lock; the writer never takes it;
+  putting a task on the queue takes no cluster lock. If a `CommitObject` or `DeleteObject` task
+  fails, a *reconcile helper* (a virtual thread) takes the namespace lock, reads that object's rows,
+  and queues `ApplyObjectMirror`, which makes the mirror match (`namespace_reconciled`).
+
+| Task | Queued by | Applies |
+|---|---|---|
+| `ApplyChanges`, `ApplySegment`, `CompleteReport` | the receipt step, PUT answers | the change stream and full reports |
+| `Register` | registration (the HTTP thread waits) | §registration rules, a new epoch |
+| `MarkDead` | the health loop | re-checks (a heartbeat meanwhile, or a new epoch, cancels it), then DEAD and a stepped purge |
+| `CommitObject` / `EndUpload` | an upload (waits up to `UPLOAD_COMMIT_WAIT`) | the mirror and the copies / garbage and DELETEs |
+| `DeleteObject` | a delete (waits up to `UPLOAD_COMMIT_WAIT`) | DELETEs to every holder and pending target; the chunks are forgotten |
+| `MarkCorrupt` | a download | a copy proven bad becomes `CORRUPT`, if still OK in the same epoch |
+| `ApplyObjectMirror` | the reconcile helper | the mirror of one object matches the database again |
+| `Barrier` | fsck, tests | nothing; its completion means everything before it is applied |
 
 If the controller itself was paused or starved (more than `STALE_AFTER / 2` between health passes),
 every worker's `last_seen` is refreshed before liveness is evaluated
@@ -718,11 +759,13 @@ declares the whole cluster dead.
 
 ### Liveness
 
-ALIVE → STALE after 6 s of silence → DEAD after 12 s. DEAD starts a new epoch (work queued for the
-old one is dropped), forgets every copy the worker held, its upload receipts and any open report
-session, clears its command queue and drops the copies it was sending or receiving. The next
-message from it is answered 404, it registers again, and its full report puts back whatever is
-still on its disk.
+ALIVE → STALE after 6 s of silence (the health loop) → DEAD after 12 s, as a queued `MarkDead`
+task that checks again when it runs: a heartbeat that arrived meanwhile cancels it. DEAD starts a new
+epoch (work queued for the old one is dropped), forgets the worker's upload receipts and any open
+report session, clears its command queue, drops the copies it was sending or receiving, and then
+removes every copy it held, in steps (the worker is *purging* meanwhile). The next message from it is
+answered 404, it registers again (its `Register` task runs after the purge), and its full report puts
+back whatever is still on its disk.
 
 ### Applying changes and reports
 
@@ -794,15 +837,21 @@ Per chunk: choose two targets, recording each target's epoch, and PUT in paralle
 `X-Change-Ack`; the changes in each answer go through the receipt step (normally including the
 chunk's `RECEIVED`, which becomes an upload receipt). A target that fails is excluded for the rest
 of the upload and the next worker on the ring takes its place (pipeline recovery). If two copies are
-impossible: best-effort delete of everything written, `503 upload_failed`. Finally, in one block
-under the lock: the namespace transaction (object, metadata, chunks, idempotency key), then the
-in-memory chunks, then for each target still in the same epoch: its receipt becomes the replica, or
-it gets an UPLOAD pending copy until its `RECEIVED` arrives; a target that died or re-registered
-meanwhile gets nothing, and the monitor simply repairs that chunk.
+impossible: `503 upload_failed`, and an `EndUpload` task queues a DELETE (`upload_failed`) for every
+copy written or possibly written. Finally, under the namespace lock: the idempotency check and the
+namespace transaction (object, metadata, chunks, idempotency key), and `CommitObject` is queued; the
+upload then waits for it, at most `UPLOAD_COMMIT_WAIT` (on time-out it still answers `201`: the
+object is durable; `upload_commit_wait_timeouts`). `CommitObject` puts the chunks in the mirror and,
+for each target still in the same epoch, turns its receipt into the replica or gives it an UPLOAD
+pending copy until its `RECEIVED` arrives; a target that died or re-registered meanwhile gets
+nothing, and the monitor simply repairs that chunk.
 
 ### The download path
 
-Every chunk must have a readable copy before the first byte is sent. Then each chunk is read with
+Every chunk must have a readable copy before the first byte is sent. A chunk that is in the database
+but not yet in memory (its `CommitObject` is still queued), or that has no candidate yet, is waited
+for (polling every 100 ms with no lock held, at most `DOWNLOAD_SETTLE_WAIT`); then `503
+chunk_unavailable`, or `404` if the object was deleted meanwhile. Then each chunk is read with
 candidates computed at that moment (ALIVE before STALE, no recent data error first, least loaded
 first, then ALIVE targets of UPLOAD pending copies, so an object can be read right after its 201),
 and each answer is classified:
@@ -916,6 +965,20 @@ the controller is down (clients retry until it is back).
 | Both copies of a chunk gone (holders dead) | `missing_chunks`; `unrecoverable` recorded once; the download answers 503. Recovers automatically when a holder returns. |
 | Only corrupt copies remain | Same as missing. Corrupt files are **kept** (never served) until a good copy exists. |
 | No eligible target (e.g. 2 workers alive and both hold the chunk) | `blocked`; nothing spins; retried every tick. |
+
+**The writer and the locks**
+
+| Situation | Behaviour |
+|---|---|
+| A heartbeat arrives between queuing `MarkDead` and applying it | `MarkDead` checks again when it runs and does nothing. |
+| Tasks queued for an epoch that has ended (DEAD, re-registration) | Dropped when applied (`stale_tasks_dropped`). |
+| A long task (a DEAD purge, a report completion, a big commit or delete) and the same worker's next task | The long task yields the lock between steps but keeps its queue position: the next task runs after it. |
+| An upload commit and a delete of the same object race | The namespace lock spans "SQLite + queue", so the queue order is the database's; a deleted object's chunks never stay in memory. |
+| A heartbeat waiting behind the writer | The writer holds the fair lock for at most `MAX_LOCK_HOLD_MS` at a time; the receipt step is O(message). |
+| The apply queue is full | The receipt step acknowledges nothing (liveness is still updated); the worker resends. |
+| A writer task throws | Caught, logged, counted; a failed commit or delete is reconciled from the database by the helper. |
+| Reads while a task is half applied | Readers use the read lock and see a consistent state at every step; a download waits (bounded) for a chunk committed but not yet in memory; fsck waits on a barrier. |
+| An upload's commit task takes longer than `UPLOAD_COMMIT_WAIT` | The upload answers `201` anyway (the object is durable) and counts it; the download settle wait covers the gap. |
 
 **Data path**
 
@@ -1047,7 +1110,7 @@ silent, contradicted each other, or did not fit the chosen stack:
 | Decision | Reason |
 |---|---|
 | Java 21 + Spring Boot 4.1 instead of Python + FastAPI | The project owner's choice. Every name visible from outside (endpoints, JSON keys, error codes, environment variables, states, log tags) is as specified. |
-| One namesystem lock instead of "one asyncio event loop" | Java has threads, so the equivalent of "no `await` between read and write" is "no network I/O while holding the lock", which is exactly how the HDFS NameNode works. The health loop and the monitor are two threads that each run one pass under the lock; there is no state outside it. Lock ordering is fixed: cluster lock before a database connection, never the reverse. |
+| One namesystem lock instead of "one asyncio event loop" | Java has threads, so the equivalent of "no `await` between read and write" is "no network I/O while holding the lock", which is exactly how the HDFS NameNode works. It is a fair read-write lock; one writer thread applies every queued change in short holds. No SQLite access happens under it: database work runs under the separate namespace lock, which is never held while waiting for the cluster lock. |
 | Worker work on threads instead of `asyncio.to_thread` | The scanner, disk check and controller link each have their own thread, so none can delay another, which is the property the "50 ms" rule protects. |
 | Blocks 5.1 and 6 in one commit | Block 5.1 alone would delete the replica tables while leaving the controller no way to learn replica locations. |
 | `oscli` (Java) instead of `client.py`; the chaos test in Python | `oscli` is the project's existing client. The chaos test is an external harness and uses only the Python standard library, so it runs on any machine with Python 3. |
@@ -1118,7 +1181,9 @@ millisecond timestamps (an update in the same second must show a later `updated_
 ├── controller/                 the NameNode
 │   └── src/main/java/com/objectstore/controller/
 │       ├── api/                ObjectsController, InternalWorkersController, ClusterController
-│       ├── cluster/            ClusterState, Registry (registration + receipt step), Receipts, ChangeApplier, SafeMode, Fsck, WorkerClient, ClusterBootstrap
+│       ├── cluster/            ClusterState (RW lock), Registry (registration, receipt step, MarkDead), Receipts, ChangeApplier,
+│       │                       ApplyQueue, Task, Writer, NamespaceLock, NamespaceTasks, ObjectReconciler, SqliteGuard,
+│       │                       SafeMode, Fsck, WorkerClient, ClusterBootstrap
 │       ├── replication/        Monitor, ReplicationPlanner, MaintenanceLoops
 │       ├── objects/            UploadService, DownloadService, ObjectService, PlacementPolicy, MetadataValidator
 │       └── repository/         ObjectRepository, ChunkRepository, ClusterMetaRepository (+ db/migration)

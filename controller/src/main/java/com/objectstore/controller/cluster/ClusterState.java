@@ -22,7 +22,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,11 +34,16 @@ import org.springframework.stereotype.Component;
  * worker still has to pick up. Like the HDFS NameNode's block map it is <em>not</em> persisted:
  * after a restart it is rebuilt from the workers' block reports.
  *
- * <p><b>The concurrency rule.</b> One lock, {@link #locked}, guards all of it (the NameNode's
- * namesystem lock). Every read-then-modify of this state runs as one synchronous block under the
- * lock, with no network I/O inside. The methods on this class are the <em>only</em> code that
- * writes {@code blocks}, {@code workerBlocks} and {@code pending}, which is what keeps the
- * invariants in {@link #checkInvariants()} true.
+ * <p><b>The concurrency rule.</b> One fair read-write lock guards all of it (the NameNode's
+ * namesystem lock): {@link #read} for readers (download candidates, metadata views, status,
+ * placement, fsck snapshots) and {@link #write} for brief writers (the receipt step, the health
+ * loop, the monitor) and the single {@code writer} thread, which applies every queued task. No
+ * network I/O, no SQLite access and no sleeping happens while it is held, read or write. The
+ * methods on this class are the <em>only</em> code that writes {@code blocks}, {@code workerBlocks}
+ * and {@code pending}, which is what keeps the invariants in {@link #checkInvariants()} true.
+ *
+ * <p>The longest continuous write-lock hold is recorded per holder (thread name) and shown in the
+ * status as {@code lock_max_hold_ms}.
  *
  * <p>Times used for liveness and time-outs are monotonic ({@link System#nanoTime()}), so a
  * clock adjustment on the host can neither kill nor revive a worker.
@@ -71,22 +76,28 @@ public class ClusterState {
         public String url;
         public String bootId;
         public WorkerState state = WorkerState.ALIVE;
-        public long lastSeen;                       // monotonic nanos of the last accepted heartbeat
+        public volatile long lastSeen;              // monotonic nanos of the last accepted heartbeat
         public long lastHbSeq = -1;
         public long epoch;                          // +1 on every accepted registration and on DEAD
         public long received;                       // changes up to this number were accepted (acknowledged)
         public long applied;                        // changes up to this number were applied to the block map
         public long lastAttempt;                    // the last accepted registration attempt of bootId
-        public ReportSession session;               // the full report being received, or null
-        public String closedReportId;               // the last completed report, to re-acknowledge its segments
-        public int closedLastSegment = -1;
+        public ReportSession session;               // the full report being applied (writer side), or null
+        // The report as the receipt step sees it: which segments were accepted (and acknowledged).
+        public String rxReportId;                   // the report being received, or the last one received
+        public long rxSession;                      // its session number
+        public long rxBaseline;
+        public int rxLastSegment = -1;
+        public boolean rxDone;                      // its last segment was accepted
+        public boolean deadQueued;                  // a MarkDead task is queued
+        public boolean purging;                     // DEAD, and its replicas are still being removed
         public boolean hasReported;                 // full report completed since (re)registration
         public long lastReportAt;                   // monotonic nanos of the last completed full report
         public String registeredAt = "";
         public WorkerStats stats;
         public final Deque<Command> commands = new ArrayDeque<>();
         public final Deque<Long> bootFlips = new ArrayDeque<>();  // monotonic nanos of boot id changes
-        public long lastDataError;                  // monotonic nanos of the last failed data-path call
+        public volatile long lastDataError;         // monotonic nanos of the last failed data-path call (no lock)
         public boolean fullReportRequested;         // set by the monitor; cleared by the next heartbeat reply
 
         WorkerInfo(String workerId) {
@@ -95,6 +106,20 @@ public class ClusterState {
 
         public boolean isDead() {
             return state == WorkerState.DEAD;
+        }
+
+        /** A full report is being received (its last segment has not been accepted yet). */
+        public boolean reportInProgress() {
+            return rxReportId != null && !rxDone;
+        }
+
+        /** Forgets the receipt-side report state (re-registration, DEAD). */
+        void resetReceipt() {
+            rxReportId = null;
+            rxSession = 0;
+            rxBaseline = 0;
+            rxLastSegment = -1;
+            rxDone = false;
         }
     }
 
@@ -129,22 +154,20 @@ public class ClusterState {
     }
 
     /**
-     * A full report being received from one worker. {@code number} is unique across all sessions;
-     * a segment sets {@code replica.mark = number} on every copy it lists, and completion removes
-     * the worker's copies whose mark differs.
+     * A full report being applied for one worker (the writer's side; the receipt step tracks which
+     * segments it accepted in {@code WorkerInfo.rx*}). {@code number} is unique across all
+     * sessions; a segment sets {@code replica.mark = number} on every copy it lists, and completion
+     * removes the worker's copies whose mark differs.
      */
     public static final class ReportSession {
-        public final String reportId;
         public final long baseline;
         public final long number;
-        public int lastSegment = -1;
         public long listed;
         public final List<String> garbage = new ArrayList<>();
         public final List<String> orphans = new ArrayList<>();
         public boolean closed;
 
-        ReportSession(String reportId, long baseline, long number) {
-            this.reportId = reportId;
+        ReportSession(long number, long baseline) {
             this.baseline = baseline;
             this.number = number;
         }
@@ -177,11 +200,15 @@ public class ClusterState {
 
     private final ControllerProperties properties;
     private final Clock clock;
-    private final ReentrantLock lock = new ReentrantLock();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+    private final Map<String, Long> maxHoldNanos = new ConcurrentHashMap<>();
+    private long writeStartedAt;                    // when the current outermost write hold began
+    /** The lock of the most recently created cluster state, for {@link #lockHeldByCurrentThread()}. */
+    private static volatile ReentrantReadWriteLock latestLock;
     private final long startedAt = System.nanoTime();
 
     private volatile String clusterId = "";
-    private final Map<String, WorkerInfo> workers = new LinkedHashMap<>();
+    private final Map<String, WorkerInfo> workers = new ConcurrentHashMap<>();
     private final Map<String, ChunkInfo> chunks = new HashMap<>();
     private final Map<String, Map<String, Replica>> blocks = new HashMap<>();
     private final Map<String, Set<String>> workerBlocks = new HashMap<>();
@@ -202,32 +229,115 @@ public class ClusterState {
     public ClusterState(ControllerProperties properties, Clock clock) {
         this.properties = properties;
         this.clock = clock;
+        latestLock = lock;
     }
 
     // ---- the lock -------------------------------------------------------------------------
 
-    /** Runs {@code action} as one synchronous block under the namesystem lock. */
-    public <T> T locked(Supplier<T> action) {
-        lock.lock();
+    /** Runs {@code action} under the read lock. It must not modify any state. */
+    public <T> T read(Supplier<T> action) {
+        lock.readLock().lock();
         try {
             return action.get();
         } finally {
-            lock.unlock();
+            lock.readLock().unlock();
         }
+    }
+
+    public void read(Runnable action) {
+        read(() -> {
+            action.run();
+            return null;
+        });
+    }
+
+    /** Runs {@code action} as one brief block under the write lock. */
+    public <T> T write(Supplier<T> action) {
+        lockWrite();
+        try {
+            return action.get();
+        } finally {
+            unlockWrite();
+        }
+    }
+
+    public void write(Runnable action) {
+        write(() -> {
+            action.run();
+            return null;
+        });
+    }
+
+    /** The same as {@link #write(Supplier)}; kept for tests. */
+    public <T> T locked(Supplier<T> action) {
+        return write(action);
     }
 
     public void locked(Runnable action) {
-        lock.lock();
-        try {
-            action.run();
-        } finally {
-            lock.unlock();
+        write(action);
+    }
+
+    /** Takes the write lock (re-entrant); the outermost hold is timed. */
+    public void lockWrite() {
+        lock.writeLock().lock();
+        if (lock.getWriteHoldCount() == 1) {
+            writeStartedAt = System.nanoTime();
         }
     }
 
-    /** For assertions in code that must only run under the lock. */
+    /** Releases the write lock; the outermost release runs {@link #flushDirty()} and records the hold. */
+    public void unlockWrite() {
+        try {
+            if (lock.getWriteHoldCount() == 1) {
+                flushDirty();
+                long held = System.nanoTime() - writeStartedAt;
+                maxHoldNanos.merge(holderName(), held, Math::max);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Hook for the priority index (Block 15): applied before every write unlock. */
+    public void flushDirty() {
+    }
+
+    private static String holderName() {
+        String name = Thread.currentThread().getName();
+        return name == null || name.isEmpty() ? (Thread.currentThread().isVirtual() ? "http" : "unnamed") : name;
+    }
+
+    /** The longest continuous write hold per holder since the last call, in ms; resets. */
+    public Map<String, Double> takeLockMaxHoldMs() {
+        Map<String, Double> snapshot = new java.util.TreeMap<>();
+        for (String holder : List.copyOf(maxHoldNanos.keySet())) {
+            Long nanos = maxHoldNanos.remove(holder);
+            if (nanos != null) {
+                snapshot.put(holder, Math.round(nanos / 10_000.0) / 100.0);
+            }
+        }
+        return snapshot;
+    }
+
+    /** The longest write hold of one holder since the last call, in ms, without resetting the others. */
+    public double peekLockMaxHoldMs(String holder) {
+        Long nanos = maxHoldNanos.get(holder);
+        return nanos == null ? 0 : nanos / 1e6;
+    }
+
+    /** For assertions in code that must only run under the lock (read or write). */
     public boolean isLocked() {
-        return lock.isHeldByCurrentThread();
+        return lock.isWriteLockedByCurrentThread() || lock.getReadHoldCount() > 0;
+    }
+
+    public boolean isWriteLocked() {
+        return lock.isWriteLockedByCurrentThread();
+    }
+
+    /** True if the current thread holds the (latest) cluster lock: no SQLite access is allowed then. */
+    public static boolean lockHeldByCurrentThread() {
+        ReentrantReadWriteLock current = latestLock;
+        return current != null && (current.isWriteLockedByCurrentThread() || current.getReadHoldCount() > 0);
     }
 
     // ---- time -----------------------------------------------------------------------------
@@ -437,12 +547,17 @@ public class ClusterState {
 
     // ---- report sessions --------------------------------------------------------------------
 
-    /** Opens a new report session for a worker, replacing any open one. */
-    public ReportSession openSession(WorkerInfo worker, String reportId, long baseline) {
+    /** A new, unique report session number (allocated by the receipt step). */
+    public long nextSessionNumber() {
+        return ++sessionNumbers;
+    }
+
+    /** Opens the writer-side session {@code number} for a worker, replacing any open one. */
+    public ReportSession openSession(WorkerInfo worker, long number, long baseline) {
         if (worker.session != null) {
             worker.session.closed = true;
         }
-        worker.session = new ReportSession(reportId, baseline, ++sessionNumbers);
+        worker.session = new ReportSession(number, baseline);
         return worker.session;
     }
 
@@ -454,8 +569,13 @@ public class ClusterState {
         }
     }
 
+    /** Workers with a report being received or applied. */
     public long openSessions() {
-        return workers.values().stream().filter(w -> w.session != null).count();
+        return workers.values().stream().filter(w -> w.session != null || w.reportInProgress()).count();
+    }
+
+    public boolean anyPurging() {
+        return workers.values().stream().anyMatch(w -> w.purging);
     }
 
     // ---- replicas (the block map) ---------------------------------------------------------
@@ -898,7 +1018,7 @@ public class ClusterState {
         for (Map.Entry<String, Map<String, Replica>> entry : blocks.entrySet()) {
             for (String workerId : entry.getValue().keySet()) {
                 WorkerInfo worker = workers.get(workerId);
-                if (worker == null || worker.isDead()) {
+                if (worker == null || (worker.isDead() && !worker.purging)) {   // a purge removes them in steps
                     violations.add("I1: chunk " + entry.getKey() + " has a replica on " + workerId
                             + (worker == null ? " (unknown)" : " (DEAD)"));
                 }

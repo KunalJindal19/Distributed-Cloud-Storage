@@ -49,7 +49,7 @@ public class Monitor {
     }
 
     public void tick() {
-        cluster.locked(() -> {
+        cluster.write(() -> {
             ticks++;
             cluster.purgeExpiredFailures();
             expirePendingCopies();
@@ -93,7 +93,8 @@ public class Monitor {
         long limit = 2 * properties.fullReportInterval().toNanos();
         long now = cluster.now();
         for (WorkerInfo worker : cluster.workers().values()) {
-            boolean overdue = worker.hasReported ? now - worker.lastReportAt > limit : worker.session == null;
+            boolean overdue = worker.hasReported ? now - worker.lastReportAt > limit
+                    : worker.session == null && !worker.reportInProgress();
             if (!worker.isDead() && overdue) {
                 worker.fullReportRequested = true;
                 log.info("[monitor] asking {} for a full report", worker.workerId);

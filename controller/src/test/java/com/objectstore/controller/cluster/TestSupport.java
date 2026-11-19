@@ -31,9 +31,16 @@ public final class TestSupport {
 
     public final ControllerProperties properties;
     public final ClusterState cluster;
+    public final ApplyQueue queue;
+    public final NamespaceLock namespaceLock = new NamespaceLock();
+    public final NamespaceTasks namespaceTasks;
+    public final ObjectReconciler reconciler;
+    public final Writer writer;
     public final ChangeApplier applier;
     public final Receipts receipts;
     public final Registry registry;
+    /** The namespace the reconcile helper reads (tests put rows here). */
+    public final Map<String, List<com.objectstore.controller.domain.Chunk>> namespace = new java.util.concurrent.ConcurrentHashMap<>();
     public final com.objectstore.controller.objects.PlacementPolicy placement;
     public final com.objectstore.controller.replication.ReplicationPlanner planner;
     private final Map<String, Fake> fakes = new HashMap<>();
@@ -53,9 +60,14 @@ public final class TestSupport {
     public TestSupport(ControllerProperties properties) {
         this.properties = properties;
         this.cluster = new ClusterState(properties, Clock.systemUTC());
+        this.queue = new ApplyQueue(properties.applyQueueCapacity());
+        this.namespaceTasks = new NamespaceTasks(cluster);
+        this.reconciler = new ObjectReconciler(namespaceLock, queue, namespaceTasks,
+                objectId -> namespace.getOrDefault(objectId, List.of()));
+        this.writer = new Writer(cluster, queue, properties, reconciler);   // not started: sync() applies the queue
         this.applier = new ChangeApplier(cluster, properties);
-        this.receipts = new Receipts(cluster, applier);
-        this.registry = new Registry(cluster, properties, receipts);
+        this.receipts = new Receipts(cluster, applier, queue);
+        this.registry = new Registry(cluster, properties, receipts, queue, writer);
         this.placement = new com.objectstore.controller.objects.PlacementPolicy(cluster, properties);
         this.planner = new com.objectstore.controller.replication.ReplicationPlanner(cluster, placement, properties);
         cluster.setClusterId("cluster-1");
@@ -64,7 +76,8 @@ public final class TestSupport {
 
     public static ControllerProperties properties(double staleAfter, double deadAfter, double orphanGcDelay) {
         return new ControllerProperties(1_048_576, 2, Path.of("/tmp/unused.db"), staleAfter, deadAfter, 0.5,
-                0.1, 0.3, 2, 3, 2, 30, 1000, 10, 0.999, 0.1, 5, orphanGcDelay, 0.5, 16 * 1024 * 1024, 30, 2, 10, true);
+                0.1, 0.3, 2, 3, 2, 30, 1000, 10, 0.999, 0.1, 5, orphanGcDelay, 0.5, 16 * 1024 * 1024, 30, 2, 10, true,
+                5, 10_000, 5, 2);
     }
 
     public static String chunk(int index) {
@@ -131,11 +144,26 @@ public final class TestSupport {
         return new Change(++fake.lastChange, type, chunkId, size, checksum, cmdId, null, null);
     }
 
-    /** A heartbeat with the next sequence number, these changes and this segment. */
+    /** A heartbeat with the next sequence number, these changes and this segment; then the queue is applied. */
     public HeartbeatResponse send(String workerId, List<Change> changes, ReportSegment segment) {
         Fake fake = fake(workerId);
-        return registry.heartbeat(new HeartbeatRequest(workerId, fake.boot, ++fake.hbSeq, InternalApi.nowSeconds(), STATS,
-                changes, segment));
+        HeartbeatResponse response = registry.heartbeat(new HeartbeatRequest(workerId, fake.boot, ++fake.hbSeq,
+                InternalApi.nowSeconds(), STATS, changes, segment));
+        sync();
+        return response;
+    }
+
+    /** Applies everything queued (the writer thread is not running in these tests). */
+    public void sync() {
+        if (writer.isThreadRunning()) {
+            try {
+                writer.barrier(java.time.Duration.ofSeconds(30));
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        } else {
+            writer.drainInline();
+        }
     }
 
     /** One planning pass, as the monitor runs it. */
@@ -156,6 +184,8 @@ public final class TestSupport {
     public HeartbeatResponse heartbeat(String workerId, String boot, long hbSeq) {
         Fake fake = fake(workerId);
         fake.hbSeq = Math.max(fake.hbSeq, hbSeq);
-        return registry.heartbeat(new HeartbeatRequest(workerId, boot, hbSeq, InternalApi.nowSeconds(), STATS));
+        HeartbeatResponse response = registry.heartbeat(new HeartbeatRequest(workerId, boot, hbSeq, InternalApi.nowSeconds(), STATS));
+        sync();
+        return response;
     }
 }
