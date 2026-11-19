@@ -20,7 +20,15 @@ public record ClusterStatusResponse(
         int pendingReplications,
         long blocked,
         Map<String, Long> counters,
-        List<RepairEvent> repairLog) {
+        List<RepairEvent> repairLog,
+        /** Longest continuous write-lock hold since the last status read (ms), and per holder. */
+        double lockMaxHoldMs,
+        Map<String, Double> lockMaxHoldBy,
+        int applyQueueDepth,
+        long applyOldestTaskAgeMs,
+        /** Fraction of the time since the last status read that the writer held the lock. */
+        double writerBusyRatio,
+        long reportSessionsOpen) {
 
     public record Config(
             int chunkSize,

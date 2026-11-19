@@ -39,7 +39,15 @@ public record ControllerProperties(
         @Positive double fullReportIntervalSeconds,
         @Positive double connectTimeoutSeconds,
         @Positive double readTimeoutSeconds,
-        boolean invariantChecks) {
+        boolean invariantChecks,
+        /** Longest continuous write-lock hold by the writer before it yields. */
+        @Min(1) long maxLockHoldMs,
+        /** Tasks the apply queue holds; when full, the receipt step does not acknowledge. */
+        @Min(1) int applyQueueCapacity,
+        /** How long an upload (or delete) waits for its task before answering anyway. */
+        @Positive double uploadCommitWaitSeconds,
+        /** How long a download waits for a chunk that is in the database but not yet readable in memory. */
+        @PositiveOrZero double downloadSettleWaitSeconds) {
 
     public Duration staleAfter() {
         return seconds(staleAfterSeconds);
@@ -95,6 +103,18 @@ public record ControllerProperties(
 
     public Duration readTimeout() {
         return seconds(readTimeoutSeconds);
+    }
+
+    public Duration maxLockHold() {
+        return Duration.ofMillis(maxLockHoldMs);
+    }
+
+    public Duration uploadCommitWait() {
+        return seconds(uploadCommitWaitSeconds);
+    }
+
+    public Duration downloadSettleWait() {
+        return seconds(downloadSettleWaitSeconds);
     }
 
     private static Duration seconds(double value) {

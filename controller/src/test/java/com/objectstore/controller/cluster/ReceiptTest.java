@@ -95,17 +95,7 @@ class ReceiptTest {
 
     @Test
     void edge30_aFullQueueAcknowledgesNothingButLivenessIsStillUpdated() {
-        t.receipts.setSink(new ApplySink() {
-            @Override
-            public boolean hasRoom(int tasks) {
-                return false;
-            }
-
-            @Override
-            public void submit(String name, Runnable task) {
-                throw new AssertionError("nothing may be submitted to a full queue");
-            }
-        });
+        t.receipts.setSink(tasks -> false);                          // a full queue
         cluster.locked(() -> {
             worker().state = WorkerState.STALE;
             worker().lastSeen = cluster.now() - 10_000_000_000L;
@@ -184,6 +174,7 @@ class ReceiptTest {
         // From the current boot it counts like a heartbeat's changes, without touching liveness.
         long seenBefore = cluster.locked(() -> worker().lastSeen);
         t.receipts.acceptPiggyback("worker1", boot, List.of(received(1, chunk(0))));
+        t.sync();
         cluster.locked(() -> {
             assertThat(worker().received).isEqualTo(1);
             assertThat(cluster.replica(chunk(0), "worker1").state).isEqualTo(ReplicaState.OK);
