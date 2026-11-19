@@ -6,6 +6,7 @@ import com.objectstore.common.dto.HeartbeatRequest;
 import com.objectstore.common.dto.HeartbeatResponse;
 import com.objectstore.common.dto.RegisterRequest;
 import com.objectstore.common.dto.RegisterResponse;
+import com.objectstore.common.dto.SegmentAck;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
@@ -33,16 +34,24 @@ public class Registry {
 
     private final ClusterState cluster;
     private final ControllerProperties properties;
+    private final Receipts receipts;
     private long lastHealthRun;
     private final java.util.Map<String, Long> duplicateRefusedUntil = new java.util.HashMap<>();
 
-    public Registry(ClusterState cluster, ControllerProperties properties) {
+    public Registry(ClusterState cluster, ControllerProperties properties, Receipts receipts) {
         this.cluster = cluster;
         this.properties = properties;
+        this.receipts = receipts;
     }
 
     // ---- registration ---------------------------------------------------------------------
 
+    /**
+     * Registers a worker process (v4 §4.8). Checks, in order: the cluster id; the age of the
+     * request ({@code too_old}); the duplicate-worker refusal; a delayed older attempt of the same
+     * process ({@code stale_registration}); a repeat of the last accepted attempt (answered ok,
+     * nothing reset: the earlier reply was lost). Anything else is accepted and starts a new epoch.
+     */
     public RegisterResponse register(RegisterRequest request) {
         return cluster.locked(() -> {
             String workerId = request.workerId();
@@ -53,12 +62,18 @@ public class Registry {
                 throw ApiException.conflict(ErrorCodes.CLUSTER_ID_MISMATCH,
                         "worker belongs to cluster " + request.clusterId() + ", this controller is cluster " + cluster.clusterId());
             }
+            if (InternalApi.nowSeconds() - request.sentAt() > properties.maxMessageAgeSeconds()) {
+                cluster.increment("stale_messages");
+                throw ApiException.conflict(ErrorCodes.TOO_OLD, "registration from " + workerId + " is older than "
+                        + properties.maxMessageAgeSeconds() + " s");
+            }
             long now = cluster.now();
             WorkerInfo worker = cluster.worker(workerId);
             if (worker == null) {
                 worker = cluster.addWorker(workerId, url, request.bootId());
-                log.info("[registry] registered {} url={} boot={}", workerId, url, shortId(request.bootId()));
-                reset(worker, request, now);
+                accept(worker, request, url, now);
+                log.info("[registry] registered {} url={} boot={} attempt={} change_seq={}", workerId, url,
+                        shortId(request.bootId()), request.attempt(), request.changeSeq());
                 return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
             }
             Long refusedUntil = duplicateRefusedUntil.get(workerId);
@@ -66,55 +81,78 @@ public class Registry {
                 throw ApiException.conflict(ErrorCodes.DUPLICATE_WORKER,
                         "another process is registered as " + workerId + "; refusing newcomers for a while");
             }
-            if (request.bootId().equals(worker.bootId) && !worker.isDead()) {
-                // A retried registration from the same process: just refresh it.
-                worker.url = url;
-                worker.lastSeen = now;
-                worker.stats = request.stats();
-                worker.state = WorkerState.ALIVE;
-                return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
+            boolean sameProcess = request.bootId().equals(worker.bootId);
+            if (sameProcess && request.attempt() < worker.lastAttempt) {
+                cluster.increment("stale_registrations");
+                log.warn("[registry] {} delayed registration attempt {} refused (attempt {} already accepted)", workerId,
+                        request.attempt(), worker.lastAttempt);
+                throw ApiException.conflict(ErrorCodes.STALE_REGISTRATION, "registration attempt " + request.attempt()
+                        + " is older than the accepted attempt " + worker.lastAttempt);
             }
-            if (!request.bootId().equals(worker.bootId) && cluster.recordBootFlip(worker)) {
+            if (sameProcess && request.attempt() == worker.lastAttempt) {
+                return new RegisterResponse(true, cluster.clusterId(), worker.state.name());   // a lost reply, repeated
+            }
+            if (!sameProcess && cluster.recordBootFlip(worker)) {
                 duplicateRefusedUntil.put(workerId, now + DUPLICATE_REFUSAL_NANOS);
                 log.error("[registry] duplicate WORKER_ID {}? three boot ids within a minute; refusing newcomers for 60 s", workerId);
                 throw ApiException.conflict(ErrorCodes.DUPLICATE_WORKER,
                         "another process keeps registering as " + workerId);
             }
-            boolean wasDead = worker.isDead();
-            log.info("[registry] re-registered {} url={} boot={} (was {})", workerId, url, shortId(request.bootId()), worker.state);
-            worker.url = url;
-            worker.bootId = request.bootId();
-            reset(worker, request, now);
-            if (wasDead) {
+            WorkerState was = worker.state;
+            accept(worker, request, url, now);
+            log.info("[registry] re-registered {} url={} boot={} attempt={} change_seq={} (was {}{})", workerId, url,
+                    shortId(request.bootId()), request.attempt(), request.changeSeq(), was,
+                    sameProcess ? ", same process" : "");
+            if (was == WorkerState.DEAD) {
                 log.info("[registry] {} is back", workerId);
             }
             return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
         });
     }
 
-    /** A (re)started process: forget what was in flight with the old one; keep its copies for the report to confirm. */
-    private void reset(WorkerInfo worker, RegisterRequest request, long now) {
+    /**
+     * An accepted registration: a new epoch whose change stream starts after {@code change_seq}.
+     * What was in flight with the old epoch is forgotten (commands, pending copies to or from the
+     * worker, upload receipts, an open report session). The copies are kept: the report that
+     * follows confirms or removes them.
+     */
+    private void accept(WorkerInfo worker, RegisterRequest request, String url, long now) {
+        worker.url = url;
+        worker.bootId = request.bootId();
         worker.state = WorkerState.ALIVE;
         worker.lastSeen = now;
         worker.lastHbSeq = request.hbSeq();
-        worker.lastReportSeq = request.reportSeq();
-        worker.hasReported = false;
         worker.stats = request.stats();
+        worker.epoch++;
+        worker.received = request.changeSeq();
+        worker.applied = request.changeSeq();
+        worker.lastAttempt = request.attempt();
+        cluster.closeSession(worker);
+        worker.closedReportId = null;
+        worker.closedLastSegment = -1;
+        worker.hasReported = false;
+        worker.fullReportRequested = false;
         worker.commands.clear();
-        int dropped = cluster.dropPendingForWorker(worker.workerId, true, false);
-        if (dropped > 0) {
-            log.info("[registry] {} restarted; dropped {} pending copies it was the source of", worker.workerId, dropped);
+        int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
+        int purged = cluster.purgeReceipts(worker.workerId);
+        if (dropped + purged > 0) {
+            log.info("[registry] {} new epoch {}: dropped {} pending copies to or from it and {} upload receipts",
+                    worker.workerId, worker.epoch, dropped, purged);
         }
     }
 
     // ---- heartbeat ------------------------------------------------------------------------
 
+    /**
+     * The receipt step (v4 §4.6), one brief block under the lock: acceptance; liveness; the change
+     * run and the report segment ({@link Receipts}); up to 50 commands; the acknowledgements.
+     */
     public HeartbeatResponse heartbeat(HeartbeatRequest request) {
         return cluster.locked(() -> {
             WorkerInfo worker = accept(request.workerId(), request.bootId(), request.sentAt());
             if (request.seq() <= worker.lastHbSeq) {
                 cluster.increment("duplicates");
-                return new HeartbeatResponse(true, worker.state.name(), List.of(), false, "duplicate");
+                return new HeartbeatResponse(true, worker.state.name(), List.of(), false, "duplicate", worker.received, null);
             }
             worker.lastHbSeq = request.seq();
             worker.lastSeen = cluster.now();
@@ -123,16 +161,17 @@ public class Registry {
                 worker.state = WorkerState.ALIVE;
                 log.info("[registry] {} ALIVE again (was STALE)", worker.workerId);
             }
+            receipts.acceptChanges(worker, request.changes());
+            SegmentAck segmentAck = receipts.acceptSegment(worker, request.segment());
             List<Command> commands = cluster.takeCommands(worker);
-            boolean requestFull = !worker.hasReported || worker.fullReportRequested
-                    || cluster.now() - worker.lastReportAt > 2 * properties.fullReportInterval().toNanos();
+            boolean requestFull = worker.fullReportRequested;
             worker.fullReportRequested = false;
-            return new HeartbeatResponse(true, worker.state.name(), commands, requestFull, null);
+            return new HeartbeatResponse(true, worker.state.name(), commands, requestFull, null, worker.received, segmentAck);
         });
     }
 
     /**
-     * The acceptance rules shared by heartbeats and reports: unknown or DEAD → 404 (register
+     * The acceptance rules for heartbeats: unknown or DEAD → 404 (register
      * again); a boot id that is not the current one → 409 {@code stale_boot}; a message older
      * than MAX_MESSAGE_AGE → 409 {@code too_old}. Must be called under the lock.
      */
@@ -183,10 +222,13 @@ public class Registry {
                 }
                 if (!worker.isDead() && silence > deadAfter) {
                     worker.state = WorkerState.DEAD;
-                    int removed = cluster.removeWorkerReplicas(worker.workerId);
-                    worker.commands.clear();
-                    int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
+                    worker.epoch++;                       // whatever was queued for the old epoch is dropped
                     worker.hasReported = false;
+                    worker.commands.clear();
+                    cluster.closeSession(worker);
+                    int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
+                    cluster.purgeReceipts(worker.workerId);
+                    int removed = cluster.removeWorkerReplicas(worker.workerId);
                     log.warn("[registry] {} DEAD after {}s - {} replicas removed, {} pending copies dropped",
                             worker.workerId, String.format("%.1f", silence / 1e9), removed, dropped);
                 }

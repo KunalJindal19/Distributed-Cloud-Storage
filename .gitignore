@@ -34,3 +34,4 @@ Thumbs.db
 # --- Python bytecode (tests/chaos.py) ---
 __pycache__/
 *.pyc
+prompt_v3_1_scale.md

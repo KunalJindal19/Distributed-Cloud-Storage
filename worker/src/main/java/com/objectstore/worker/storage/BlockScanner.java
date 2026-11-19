@@ -30,7 +30,7 @@ public class BlockScanner implements Runnable {
     private final ChunkStore store;
     private final WorkerProperties properties;
 
-    public BlockScanner(ChunkStore store, com.objectstore.worker.reporting.IbrBuffer ibr, WorkerProperties properties) {
+    public BlockScanner(ChunkStore store, WorkerProperties properties) {
         this.store = store;
         this.properties = properties;
     }

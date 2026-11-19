@@ -42,6 +42,12 @@ import org.springframework.stereotype.Component;
  *
  * <p>Times used for liveness and time-outs are monotonic ({@link System#nanoTime()}), so a
  * clock adjustment on the host can neither kill nor revive a worker.
+ *
+ * <p><b>Change streams (v4).</b> Each worker process numbers the changes to its disk. For each
+ * worker the controller keeps {@code received} (every change up to it has been accepted, so the
+ * worker may forget them) and {@code applied} (every change up to it has been applied to the block
+ * map), both within the current {@code epoch}. The epoch grows on every accepted registration and
+ * on DEAD, so work belonging to an earlier life of the worker is recognised and dropped.
  */
 @Component
 public class ClusterState {
@@ -51,6 +57,9 @@ public class ClusterState {
     private static final int BOOT_FLIP_WINDOW_SECONDS = 60;
     private static final int BOOT_FLIPS_FOR_DUPLICATE = 3;
     private static final int MAX_COMMANDS_PER_HEARTBEAT = 50;
+
+    /** The checksum recorded for a copy whose bytes failed verification: matches nothing. */
+    public static final String UNVERIFIED = "unverified";
 
     public enum WorkerState { ALIVE, STALE, DEAD }
 
@@ -64,9 +73,15 @@ public class ClusterState {
         public WorkerState state = WorkerState.ALIVE;
         public long lastSeen;                       // monotonic nanos of the last accepted heartbeat
         public long lastHbSeq = -1;
-        public long lastReportSeq = -1;
-        public boolean hasReported;                 // full report processed since (re)registration
-        public long lastReportAt;                   // monotonic nanos of the last accepted full report
+        public long epoch;                          // +1 on every accepted registration and on DEAD
+        public long received;                       // changes up to this number were accepted (acknowledged)
+        public long applied;                        // changes up to this number were applied to the block map
+        public long lastAttempt;                    // the last accepted registration attempt of bootId
+        public ReportSession session;               // the full report being received, or null
+        public String closedReportId;               // the last completed report, to re-acknowledge its segments
+        public int closedLastSegment = -1;
+        public boolean hasReported;                 // full report completed since (re)registration
+        public long lastReportAt;                   // monotonic nanos of the last completed full report
         public String registeredAt = "";
         public WorkerStats stats;
         public final Deque<Command> commands = new ArrayDeque<>();
@@ -83,18 +98,74 @@ public class ClusterState {
         }
     }
 
-    /** One copy of one chunk on one worker. */
+    /**
+     * One copy of one chunk on one worker. Every replica comes from the worker's own change
+     * stream or full report (or from an upload receipt, which came from them), so all are confirmed.
+     */
     public static final class Replica {
         public ReplicaState state = ReplicaState.OK;
-        public boolean confirmed;                   // seen in this worker's ordered report channel
+        public long mark;                           // the report session that last listed it; 0 = none
         public long addedAt;                        // monotonic nanos
         public long deleteQueuedAt;                 // monotonic nanos; 0 = no delete queued
         public boolean deleteDelivered;             // the DELETE was handed to the worker; it cannot be cancelled
         public String deleteCmdId;
     }
 
-    /** A copy that a source worker has been told to make on a target worker. */
-    public record PendingCopy(String source, String target, long deadline, String cmdId, long startedAt) {
+    public enum PendingKind { REPAIR, UPLOAD }
+
+    /**
+     * A copy on its way to {@code target}: a REPAIR that {@code source} was told to make (with the
+     * REPLICATE's {@code cmdId}), or an UPLOAD the controller wrote itself and whose RECEIVED has
+     * not arrived yet ({@code source} and {@code cmdId} are null). It ends by the target's RECEIVED
+     * or a report listing the copy, by {@code CMD_FAILED}, by time-out, by its source or target
+     * becoming DEAD or re-registering, or by its chunk being deleted.
+     */
+    public record PendingCopy(PendingKind kind, String source, String target, long deadline, String cmdId,
+                              long startedAt) {
+
+        public boolean involves(String workerId) {
+            return workerId.equals(source) || workerId.equals(target);
+        }
+    }
+
+    /**
+     * A full report being received from one worker. {@code number} is unique across all sessions;
+     * a segment sets {@code replica.mark = number} on every copy it lists, and completion removes
+     * the worker's copies whose mark differs.
+     */
+    public static final class ReportSession {
+        public final String reportId;
+        public final long baseline;
+        public final long number;
+        public int lastSegment = -1;
+        public long listed;
+        public final List<String> garbage = new ArrayList<>();
+        public final List<String> orphans = new ArrayList<>();
+        public boolean closed;
+
+        ReportSession(String reportId, long baseline, long number) {
+            this.reportId = reportId;
+            this.baseline = baseline;
+            this.number = number;
+        }
+    }
+
+    /**
+     * Proof that worker {@code W}, in {@code epoch}, holds bytes of a chunk whose upload has not
+     * committed yet. The commit turns it into a replica; {@code seenInSession} becomes its mark.
+     */
+    public static final class Receipt {
+        public final long epoch;
+        public long size;
+        public String checksum;
+        public long seenInSession;
+
+        Receipt(long epoch, long size, String checksum, long seenInSession) {
+            this.epoch = epoch;
+            this.size = size;
+            this.checksum = checksum;
+            this.seenInSession = seenInSession;
+        }
     }
 
     /** Mirror of one row of the {@code chunks} table. */
@@ -118,8 +189,9 @@ public class ClusterState {
     private final Set<String> pendingUploads = new HashSet<>();
     /** Objects whose chunks are certainly garbage: failed or interrupted uploads, deleted objects. */
     private final Set<String> garbageObjects = new HashSet<>();
-    /** object id of an upload in progress -> "chunkId@workerId" copies already confirmed by a report. */
-    private final Map<String, Set<String>> uploadReceipts = new HashMap<>();
+    /** Upload receipts: chunk id (of an upload in progress) -> worker id -> receipt. */
+    private final Map<String, Map<String, Receipt>> uploadReceipts = new HashMap<>();
+    private long sessionNumbers;
     private final Map<FailureKey, Long> recentFailures = new HashMap<>();
     private final Deque<RepairEvent> events = new ArrayDeque<>(EVENT_CAPACITY);
     private final Map<String, AtomicLong> counters = new ConcurrentHashMap<>();
@@ -277,6 +349,7 @@ public class ClusterState {
             }
         }
         pending.remove(chunkId);
+        uploadReceipts.remove(chunkId);
     }
 
     public Set<String> pendingUploads() {
@@ -296,24 +369,93 @@ public class ClusterState {
         pendingUploads.add(objectId);
     }
 
+    /** The upload ended (committed or not): it is no longer pending and its receipts go. */
     public void endUpload(String objectId) {
         pendingUploads.remove(objectId);
-        uploadReceipts.remove(objectId);
+        String prefix = objectId + "-";
+        uploadReceipts.keySet().removeIf(chunkId -> chunkId.startsWith(prefix));
+    }
+
+    // ---- upload receipts --------------------------------------------------------------------
+
+    public Receipt receipt(String chunkId, String workerId) {
+        Map<String, Receipt> byWorker = uploadReceipts.get(chunkId);
+        return byWorker == null ? null : byWorker.get(workerId);
     }
 
     /**
-     * A worker's ordered report channel mentioned a chunk of an upload that is not committed yet.
-     * Remembered so the copy can be recorded as confirmed when the upload commits.
+     * Records (or refreshes) a receipt. A receipt of the same epoch keeps its {@code seenInSession}
+     * unless {@code seenInSession} is given: only report segments set it.
      */
-    public void recordUploadReceipt(String objectId, String chunkId, String workerId) {
-        if (pendingUploads.contains(objectId)) {
-            uploadReceipts.computeIfAbsent(objectId, id -> new HashSet<>()).add(chunkId + "@" + workerId);
+    public Receipt putReceipt(String chunkId, String workerId, long epoch, long size, String checksum,
+                              long seenInSession) {
+        Map<String, Receipt> byWorker = uploadReceipts.computeIfAbsent(chunkId, id -> new HashMap<>());
+        Receipt existing = byWorker.get(workerId);
+        if (existing != null && existing.epoch == epoch) {
+            existing.size = size;
+            existing.checksum = checksum;
+            if (seenInSession != 0) {
+                existing.seenInSession = seenInSession;
+            }
+            return existing;
+        }
+        Receipt receipt = new Receipt(epoch, size, checksum, seenInSession);
+        byWorker.put(workerId, receipt);
+        return receipt;
+    }
+
+    public Receipt removeReceipt(String chunkId, String workerId) {
+        Map<String, Receipt> byWorker = uploadReceipts.get(chunkId);
+        if (byWorker == null) {
+            return null;
+        }
+        Receipt removed = byWorker.remove(workerId);
+        if (byWorker.isEmpty()) {
+            uploadReceipts.remove(chunkId);
+        }
+        return removed;
+    }
+
+    /** Forgets every receipt of a worker (it re-registered or is DEAD: its old epoch is over). */
+    public int purgeReceipts(String workerId) {
+        int purged = 0;
+        for (Iterator<Map.Entry<String, Map<String, Receipt>>> it = uploadReceipts.entrySet().iterator(); it.hasNext(); ) {
+            Map<String, Receipt> byWorker = it.next().getValue();
+            if (byWorker.remove(workerId) != null) {
+                purged++;
+            }
+            if (byWorker.isEmpty()) {
+                it.remove();
+            }
+        }
+        return purged;
+    }
+
+    public Map<String, Map<String, Receipt>> receipts() {
+        return uploadReceipts;
+    }
+
+    // ---- report sessions --------------------------------------------------------------------
+
+    /** Opens a new report session for a worker, replacing any open one. */
+    public ReportSession openSession(WorkerInfo worker, String reportId, long baseline) {
+        if (worker.session != null) {
+            worker.session.closed = true;
+        }
+        worker.session = new ReportSession(reportId, baseline, ++sessionNumbers);
+        return worker.session;
+    }
+
+    /** Closes the worker's open report session, if any (completed, re-registered or DEAD). */
+    public void closeSession(WorkerInfo worker) {
+        if (worker.session != null) {
+            worker.session.closed = true;
+            worker.session = null;
         }
     }
 
-    public boolean hasUploadReceipt(String objectId, String chunkId, String workerId) {
-        Set<String> receipts = uploadReceipts.get(objectId);
-        return receipts != null && receipts.contains(chunkId + "@" + workerId);
+    public long openSessions() {
+        return workers.values().stream().filter(w -> w.session != null).count();
     }
 
     // ---- replicas (the block map) ---------------------------------------------------------
@@ -336,17 +478,13 @@ public class ClusterState {
     }
 
     /**
-     * Records a copy. Refused (returns false) if the worker is unknown or DEAD, if the worker has
-     * restarted since {@code expectBoot} was observed, or if the chunk is not known: a copy on a
-     * worker that died or restarted after it was written cannot be trusted to exist.
+     * Records a copy, or sets the state of an existing one. Refused (returns null) if the worker is
+     * unknown or DEAD, or if the chunk is not known.
      */
-    public boolean addReplica(String chunkId, String workerId, boolean confirmed, ReplicaState state, String expectBoot) {
+    public Replica addReplica(String chunkId, String workerId, ReplicaState state) {
         WorkerInfo worker = workers.get(workerId);
         if (worker == null || worker.isDead() || !chunks.containsKey(chunkId)) {
-            return false;
-        }
-        if (expectBoot != null && !expectBoot.equals(worker.bootId)) {
-            return false;
+            return null;
         }
         Map<String, Replica> holders = blocks.computeIfAbsent(chunkId, id -> new LinkedHashMap<>());
         Replica replica = holders.get(workerId);
@@ -357,8 +495,7 @@ public class ClusterState {
             workerBlocks.computeIfAbsent(workerId, id -> new HashSet<>()).add(chunkId);
         }
         replica.state = state;
-        replica.confirmed |= confirmed;
-        return true;
+        return replica;
     }
 
     public Replica removeReplica(String chunkId, String workerId) {
@@ -482,6 +619,22 @@ public class ClusterState {
         return live;
     }
 
+    /**
+     * Where a download may read a chunk: {@link #readable}, then the ALIVE targets of UPLOAD
+     * pending copies (written and fsynced, but their RECEIVED has not been applied yet), last.
+     */
+    public List<String> readCandidates(String chunkId) {
+        List<String> candidates = readable(chunkId);
+        for (PendingCopy copy : pendingOf(chunkId)) {
+            WorkerInfo worker = workers.get(copy.target());
+            if (copy.kind() == PendingKind.UPLOAD && worker != null && worker.state == WorkerState.ALIVE
+                    && !candidates.contains(copy.target())) {
+                candidates.add(copy.target());
+            }
+        }
+        return candidates;
+    }
+
     // ---- pending copies -------------------------------------------------------------------
 
     public Map<String, List<PendingCopy>> pending() {
@@ -492,10 +645,43 @@ public class ClusterState {
         return pending.getOrDefault(chunkId, Collections.emptyList());
     }
 
+    /** A REPAIR: {@code source} was told (command {@code cmdId}) to copy the chunk to {@code target}. */
     public void addPending(String chunkId, String source, String target, String cmdId) {
         long now = now();
-        pending.computeIfAbsent(chunkId, id -> new ArrayList<>())
-                .add(new PendingCopy(source, target, now + properties.pendingTimeout().toNanos(), cmdId, now));
+        pending.computeIfAbsent(chunkId, id -> new ArrayList<>()).add(new PendingCopy(PendingKind.REPAIR, source, target,
+                now + properties.pendingTimeout().toNanos(), cmdId, now));
+    }
+
+    /** An UPLOAD copy whose RECEIVED has not arrived: counted, readable, and expiring into normal repair. */
+    public void addUploadPending(String chunkId, String target) {
+        long now = now();
+        for (PendingCopy existing : pendingOf(chunkId)) {
+            if (existing.target().equals(target)) {
+                return;
+            }
+        }
+        pending.computeIfAbsent(chunkId, id -> new ArrayList<>()).add(new PendingCopy(PendingKind.UPLOAD, null, target,
+                now + properties.pendingTimeout().toNanos(), null, now));
+    }
+
+    /** Removes the REPAIR pending copy started by command {@code cmdId}, if it is still pending. */
+    public PendingCopy removePendingByCommand(String chunkId, String cmdId) {
+        List<PendingCopy> list = pending.get(chunkId);
+        if (list == null || cmdId == null) {
+            return null;
+        }
+        PendingCopy removed = null;
+        for (Iterator<PendingCopy> it = list.iterator(); it.hasNext(); ) {
+            PendingCopy copy = it.next();
+            if (cmdId.equals(copy.cmdId())) {
+                it.remove();
+                removed = copy;
+            }
+        }
+        if (list.isEmpty()) {
+            pending.remove(chunkId);
+        }
+        return removed;
     }
 
     public PendingCopy removePending(String chunkId, String target) {
@@ -524,7 +710,7 @@ public class ClusterState {
             List<PendingCopy> list = entry.getValue();
             for (Iterator<PendingCopy> copies = list.iterator(); copies.hasNext(); ) {
                 PendingCopy copy = copies.next();
-                if ((asSource && copy.source().equals(workerId)) || (asTarget && copy.target().equals(workerId))) {
+                if ((asSource && workerId.equals(copy.source())) || (asTarget && copy.target().equals(workerId))) {
                     copies.remove();
                     dropped++;
                 }
@@ -540,7 +726,7 @@ public class ClusterState {
         int count = 0;
         for (List<PendingCopy> list : pending.values()) {
             for (PendingCopy copy : list) {
-                if (copy.source().equals(workerId)) {
+                if (workerId.equals(copy.source())) {
                     count++;
                 }
             }
@@ -756,10 +942,19 @@ public class ClusterState {
             }
             Set<String> targets = new HashSet<>();
             for (PendingCopy copy : entry.getValue()) {
-                WorkerInfo source = workers.get(copy.source());
                 WorkerInfo target = workers.get(copy.target());
-                if (source == null || source.isDead() || target == null || target.isDead()) {
-                    violations.add("I4: pending copy of " + chunkId + " " + copy.source() + "->" + copy.target() + " involves a DEAD worker");
+                if (copy.kind() == PendingKind.UPLOAD) {
+                    if (copy.source() != null || target == null || target.isDead()) {
+                        violations.add("I4: upload pending copy of " + chunkId + " to " + copy.target()
+                                + " has a source or a DEAD target");
+                    }
+                } else {
+                    WorkerInfo source = copy.source() == null ? null : workers.get(copy.source());
+                    if (source == null || source.isDead() || target == null || target.isDead()) {
+                        violations.add("I4: pending copy of " + chunkId + " " + copy.source() + "->" + copy.target()
+                                + " involves a DEAD worker");
+                    }
+                    perSource.merge(copy.source(), 1, Integer::sum);
                 }
                 if (replica(chunkId, copy.target()) != null) {
                     violations.add("I4: pending copy of " + chunkId + " targets " + copy.target() + " which already holds it");
@@ -767,7 +962,6 @@ public class ClusterState {
                 if (!targets.add(copy.target())) {
                     violations.add("I8: chunk " + chunkId + " has two pending copies to " + copy.target());
                 }
-                perSource.merge(copy.source(), 1, Integer::sum);
             }
         }
         for (Map.Entry<String, Integer> entry : perSource.entrySet()) {
@@ -790,6 +984,23 @@ public class ClusterState {
                         violations.add("I6: DELETE (" + command.reason() + ") queued on " + worker.workerId + " for "
                                 + command.chunkId() + " would leave " + liveAfter + " live copies");
                     }
+                }
+            }
+        }
+        // I11: applied <= received for every worker.
+        for (WorkerInfo worker : workers.values()) {
+            if (worker.applied > worker.received) {
+                violations.add("I11: " + worker.workerId + " applied " + worker.applied + " > received " + worker.received);
+            }
+        }
+        // I13: no receipt belongs to an old epoch or to an object that is not pending.
+        for (Map.Entry<String, Map<String, Receipt>> entry : uploadReceipts.entrySet()) {
+            String objectId = com.objectstore.common.ChunkIds.objectIdOf(entry.getKey());
+            for (Map.Entry<String, Receipt> holder : entry.getValue().entrySet()) {
+                WorkerInfo worker = workers.get(holder.getKey());
+                if (!pendingUploads.contains(objectId) || worker == null || worker.epoch != holder.getValue().epoch) {
+                    violations.add("I13: receipt of " + entry.getKey() + " on " + holder.getKey()
+                            + " belongs to an old epoch or an object that is not pending");
                 }
             }
         }

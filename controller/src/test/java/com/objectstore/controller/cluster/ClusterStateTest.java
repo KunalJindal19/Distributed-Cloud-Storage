@@ -16,17 +16,16 @@ class ClusterStateTest {
     private final ClusterState cluster = t.cluster;
 
     @Test
-    void aReplicaIsOnlyRecordedOnAKnownLiveWorkerForAKnownChunkFromTheExpectedProcess() {
-        String boot = t.join("worker1");
+    void aReplicaIsOnlyRecordedOnAKnownLiveWorkerForAKnownChunk() {
+        t.join("worker1");
         cluster.locked(() -> {
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, null)).isFalse(); // unknown chunk
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNull(); // unknown chunk
             cluster.putChunk(chunk(0), new ClusterState.ChunkInfo(TestSupport.OBJECT, 0, 10, TestSupport.SUM));
-            assertThat(cluster.addReplica(chunk(0), "worker9", false, ReplicaState.OK, null)).isFalse(); // unknown worker
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, "old-boot")).isFalse(); // restarted
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, boot)).isTrue();
+            assertThat(cluster.addReplica(chunk(0), "worker9", ReplicaState.OK)).isNull(); // unknown worker
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNotNull();
             cluster.worker("worker1").state = WorkerState.DEAD;
             cluster.removeWorkerReplicas("worker1");
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, null)).isFalse(); // DEAD
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNull(); // DEAD
             assertThat(cluster.checkInvariants()).isEmpty();
         });
     }

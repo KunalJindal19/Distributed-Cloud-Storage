@@ -81,7 +81,7 @@ public class DownloadService {
         List<Chunk> chunkRows = chunks.findChunksByObject(objectId);
         cluster.locked(() -> {
             for (Chunk chunk : chunkRows) {
-                if (cluster.readable(chunk.chunkId()).isEmpty()) {
+                if (cluster.readCandidates(chunk.chunkId()).isEmpty()) {
                     throw unavailable(chunk.chunkId());
                 }
             }
@@ -157,7 +157,7 @@ public class DownloadService {
     private List<Candidate> candidates(String chunkId) {
         return cluster.locked(() -> {
             List<Candidate> list = new ArrayList<>();
-            for (String workerId : cluster.readable(chunkId)) {
+            for (String workerId : cluster.readCandidates(chunkId)) {
                 WorkerInfo worker = cluster.worker(workerId);
                 list.add(new Candidate(workerId, worker.url, worker.bootId));
             }

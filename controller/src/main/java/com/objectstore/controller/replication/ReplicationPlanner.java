@@ -31,8 +31,8 @@ import org.springframework.stereotype.Component;
  *       for deletion, cancel that and keep it; if there is no OK copy at all, report the chunk as
  *       missing (once); otherwise order a healthy holder to copy the chunk directly to a new
  *       worker ({@code REPLICATE}, HDFS {@code DNA_TRANSFER}) and track the copy as pending.</li>
- *   <li><b>Over-replicated</b> ({@code live > RF}, nothing pending, no holder STALE or
- *       unconfirmed): mark the surplus copies EXCESS and order their deletion.</li>
+ *   <li><b>Over-replicated</b> ({@code live > RF}, nothing pending, no holder STALE or without a
+ *       completed full report): mark the surplus copies EXCESS and order their deletion.</li>
  *   <li><b>Clean-up</b> on ALIVE workers: re-send a DELETE that was not confirmed in time; delete
  *       a CORRUPT copy, but only once RF good copies exist again (replace first, then invalidate,
  *       as HDFS does).</li>
@@ -94,7 +94,7 @@ public class ReplicationPlanner {
         Map<String, Replica> replicas = cluster.replicasOf(chunkId);
         boolean postpone = replicas.entrySet().stream().anyMatch(entry -> {
             WorkerInfo worker = cluster.worker(entry.getKey());
-            return worker.state == WorkerState.STALE || !worker.hasReported || !entry.getValue().confirmed;
+            return worker.state == WorkerState.STALE || !worker.hasReported;
         });
 
         if (live.size() + pending.size() < rf) {

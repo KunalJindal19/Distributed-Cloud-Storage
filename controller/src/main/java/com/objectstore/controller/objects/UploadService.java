@@ -5,8 +5,12 @@ import com.objectstore.common.ChunkIds;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.common.dto.ChunkPutResponse;
 import com.objectstore.controller.cluster.ClusterState;
+import com.objectstore.controller.cluster.ClusterState.Receipt;
+import com.objectstore.controller.cluster.ClusterState.Replica;
 import com.objectstore.controller.cluster.ClusterState.ReplicaState;
+import com.objectstore.controller.cluster.Receipts;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.cluster.WorkerClient;
@@ -49,7 +53,12 @@ import org.springframework.web.multipart.MultipartFile;
  *       transaction, and only after every chunk is fsynced on two workers. A 201 therefore
  *       survives a controller crash and the loss of any one worker. If the upload fails before
  *       that, nothing is recorded and every copy written so far is deleted (best effort; whatever
- *       is left is an orphan, which block reports clean up).</li>
+ *       is left is garbage, which the workers' streams and reports clean up).</li>
+ *   <li><b>Copies come from the workers.</b> A 2xx answer to a PUT never creates a replica by
+ *       itself. The PUT carries {@code X-Change-Ack} and the answer usually carries the worker's
+ *       {@code RECEIVED} for the chunk, which becomes an upload receipt; at commit a receipt
+ *       becomes a replica, and a copy without one becomes an UPLOAD pending copy, which counts
+ *       against repair, may be read from, and expires into normal repair.</li>
  * </ul>
  */
 @Service
@@ -60,8 +69,8 @@ public class UploadService {
     private static final int MAX_CONTENT_TYPE_LENGTH = 255;
     private static final String DEFAULT_NAME = "unnamed";
 
-    /** A target worker, with the boot id it had when we wrote to it. */
-    private record Target(String workerId, String url, String bootId) {
+    /** A target worker, with the boot id and epoch it had when we chose it. */
+    private record Target(String workerId, String url, String bootId, long epoch) {
     }
 
     /** A copy that was, or may have been, written during this upload. */
@@ -101,10 +110,11 @@ public class UploadService {
     private final ObjectRepository objects;
     private final ObjectViewAssembler views;
     private final Clock clock;
+    private final Receipts receipts;
 
     public UploadService(ControllerProperties properties, MetadataValidator metadataValidator, ClusterState cluster,
                          SafeMode safeMode, PlacementPolicy placement, WorkerClient workers, WorkerIo io,
-                         ObjectRepository objects, ObjectViewAssembler views, Clock clock) {
+                         ObjectRepository objects, ObjectViewAssembler views, Clock clock, Receipts receipts) {
         this.properties = properties;
         this.metadataValidator = metadataValidator;
         this.cluster = cluster;
@@ -115,6 +125,7 @@ public class UploadService {
         this.objects = objects;
         this.views = views;
         this.clock = clock;
+        this.receipts = receipts;
     }
 
     /**
@@ -238,9 +249,11 @@ public class UploadService {
 
     /**
      * Commits the namespace and records the copies, as one synchronous block under the cluster
-     * lock: the durable transaction first, then the in-memory mirror. A copy whose worker died or
-     * restarted since the write is not recorded (it cannot be trusted to exist); the monitor then
-     * repairs that chunk like any other under-replicated one.
+     * lock: the durable transaction first, then the in-memory mirror (v4 §5.6 step 5). For each
+     * target still in the epoch it was written in: a receipt becomes a replica (OK, or CORRUPT if
+     * the receipt's checksum differs) carrying the receipt's report mark; no receipt yet means an
+     * UPLOAD pending copy. A copy whose worker died or re-registered since is not recorded at all;
+     * the monitor repairs that chunk like any other under-replicated one.
      */
     private void commit(StoredObject object, Map<String, String> metadata, List<StoredChunk> stored, String idempotencyKey) {
         cluster.locked(() -> {
@@ -253,20 +266,36 @@ public class UploadService {
             }
             objects.insert(object, metadata, stored.stream().map(StoredChunk::chunk).toList(), idempotencyKey);
             int refused = 0;
+            int awaited = 0;
             for (StoredChunk entry : stored) {
                 Chunk chunk = entry.chunk();
                 cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(
                         chunk.objectId(), chunk.index(), chunk.size(), chunk.checksum()));
                 for (Target holder : entry.holders()) {
-                    boolean confirmed = cluster.hasUploadReceipt(object.objectId(), chunk.chunkId(), holder.workerId());
-                    if (!cluster.addReplica(chunk.chunkId(), holder.workerId(), confirmed, ReplicaState.OK, holder.bootId())) {
+                    WorkerInfo worker = cluster.worker(holder.workerId());
+                    if (worker == null || worker.isDead() || worker.epoch != holder.epoch()) {
                         refused++;
+                        continue;
+                    }
+                    Receipt receipt = cluster.removeReceipt(chunk.chunkId(), holder.workerId());
+                    if (receipt != null && receipt.epoch == worker.epoch) {
+                        boolean intact = chunk.checksum().equals(receipt.checksum) && chunk.size() == receipt.size;
+                        Replica replica = cluster.addReplica(chunk.chunkId(), holder.workerId(),
+                                intact ? ReplicaState.OK : ReplicaState.CORRUPT);
+                        replica.mark = receipt.seenInSession;
+                    } else {
+                        cluster.addUploadPending(chunk.chunkId(), holder.workerId());
+                        awaited++;
                     }
                 }
             }
+            cluster.endUpload(object.objectId());
             if (refused > 0) {
-                log.warn("[upload] object={}: {} copies not recorded because their worker died or restarted meanwhile; "
+                log.warn("[upload] object={}: {} copies not recorded because their worker died or re-registered meanwhile; "
                         + "the monitor will re-replicate", object.objectId(), refused);
+            }
+            if (awaited > 0) {
+                log.debug("[upload] object={}: {} copies await their RECEIVED", object.objectId(), awaited);
             }
         });
     }
@@ -282,7 +311,7 @@ public class UploadService {
         List<Target> ring = cluster.locked(() -> {
             List<Target> targets = new ArrayList<>();
             for (WorkerInfo worker : placement.ringForUpload(objectId, index, exclude)) {
-                targets.add(new Target(worker.workerId, worker.url, worker.bootId));
+                targets.add(new Target(worker.workerId, worker.url, worker.bootId, worker.epoch));
             }
             return targets;
         });
@@ -318,7 +347,11 @@ public class UploadService {
         // Recorded before the call: a write that timed out may still have reached the disk.
         attempted.add(new WrittenCopy(target, chunkId));
         try {
-            workers.putChunk(target.url(), chunkId, data, checksum);
+            String changeAck = cluster.locked(() -> receipts.changeAck(target.workerId()));
+            ChunkPutResponse answer = workers.putChunk(target.url(), chunkId, data, checksum, changeAck);
+            if (answer != null && answer.changes() != null) {
+                receipts.acceptPiggyback(target.workerId(), answer.changes().bootId(), answer.changes().items());
+            }
             return true;
         } catch (WorkerException e) {
             log.warn("[upload] chunk={} worker={} write failed ({}); replacing it for this upload",
