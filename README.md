@@ -142,7 +142,7 @@ It knows nothing about objects.
 | Dead DataNode: its replicas leave the block map | `DEAD` after 12 s of silence |
 | Full block report + incremental block reports (IBR), processed in order | full report every 30 s and after registering, IBR every 0.5 s, on one ordered, acknowledged channel per worker (sequence numbers) |
 | `.meta` checksum file per block; DataNode verifies on read and transfer | `<chunk_id>.meta`; the worker verifies on GET and before every REPLICATE |
-| DataNode block scanner; `reportBadBlocks` | worker scanner every 10 s; the controller also marks a copy corrupt when a read proves it bad |
+| DataNode block scanner (rate-limited, with disk/index reconciliation); `reportBadBlocks` | worker scanner: at most one pass per 10 s, reading at most 32 MiB/s; the controller also marks a copy corrupt when a read proves it bad |
 | Disk checker; the DataNode shuts down on volume failure | worker disk check every 30 s; on failure the process exits, goes DEAD and is repaired |
 | RedundancyMonitor with priority by replica count | replication monitor every 3 s, chunks with the fewest live copies first |
 | PendingReconstructionBlocks with a time-out | pending copies, 15 s time-out, then retried with another target |
@@ -453,7 +453,8 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `FULL_REPORT_INTERVAL` | 30 | both | full block report period (the controller uses it to spot overdue reports) |
 | `IBR_INTERVAL` | 0.5 | worker | incremental report flush period |
 | `IBR_BUFFER_MAX` | 10000 | worker | on overflow, drop the buffer and send a full report |
-| `SCAN_INTERVAL` | 10 | worker | block scanner period |
+| `SCAN_INTERVAL` | 10 | worker | at most one block scanner pass per this many seconds |
+| `SCAN_MAX_BYTES_PER_SEC` | 33554432 | worker | block scanner read rate limit (32 MiB/s, a token bucket refilled each second) |
 | `DISK_CHECK_INTERVAL` | 30 | worker | volume probe period |
 | `HEARTBEAT_HTTP_TIMEOUT` | 3 | worker | heartbeat request time-out (below `STALE_AFTER`) |
 | `CONNECT_TIMEOUT` | 2 | both | HTTP connect time-out |
@@ -746,16 +747,25 @@ processed, plus 5 s; at the latest after 30 s. Reads work as soon as reports arr
 
 - **Store:** PUT checks the id, the size, free space (`507 insufficient_storage`) and the checksum;
   writes data and `.meta` to unique temporary names, fsyncs both, renames them, fsyncs the
-  directory, then reports `received`. GET verifies the data against `.meta`. DELETE removes both and
-  reports `deleted`. At start-up, temporary files are removed, a missing sidecar is rebuilt from its
-  (already verified) data, and a stray sidecar is dropped.
+  directory, then reports `received`. A PUT of a chunk that already exists verifies the stored data:
+  if it matches, the chunk is announced again (`200`); if it is rotten, it is replaced by the new,
+  verified bytes (`201`). GET verifies the data against `.meta`. DELETE removes both and reports
+  `deleted`. At start-up, one walk of the directory removes temporary files, rebuilds a missing
+  sidecar from its (already verified) data, drops a stray sidecar, and fills an **in-memory index**
+  (size and checksum per chunk, with running totals), so statistics are O(1) and listings need no
+  disk walk. Chunks whose data failed verification in this process are kept in a *known bad* set.
 - **VERSION:** a volume whose `worker_id` is another worker's makes the worker refuse to register
   and its health check fail (`misconfigured`), so the data stays untouched.
 - **Executor:** at most 4 commands at a time; REPLICATE reads the local copy, verifies it against
   the sidecar and the command's checksum (bad bytes are reported, never sent) and PUTs it to the
   target.
-- **Scanner:** every 10 s, one chunk at a time; a mismatch is reported once, and once more after each
-  full report. It never deletes.
+- **Scanner:** at most one pass per `SCAN_INTERVAL`. Each pass first **reconciles** the index with
+  the directory (names only; files modified in the last 5 s are skipped): a chunk file copied in by
+  hand is indexed (its sidecar rebuilt if missing) and reported `received`; an indexed chunk whose
+  file was deleted by hand is reported `deleted`. Then it **verifies** every indexed chunk against its
+  sidecar at most at `SCAN_MAX_BYTES_PER_SEC`: a chunk that fails is reported `bad` exactly once
+  (it becomes known bad); one that verifies again (its file was replaced) is no longer known bad. It
+  never deletes.
 - **Disk check:** every 30 s, write/fsync/read/delete `/data/.probe`; on failure the process exits.
 
 ---
