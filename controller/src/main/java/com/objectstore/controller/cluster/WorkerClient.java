@@ -3,6 +3,7 @@ package com.objectstore.controller.cluster;
 import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.ChunkInfo;
 import com.objectstore.common.dto.ChunkListResponse;
+import com.objectstore.common.dto.ChunkPutResponse;
 import com.objectstore.common.http.FaultSettings;
 import com.objectstore.common.http.HttpClients;
 import com.objectstore.controller.config.ControllerProperties;
@@ -44,20 +45,32 @@ public class WorkerClient {
         this.listing = HttpClients.restClient(builder, connect, listingTimeout, faults);
     }
 
-    /** {@code PUT /internal/chunks/{chunk_id}}. 200 (already there) and 201 (written) both succeed. */
-    public void putChunk(String workerUrl, String chunkId, byte[] data, String checksum) {
-        call(workerUrl, () -> chunks.put()
-                .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
-                .header(InternalApi.CHECKSUM_HEADER, checksum)
-                .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .body(data)
-                .exchange((request, response) -> {
-                    int status = response.getStatusCode().value();
-                    if (status != 200 && status != 201) {
-                        throw failure(workerUrl, response);
-                    }
-                    return Boolean.TRUE;
-                }));
+    /**
+     * {@code PUT /internal/chunks/{chunk_id}}. 200 (already there) and 201 (written) both succeed.
+     * {@code changeAck} ({@code <boot_id>:<received>}, may be null) goes in {@code X-Change-Ack};
+     * the answer may carry the worker's next changes.
+     */
+    public ChunkPutResponse putChunk(String workerUrl, String chunkId, byte[] data, String checksum, String changeAck) {
+        return call(workerUrl, () -> {
+            RestClient.RequestBodySpec spec = chunks.put()
+                    .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
+                    .header(InternalApi.CHECKSUM_HEADER, checksum)
+                    .contentType(MediaType.APPLICATION_OCTET_STREAM);
+            if (changeAck != null) {
+                spec = spec.header(InternalApi.CHANGE_ACK_HEADER, changeAck);
+            }
+            return spec.body(data).exchange((request, response) -> {
+                int status = response.getStatusCode().value();
+                if (status != 200 && status != 201) {
+                    throw failure(workerUrl, response);
+                }
+                try {
+                    return response.bodyTo(ChunkPutResponse.class);
+                } catch (RuntimeException unreadable) {
+                    return null;                      // the chunk is stored; only the piggyback is lost
+                }
+            });
+        });
     }
 
     /** {@code GET /internal/chunks/{chunk_id}}. The caller classifies and verifies the result. */

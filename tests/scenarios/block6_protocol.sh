@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Block 6: protocol, liveness, block reports, safe mode, cluster identity, scanner, orphan GC.
+# Block 6: protocol, liveness, full reports and the change stream, safe mode, cluster identity, scanner, orphan GC.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 section "AC-6.1 the cluster forms; every volume records the cluster id"
@@ -38,6 +38,8 @@ check "worker2 ALIVE and reported again" sh -c "[ \"\$(curl -fsS $API/cluster/st
 wait_for 90 healthy
 
 section "AC-6.3 docker restart, or a 9 s pause: never DEAD, nothing re-replicated"
+copies() { curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event=="copied")] | length'; }
+copies_before=$(copies)   # AC-6.2's DEAD legitimately made copies; count only those made from here on
 watch_never_dead() { # watch_never_dead <worker> <seconds>
     local end=$((SECONDS + $2)) seen=""
     while [ $SECONDS -lt $end ]; do seen="$seen $(worker_field "$1" state)"; sleep 0.25; done
@@ -46,7 +48,7 @@ watch_never_dead() { # watch_never_dead <worker> <seconds>
 docker restart worker2 > /dev/null &
 check "docker restart worker2: never DEAD" watch_never_dead worker2 20
 wait
-check "under_replicated stayed 0, no copies made" sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"copied\")] | length') = 0 ]"
+check "under_replicated stayed 0, no copies made" sh -c "[ \$(curl -fsS $API/cluster/status | jq .under_replicated) = 0 ] && [ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"copied\")] | length') = $copies_before ]"
 docker pause worker3 > /dev/null
 ( sleep 9; docker unpause worker3 > /dev/null ) &
 saw=""
@@ -55,7 +57,7 @@ wait
 check "a 9 s pause makes worker3 STALE" sh -c "echo '$saw' | grep -q STALE"
 check "...but never DEAD" sh -c "! echo '$saw' | grep -q DEAD"
 wait_for 30 healthy
-check "under_replicated 0 and no copies made" sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"copied\")] | length') = 0 ]"
+check "under_replicated 0 and no copies made" sh -c "[ \$(curl -fsS $API/cluster/status | jq .under_replicated) = 0 ] && [ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"copied\")] | length') = $copies_before ]"
 
 section "AC-6.4 docker pause controller for 20 s: stall detected, no worker DEAD"
 docker pause controller > /dev/null; sleep 20; docker unpause controller > /dev/null

@@ -5,7 +5,7 @@ arbitrary binary objects (documents, images, video, audio, archives, anything) t
 **controller** (the NameNode), which splits them into **1 MB chunks** (blocks) and stores **two
 copies of every chunk on different storage workers** (DataNodes). Like HDFS, the controller keeps
 only the namespace on disk; where every copy lives is held in memory and rebuilt from the workers'
-block reports. It detects dead, stale, partitioned and restarted workers and corrupted data, keeps
+change streams and block reports. It detects dead, stale, partitioned and restarted workers and corrupted data, keeps
 serving objects from good copies, has workers copy chunks directly to each other to restore the
 replication factor, and survives its own crash at any instruction.
 
@@ -101,7 +101,7 @@ flowchart LR
 
     C1 -->|HTTP| API
     ctrl -->|"upload / download / fsck:<br/>PUT, GET, list chunks"| W1 & W2 & W3 & W4
-    W1 & W2 & W3 & W4 -.->|"register, heartbeat (2 s),<br/>full block report (30 s),<br/>incremental reports (0.5 s)"| ctrl
+    W1 & W2 & W3 & W4 -.->|"register; heartbeat (2 s, or 250 ms after a change)<br/>carrying the numbered change stream<br/>and full-report segments (every 30 s)"| ctrl
     ctrl -.->|"commands in heartbeat replies:<br/>REPLICATE, DELETE"| W1 & W2 & W3 & W4
     W1 ==>|"REPLICATE: copy straight to another worker"| W3
 ```
@@ -114,14 +114,15 @@ out in heartbeat replies; workers execute them, copying chunks **directly to eac
 
 **Workers are DataNodes.** Each stores chunk files with a `.meta` sidecar holding the checksum,
 verifies every chunk it serves, scans its disk for silent corruption, checks that its volume is
-writable, and tells the controller about every change over an ordered, acknowledged report channel.
-It knows nothing about objects.
+writable, and tells the controller about every change to its disk in one numbered change stream
+that travels on heartbeats and on its answers to the controller's chunk uploads, each change kept
+until the controller acknowledges it. It knows nothing about objects.
 
 | Module | What it is |
 |---|---|
 | [`common/`](common) | The wire contract: protocol messages, SHA-256 and chunk-id helpers, JSON error handling, fault-injecting HTTP clients |
-| [`worker/`](worker) | The DataNode: chunk store with sidecars, reporter, heartbeat lifeline, command executor, block scanner, disk check |
-| [`controller/`](controller) | The NameNode: public API, namespace, cluster state, registry, block reports, replication monitor, safe mode, fsck, dashboard |
+| [`worker/`](worker) | The DataNode: chunk store with sidecars and an in-memory index, change log, controller link (registration, heartbeats, report segments), command executor, block scanner, disk check |
+| [`controller/`](controller) | The NameNode: public API, namespace, cluster state, registry and receipt step, change applier, replication monitor, safe mode, fsck, dashboard |
 | [`client/`](client) | `oscli`, a command-line client with idempotent, retrying uploads |
 | [`system-tests/`](system-tests) | The real controller and four real workers in one JVM, for end-to-end tests |
 | [`tests/`](tests) | Docker scenario scripts per acceptance-criteria block, and the chaos test |
@@ -136,11 +137,11 @@ It knows nothing about objects.
 | NameNode keeps block locations and DataNode state **in memory**, rebuilt from reports | [`ClusterState`](controller/src/main/java/com/objectstore/controller/cluster/ClusterState.java): workers, block map and its reverse index, pending copies, command queues |
 | `clusterID` in each DataNode's `VERSION` file; mismatched DataNodes are refused | `cluster_id` in `cluster_meta` and in `/data/VERSION` on each worker |
 | DataNode registration; the NameNode tells unknown or dead DataNodes to re-register (`DNA_REGISTER`) | `POST /internal/workers/register`; other messages answer 404 `unknown_worker` and the worker re-registers |
-| Heartbeats with statistics on a separate lifeline that never queues behind reports | the worker's heartbeat runs on its own thread and HTTP client |
+| `BPServiceActor`: one thread per NameNode for registration, heartbeats and reports | the worker's `link` thread, on its own HTTP client with a short time-out (`HEARTBEAT_HTTP_TIMEOUT`) |
 | Stale DataNode: avoided for reads and writes, replicas still count | `STALE` after 6 s of silence |
 | Stale ratio: if more than half are stale, stop avoiding them for writes | `STALE_RATIO = 0.5` |
 | Dead DataNode: its replicas leave the block map | `DEAD` after 12 s of silence |
-| Full block report + incremental block reports (IBR), processed in order | full report every 30 s and after registering, IBR every 0.5 s, on one ordered, acknowledged channel per worker (sequence numbers) |
+| Incremental block reports (`blockReceivedAndDeleted`) and full block reports | one numbered change stream per worker (`RECEIVED`, `DELETED`, `BAD`, `CMD_FAILED`), kept until acknowledged, on heartbeats and PUT answers; full reports after registering and every 30 s, in segments on heartbeats, with a baseline and hold-back |
 | `.meta` checksum file per block; DataNode verifies on read and transfer | `<chunk_id>.meta`; the worker verifies on GET and before every REPLICATE |
 | DataNode block scanner (rate-limited, with disk/index reconciliation); `reportBadBlocks` | worker scanner: at most one pass per 10 s, reading at most 32 MiB/s; the controller also marks a copy corrupt when a read proves it bad |
 | Disk checker; the DataNode shuts down on volume failure | worker disk check every 30 s; on failure the process exits, goes DEAD and is repaired |
@@ -149,7 +150,7 @@ It knows nothing about objects.
 | `DNA_TRANSFER`: DataNode copies directly to DataNode | `REPLICATE` command in the heartbeat reply; the worker PUTs to the target worker |
 | `DNA_INVALIDATE` | `DELETE` command |
 | `max-streams` per DataNode | `MAX_STREAMS = 2` copies in flight per source |
-| Excess replicas trimmed, postponed while replicas sit on stale nodes | `EXCESS` state; postponed while any holder is STALE or its copy unconfirmed |
+| Excess replicas trimmed, postponed while replicas sit on stale nodes | `EXCESS` state; postponed while any holder is STALE or has not completed a full report |
 | A corrupt replica is deleted only after a good one is restored | a `CORRUPT` copy is deleted only once RF live copies exist |
 | Safe mode: read-only until 99.9 % of blocks are reported, plus an extension | `SAFE_MODE_THRESHOLD = 0.999`, `SAFE_MODE_EXTENSION = 5 s`, `SAFE_MODE_TIMEOUT = 30 s` |
 | Start-up delay before deleting blocks | no orphan deletion during the first `ORPHAN_GC_DELAY = 60 s` after a controller start |
@@ -300,8 +301,9 @@ copy's state (`OK`, `CORRUPT`, `EXCESS`), `worker_status` the worker's (`ALIVE`,
   Keys: 1–64 characters from `A-Z a-z 0-9 _ . -`; values: strings of at most 1024 characters; at
   most 64 keys. Anything else is `400 invalid_metadata`. `503 safe_mode` in safe mode.
 - **DELETE**: `204`; the namespace row is deleted durably and every known copy gets a DELETE
-  command (workers delete the files with their next heartbeat, within ~2 s). Copies the controller
-  could not know about (on a DEAD worker) become orphans and are collected from block reports.
+  command (workers delete the files with their next heartbeat, within ~2 s), and so does the target
+  of any copy still on its way. Copies the controller could not know about (on a DEAD worker)
+  become garbage and are collected from the worker's changes or its next full report.
   `404` if unknown, `503 safe_mode` in safe mode.
 - **List**: `limit` 1–500 (default 50), `offset` ≥ 0; newest first; `{items, total, limit, offset}`.
 
@@ -360,16 +362,17 @@ pending copies, no queued commands and not in safe mode; only then are differenc
 | Method | Endpoint | Served by | Purpose |
 |---|---|---|---|
 | `POST` | `/internal/workers/register` | controller | Register a worker (process) |
-| `POST` | `/internal/workers/heartbeat` | controller | Report availability; receive commands |
-| `POST` | `/internal/workers/blockreport` | controller | Full block report |
-| `POST` | `/internal/workers/ibr` | controller | Incremental block report |
-| `PUT` | `/internal/chunks/{chunk_id}` | worker | Store a chunk (from the controller, or from another worker for a repair) |
+| `POST` | `/internal/workers/heartbeat` | controller | Liveness and statistics, the worker's next changes and at most one full-report segment; receive commands and acknowledgements |
+| `PUT` | `/internal/chunks/{chunk_id}` | worker | Store a chunk (from the controller, or from another worker for a repair); the controller's PUT also acknowledges and collects changes |
 | `GET` | `/internal/chunks/{chunk_id}` | worker | Retrieve a chunk, verified against its `.meta` |
 | `DELETE` | `/internal/chunks/{chunk_id}` | worker | Delete a chunk (idempotent: always 204) |
 | `GET` | `/internal/workers/{worker_id}/chunks` | worker | Every chunk on disk with a freshly computed checksum (fsck) |
 
-Worker answers: **PUT** (raw bytes, header `X-Checksum: <sha256>`) → `201` written · `200` identical
-content already there (idempotent) · `400 bad_request` (malformed id, missing header) · `400
+There are no separate report endpoints: full and incremental reports both travel on heartbeats.
+
+Worker answers: **PUT** (raw bytes, header `X-Checksum: <sha256>`; from the controller also
+`X-Change-Ack: <boot_id>:<n>`) → `201` written · `200` identical content already there and verified
+(idempotent; rotten stored bytes are replaced and answer `201`) · `400 bad_request` (malformed id, missing header) · `400
 checksum_mismatch` (nothing written) · `409 conflict` (the id holds different content) · `413` (more
 than one chunk) · `507 insufficient_storage`. **GET** → `200` bytes with `X-Checksum` · `404
 chunk_not_found` · `409 chunk_corrupt` (the bytes no longer match `.meta`; never served).
@@ -380,29 +383,91 @@ outside `/data/chunks`.
 
 ### The envelope and the acceptance rules
 
-Every heartbeat and report carries `{"worker_id", "boot_id", "seq", "sent_at"}`: `boot_id` is a
-UUID generated once per worker *process*; heartbeats and reports each have their own `seq`
-counter; `sent_at` is the wall-clock time of the (re)send. The controller checks, in this order:
+Every heartbeat carries `{"worker_id", "boot_id", "seq", "sent_at", "stats", "changes", "segment"}`:
+`boot_id` is a UUID generated once per worker *process*; `seq` numbers the heartbeats; `sent_at` is
+the wall-clock time of the send. The controller checks, in this order:
 
 | Condition | Answer | Effect |
 |---|---|---|
 | worker unknown, or DEAD | 404 `unknown_worker` | the worker registers again (HDFS `DNA_REGISTER`) |
 | `boot_id` is not the current process | 409 `stale_boot` | ignored: a message from a dead old process |
-| sent more than `MAX_MESSAGE_AGE` ago | 409 `too_old` | ignored |
-| heartbeat with `seq` ≤ the last one | 200 `{"ignored":"duplicate"}` | no commands are delivered |
-| report with `seq` = the last one | 200 `{"ignored":"duplicate"}` | nothing applied: the worker retried after a lost answer |
-| report with `seq` < the last one | 409 `stale_seq` | ignored: a delayed old copy |
-| otherwise | apply | |
+| sent more than `MAX_MESSAGE_AGE` ago | 409 `too_old` | ignored; the worker resends it at once with a fresh `sent_at` |
+| `seq` ≤ the last one | 200 `{"ignored":"duplicate", "changes_received_up_to"}` | only the acknowledgement is echoed: no commands, nothing applied |
+| otherwise | the receipt step (below) | |
 
 **Registration** carries `url`, `boot_id`, the `cluster_id` from `/data/VERSION` (or `null` for a
-new volume), the last used sequence numbers and statistics. A `cluster_id` that is not the
-controller's is refused with 409 `cluster_id_mismatch`: the worker keeps its data and stops
-trying (it retries only every 60 s). With `null`, the worker records the controller's cluster id
-durably in `VERSION` before its first report. A worker re-registering with a new `boot_id` (or after
-being DEAD) is ALIVE again, its command queue is cleared, copies it was sending are dropped, and its
-replicas are kept until its full report reconciles them. Three new boot ids for one id within a
-minute look like two containers with the same `WORKER_ID`: newcomers get 409 `duplicate_worker` for
-60 s.
+new volume), `attempt` (a per-process counter, +1 on every registration attempt), `change_seq` (the
+last change number of the process, taken together with the hold of the report that follows), the
+last heartbeat `seq` and statistics. The controller checks, in order: a `cluster_id` that is not its
+own → 409 `cluster_id_mismatch` (the worker keeps its data and retries only every 60 s); sent more
+than `MAX_MESSAGE_AGE` ago → 409 `too_old`; the duplicate-worker refusal (three new boot ids for one
+id within a minute look like two containers with the same `WORKER_ID`: newcomers get 409
+`duplicate_worker` for 60 s); the same `boot_id` with an `attempt` below the last accepted one (a
+delayed old request) → 409 `stale_registration`; the same `attempt` again (its reply was lost) → ok,
+nothing reset. Otherwise the registration is accepted and starts a new **epoch** for the worker:
+`received = applied = change_seq`, the command queue is cleared, pending copies to or from it are
+dropped, its upload receipts and any open report session are forgotten, and its replicas are kept
+until its full report confirms or removes them. With `cluster_id: null`, the worker records the
+controller's cluster id durably in `VERSION` before anything else.
+
+### The change stream
+
+Every change to a worker's disk gets the next number in its process (the first is 1) and is kept in
+the worker's `ChangeLog` until the controller acknowledges it:
+
+| Change | Meaning |
+|---|---|
+| `RECEIVED(chunk, size, checksum)` | the worker now holds verified bytes of `chunk` with this checksum (also for an identical re-upload) |
+| `DELETED(chunk)` | the worker does not hold `chunk` (logged even if it was already absent) |
+| `BAD(chunk)` | the worker's copy failed verification (on read, before a transfer, or by the scanner) |
+| `CMD_FAILED(cmd_id, chunk, target, reason)` | a `REPLICATE` could not be completed: no local copy, a corrupt one, or the PUT failed |
+
+Changes travel on two channels, each carrying a contiguous run:
+
+- **Heartbeats**: up to `MAX_CHANGES_PER_MESSAGE` changes after the last acknowledgement. The worker
+  heartbeats every `HEARTBEAT_INTERVAL`, but `HEARTBEAT_MIN_GAP_MS` after a change (a new change
+  wakes it early).
+- **PUT answers**: the controller's `PUT /internal/chunks/{id}` carries `X-Change-Ack:
+  <boot_id>:<received>`; the worker forgets everything up to `received` and answers with
+  `{chunk_id, size, checksum, changes: {boot_id, items}}`, at most `MAX_CHANGES_PER_PUT_ANSWER`
+  changes, which usually include the `RECEIVED` of the chunk just written. Another boot id, or a
+  worker-to-worker PUT, gets no changes.
+
+**The receipt step** (one brief block under the cluster lock, per heartbeat or PUT answer): changes
+up to the worker's `received` are dropped (duplicates, overlaps); if the first remaining one is not
+`received + 1`, that is a **gap**: nothing from the message is accepted, a full report is requested
+and `changes_gap` counted, so the acknowledgement never moves past a gap. Otherwise the longest
+contiguous run is applied and `received` moves to its end. The reply carries
+`changes_received_up_to = received`; the worker forgets what it acknowledges. If the worker's log
+holds more than `CHANGE_LOG_MAX` unacknowledged changes, it drops them all and sends a full report
+instead. Only heartbeats count for liveness.
+
+**Upload receipts.** A `RECEIVED` for a chunk of an upload that has not committed yet becomes an
+upload receipt `(chunk, worker, epoch)`. At commit, a receipt becomes the replica; a copy without one
+(its `RECEIVED` is still on its way) becomes an **UPLOAD pending copy**: it counts against repair,
+downloads may read from it (after every live copy), and it ends when its `RECEIVED` arrives or, after
+`PENDING_TIMEOUT`, expires into normal repair. A 2xx answer to a PUT never creates a replica by
+itself.
+
+### Full reports
+
+A full report lists the worker's in-memory index (with each chunk's size, sidecar checksum and
+whether it is known bad), sorted by chunk id, in segments of `REPORT_SEGMENT_SIZE` entries, one
+segment per heartbeat, stop-and-wait (segment *i+1* only after *i* was acknowledged). Each segment
+carries the `report_id` (new for every report), its `index`, `last` and the **baseline** `M`: the
+last change number the listing includes. Reports are sent after registering, every
+`FULL_REPORT_INTERVAL`, when the controller asks (a request during a report is ignored), and after a
+change-log overflow (which abandons any report in progress and starts a new one).
+
+- **Hold-back:** while a report with baseline `M` is in progress, no change above `M` leaves the
+  worker on any channel. So when the last segment arrives the controller sets `received =
+  max(received, M)`, and the report is complete: every copy the report did not list is removed
+  (each listed copy is *marked* with the report's session; unmarked ones go), and orphan GC runs.
+- **Segments of an old report** are re-acknowledged, never applied twice; a segment that skips
+  ahead is ignored.
+- A listed chunk the namespace does not know is an upload receipt (if its upload is in progress),
+  known garbage (a failed upload or a deleted object) or an orphan; see
+  [orphans](#orphans-and-the-safety-valve).
 
 **Commands** in heartbeat replies:
 
@@ -414,15 +479,6 @@ minute look like two containers with the same `WORKER_ID`: newcomers get 409 `du
 A worker executes a `cmd_id` at most once and drops a command whose `expires_at` has passed, both
 on arrival and right before running it. A lost heartbeat reply loses its commands; the pending
 time-out (REPLICATE) and the DELETE retry rule recover them, as in HDFS.
-
-### The ordered report channel
-
-One thread on each worker sends reports **one at a time, stop-and-wait**: the next message is built
-only after the previous one was acknowledged, and an unacknowledged message is resent unchanged
-(same `seq`, fresh `sent_at`) with back-off 0.5, 1, 2, 4, 5 … s. So reports can never be applied
-out of order or twice. A full report is built atomically: snapshot of the disk, clear the IBR
-buffer (the snapshot supersedes it), take the next `seq`. Full reports are sent after registering,
-every 30 s, on the controller's request, and when the IBR buffer overflows.
 
 ---
 
@@ -450,9 +506,12 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `ORPHAN_GC_DELAY` | 60 | controller | no orphan deletion during the first N s after a controller start |
 | `ORPHAN_GC_MAX_FRACTION` | 0.5 | controller | refuse orphan GC if one report would delete more than this fraction of a worker's chunks (when > 10) |
 | `MIN_FREE_BYTES` | 16777216 | controller | minimum free space for a write or repair target |
-| `FULL_REPORT_INTERVAL` | 30 | both | full block report period (the controller uses it to spot overdue reports) |
-| `IBR_INTERVAL` | 0.5 | worker | incremental report flush period |
-| `IBR_BUFFER_MAX` | 10000 | worker | on overflow, drop the buffer and send a full report |
+| `FULL_REPORT_INTERVAL` | 30 | both | full report period (the controller uses it to spot overdue reports) |
+| `HEARTBEAT_MIN_GAP_MS` | 250 | worker | earliest next heartbeat when changes or report segments are waiting |
+| `CHANGE_LOG_MAX` | 10000 | worker | unacknowledged changes kept; on overflow all are dropped and a full report starts |
+| `MAX_CHANGES_PER_MESSAGE` | 2000 | worker | changes per heartbeat |
+| `MAX_CHANGES_PER_PUT_ANSWER` | 256 | worker | changes per answer to a controller PUT |
+| `REPORT_SEGMENT_SIZE` | 2000 | worker | entries per full-report segment |
 | `SCAN_INTERVAL` | 10 | worker | at most one block scanner pass per this many seconds |
 | `SCAN_MAX_BYTES_PER_SEC` | 33554432 | worker | block scanner read rate limit (32 MiB/s, a token bucket refilled each second) |
 | `DISK_CHECK_INTERVAL` | 30 | worker | volume probe period |
@@ -476,9 +535,10 @@ All services have `restart: unless-stopped` (a crashed process comes back by its
 stop` still keeps it stopped) and `stop_grace_period: 5s`. [`docker-compose.chaos.yml`](docker-compose.chaos.yml)
 turns fault injection on (300 ms, 5 % drops, 5 % duplicates).
 
-Log tags: controller `[api]`, `[upload]`, `[download]`, `[registry]`, `[report]`, `[ibr]`,
-`[monitor]`, `[safemode]`, `[integrity]`, `[invariant]`, `[fsck]`; worker `[register]`,
-`[heartbeat]`, `[report]`, `[ibr]`, `[cmd]`, `[store]`, `[scanner]`, `[diskcheck]`, `[version]`.
+Log tags: controller `[api]`, `[upload]`, `[download]`, `[registry]`, `[report]`,
+`[monitor]`, `[safemode]`, `[integrity]`, `[invariant]`, `[fsck]`; worker `[link]` (registration,
+heartbeats, report segments, change-log overflow), `[cmd]`, `[store]`, `[scanner]`, `[diskcheck]`,
+`[version]`.
 
 ---
 
@@ -561,14 +621,14 @@ docker stop worker2
 | ~6 s of silence | `worker2` is **STALE**: avoided for reads and writes, but its copies still count; nothing is re-replicated (a GC pause or a network blip must not trigger mass copying) |
 | ~12 s of silence | **DEAD**: `[registry] worker2 DEAD after 12.0s - N replicas removed`; `under_replicated` > 0; downloads keep working from the other copies |
 | within ~3 s | the monitor orders copies: `[monitor] REPLICATE chunk=… copies=1 worker1->worker4` |
-| within ~2 s more | the source picks the command up with its heartbeat and copies the chunk **directly to the target**: `[cmd] replicate ok chunk=…` in the source's log; the target's incremental report confirms it: `[monitor] copied …` |
+| within ~2 s more | the source picks the command up with its heartbeat and copies the chunk **directly to the target**: `[cmd] replicate ok chunk=…` in the source's log; the target's `RECEIVED` change confirms it: `[monitor] copied …` |
 
 ```bash
 docker start worker2
 ```
 
-It registers again, sends a full block report listing the chunks still on its volume, and those
-chunks now have 3 copies. Once every holder is ALIVE and confirmed, the monitor marks the copy on the
+It registers again, sends a full report listing the chunks still on its volume, and those
+chunks now have 3 copies. Once every holder is ALIVE and has reported, the monitor marks the copy on the
 busiest worker `EXCESS` and orders its deletion: `[monitor] trimmed …`. Every chunk ends with exactly
 two copies; at no point did any chunk have fewer than one.
 
@@ -583,7 +643,7 @@ make corrupt W=worker1 C=<chunk_id>        # 4 bytes overwritten inside the data
   `409 chunk_corrupt` and reports it bad; the controller marks the copy `CORRUPT` and reads the
   other copy. The client gets correct data.
 - **Found without anyone reading:** the worker's block scanner (every 10 s) re-hashes every chunk:
-  `[scanner] CORRUPT chunk=…`, reported to the controller in the next incremental report.
+  `[scanner] CORRUPT chunk=…`, reported to the controller as a `BAD` change with the next heartbeat.
 - **Restored, HDFS-style:** the corrupt copy is kept as a last resort while a healthy holder copies
   the chunk to a third worker; only after that copy is confirmed is the corrupt one deleted
   (`replicate` → `copied` → `invalidated` in the monitor log).
@@ -610,11 +670,13 @@ them deleted. `fsck` is `HEALTHY`.
 ### State and invariants
 
 The controller's in-memory state ([`ClusterState`](controller/src/main/java/com/objectstore/controller/cluster/ClusterState.java)):
-workers (state, boot id, sequence numbers, statistics, command queue), a mirror of the `chunks`
-table, the **block map** (chunk → worker → copy) with its exact reverse index, pending copies,
-uploads in progress, recent failures, safe mode and counters. A copy is `OK`, `CORRUPT` or `EXCESS`,
-and remembers whether it was confirmed by the worker's reports and whether a DELETE for it was
-queued or already delivered.
+workers (state, boot id, epoch, `received` / `applied` change numbers, the open report session,
+statistics, command queue), a mirror of the `chunks` table, the **block map** (chunk → worker →
+copy) with its exact reverse index, pending copies (REPAIR from a source, or UPLOAD awaiting its
+`RECEIVED`), upload receipts, uploads in progress, recent failures, safe mode and counters. A copy is
+`OK`, `CORRUPT` or `EXCESS`, carries the mark of the last report session that listed it, and
+remembers whether a DELETE for it was queued or already delivered. Every copy comes from the
+worker's own change stream or report, so all are confirmed.
 
 **Live copies** of a chunk are its `OK` copies on non-DEAD workers (a STALE worker's copies still
 count, as in HDFS). The status, `replication_ok`, the dashboard and fsck call a chunk
@@ -631,11 +693,13 @@ same copy twice.
 | I1 | every worker in the block map is known and not DEAD |
 | I2 | the reverse index is exactly the inverse of the block map |
 | I3 | every chunk in the block map, the pending copies and the reverse index is known |
-| I4 | a pending copy is between non-DEAD workers, to a worker without the chunk, and a source has at most `MAX_STREAMS` |
+| I4 | a REPAIR pending copy is between non-DEAD workers, to a worker without the chunk, and a source has at most `MAX_STREAMS`; an UPLOAD pending copy has no source and a non-DEAD target |
 | I5 | a copy whose DELETE was delivered is `EXCESS` or `CORRUPT`, never `OK` |
 | I6 | no excess or corrupt DELETE is queued for a chunk with fewer than 2 live copies |
 | I7 | the in-memory chunk table equals the database's (fsck only) |
 | I8 | a chunk never has two pending copies to the same worker |
+| I11 | for every worker, `applied ≤ received` |
+| I13 | no upload receipt belongs to an old epoch or to an object that is not being uploaded |
 
 ### The concurrency rule
 
@@ -654,19 +718,33 @@ declares the whole cluster dead.
 
 ### Liveness
 
-ALIVE → STALE after 6 s of silence → DEAD after 12 s. DEAD forgets every copy the worker held,
-clears its command queue and drops the copies it was sending or receiving. The next message from
-it is answered 404, it registers again, and its full report puts back whatever is still on its disk.
+ALIVE → STALE after 6 s of silence → DEAD after 12 s. DEAD starts a new epoch (work queued for the
+old one is dropped), forgets every copy the worker held, its upload receipts and any open report
+session, clears its command queue and drops the copies it was sending or receiving. The next
+message from it is answered 404, it registers again, and its full report puts back whatever is
+still on its disk.
 
-### Block reports
+### Applying changes and reports
 
-- **Full report:** chunks of an upload in progress are skipped; unknown chunks are orphans (see
-  below); a checksum that differs from the namespace makes
-  the copy `CORRUPT`; a confirmed copy that is no longer reported is removed (an unconfirmed one only
-  once it is older than `PENDING_TIMEOUT`, because an upload may have added it after the worker took
-  its snapshot); copies completing a pending copy are recorded as `copied`.
-- **Incremental report:** `received` adds or confirms copies and completes pending copies;
-  `deleted` removes copies (`trimmed`, `invalidated`, `deleted`); `bad` marks copies `CORRUPT`.
+([`ChangeApplier`](controller/src/main/java/com/objectstore/controller/cluster/ChangeApplier.java);
+every step carries the worker's epoch and is skipped if the epoch has ended.)
+
+- **`RECEIVED`** of a known chunk: a size or checksum that differs from the namespace makes the copy
+  `CORRUPT`; otherwise it is `OK` (also from `CORRUPT`: these are freshly verified bytes; `EXCESS`
+  stays `EXCESS`), and any pending copy of the chunk to that worker completes (`copied`). Of an
+  unknown chunk: an upload receipt if its upload is in progress; a DELETE if it is known garbage and
+  orphan GC is allowed; otherwise nothing (the next full report decides).
+- **`DELETED`** removes the copy (`trimmed`, `invalidated` or `deleted`) and any upload receipt;
+  **`BAD`** makes the copy `CORRUPT`; **`CMD_FAILED`** ends the pending copy started by that command
+  at once (`failed`) and avoids that target for `TARGET_BACKOFF`.
+- **Report segment:** each listed copy is added or kept (a bad or mismatched one is `CORRUPT`, a
+  verified one `OK` unless its DELETE was already delivered) and *marked* with the session; unknown
+  chunks become receipts, known garbage or orphans. A change up to the baseline that arrives after
+  the segment that listed its chunk is older than the listing and is skipped.
+- **Report completion:** orphan GC (if allowed), then every copy of the worker without this
+  session's mark is removed (`[report] missing …`). Hold-back guarantees that such a copy was
+  deleted before the listing was taken. A copy created at commit from a receipt takes the receipt's
+  mark, so an upload during a report is not lost.
 
 ### Orphans and the safety valve
 
@@ -689,12 +767,13 @@ Every 3 s, as one block under the lock: expire pending copies that were not conf
 (and avoid that target for `TARGET_BACKOFF`), evaluate safe mode (and stop there while it is on),
 then for every chunk, fewest live copies first:
 
-1. **Under-replicated:** keep a surplus copy whose DELETE was not delivered yet; if no OK copy exists,
+1. **Under-replicated** (`live + pending < RF`, where pending includes UPLOAD copies awaiting
+   their `RECEIVED`): keep a surplus copy whose DELETE was not delivered yet; if no OK copy exists,
    record `unrecoverable` once and wait; otherwise pick a source (an ALIVE, reported holder with
    fewer than `MAX_STREAMS` copies in flight) and a target (a write-eligible worker with no copy of
    the chunk in any state, the least loaded), queue `REPLICATE` on the source, record the copy as
    pending.
-2. **Over-replicated** (and nothing pending, no holder STALE or unconfirmed): mark the copies on the
+2. **Over-replicated** (and nothing pending, no holder STALE or without a completed full report): mark the copies on the
    busiest workers `EXCESS` and queue their DELETE.
 3. **Clean-up** on ALIVE workers: re-send a DELETE not confirmed within `PENDING_TIMEOUT`; delete a
    `CORRUPT` copy only once 2 live copies exist.
@@ -711,18 +790,22 @@ different workers and spread evenly.
 
 ### The upload path
 
-Per chunk: choose two targets, PUT in parallel, recording each target's boot id. A target that fails
-is excluded for the rest of the upload and the next worker on the ring takes its place (pipeline
-recovery). If two copies are impossible: best-effort delete of everything written, `503
-upload_failed`. Finally, in one block under the lock: the namespace transaction (object, metadata,
-chunks, idempotency key), then the in-memory chunks, then the copies, each only if its worker is
-still the same process that acknowledged the write; otherwise the monitor simply repairs that chunk.
+Per chunk: choose two targets, recording each target's epoch, and PUT in parallel with
+`X-Change-Ack`; the changes in each answer go through the receipt step (normally including the
+chunk's `RECEIVED`, which becomes an upload receipt). A target that fails is excluded for the rest
+of the upload and the next worker on the ring takes its place (pipeline recovery). If two copies are
+impossible: best-effort delete of everything written, `503 upload_failed`. Finally, in one block
+under the lock: the namespace transaction (object, metadata, chunks, idempotency key), then the
+in-memory chunks, then for each target still in the same epoch: its receipt becomes the replica, or
+it gets an UPLOAD pending copy until its `RECEIVED` arrives; a target that died or re-registered
+meanwhile gets nothing, and the monitor simply repairs that chunk.
 
 ### The download path
 
 Every chunk must have a readable copy before the first byte is sent. Then each chunk is read with
 candidates computed at that moment (ALIVE before STALE, no recent data error first, least loaded
-first), and each answer is classified:
+first, then ALIVE targets of UPLOAD pending copies, so an object can be read right after its 201),
+and each answer is classified:
 
 | Worker's answer | Meaning | Action |
 |---|---|---|
@@ -806,8 +889,12 @@ the controller is down (clients retry until it is back).
 | Controller cannot reach a worker for data, but heartbeats arrive | Uploads replace it chunk by chunk; reads fall back; repairs avoid it. |
 | Very late heartbeat from a dead worker | Rejected as `too_old` or by sequence number; it never revives a DEAD worker. |
 | Heartbeat answer lost | Its commands are lost: a REPLICATE is re-planned after `PENDING_TIMEOUT`, a DELETE re-sent. |
-| Report answer lost | The worker resends the same `seq`; the controller answers `duplicate` and applies nothing twice. |
-| Old report delivered after a newer one | Lower `seq` → `stale_seq`, ignored. |
+| Heartbeat answer lost (changes, segment) | The worker sends the same changes and segment again on its next heartbeat; change numbers and segment indexes make the repeat harmless (only re-acknowledged). |
+| Old or reordered heartbeat delivered after a newer one | Lower heartbeat `seq` → `duplicate`: only the acknowledgement is echoed. |
+| A gap in a worker's change numbers | Nothing from that message is accepted, the acknowledgement never moves past the gap, and a full report is requested (`changes_gap`). |
+| A delayed old registration of the same process | Older `attempt` → `stale_registration`; the same attempt again → ok, nothing reset; sent too long ago → `too_old`. |
+| A PUT answer from a restarted worker process | Its `boot_id` is not the current one: its changes are ignored. |
+| An upload lands on a worker during its full report | Its `RECEIVED` is held back until the report completes; meanwhile the copy is an UPLOAD pending copy (no repair; readable); then the change records it. |
 | Message from a dead old worker process | Different `boot_id` → `stale_boot`, ignored. |
 | Command delivered twice | Heartbeat `seq` dedup on the controller, `cmd_id` dedup on the worker; PUT and DELETE are idempotent anyway. |
 | Command executed very late | Dropped once `expires_at` has passed. Inside the TTL: a late REPLICATE makes an extra copy (trimmed later); a late orphan or object DELETE is harmless (ids are never reused). |
@@ -816,14 +903,15 @@ the controller is down (clients retry until it is back).
 
 | Situation | Behaviour |
 |---|---|
-| A repair copy landed but the target's report was lost | The pending copy times out; the target's next full report adds the copy; any extra copy is trimmed. |
+| A repair copy landed but the target's `RECEIVED` was lost | The target keeps the change until it is acknowledged, so it arrives later; if the pending copy timed out meanwhile, any extra copy is trimmed. |
+| A REPLICATE fails at the source (no copy, corrupt copy, PUT failed) | The source appends `CMD_FAILED`: the pending copy ends at once and that target is avoided; the next tick plans another copy. |
 | A late receipt after a time-out, while a second copy is in flight | Both copies are accepted; the surplus is trimmed on a later tick. |
-| The source's copy turns out corrupt during REPLICATE | The worker reports it bad instead of sending it; another source is used after the time-out. |
+| The source's copy turns out corrupt during REPLICATE | The worker reports it bad (`BAD`, `CMD_FAILED`) instead of sending it; another source is used at once. |
 | The target already has different bytes under that id (409) | The copy times out; that pair is avoided; the stray file is an orphan → collected. |
 | A holder dies while an excess DELETE is only queued | The DELETE is cancelled at once and the copy counts again; no new copy is needed. |
 | A holder dies after the excess DELETE was delivered | It is not taken back (I5); the chunk is repaired normally. Residual risk: data loss only if every other copy is lost inside the command's TTL, the same window HDFS has. |
 | Worker returns after being DEAD | Its full report re-adds its copies → 3 copies → EXCESS on the busiest worker → deleted → exactly 2. |
-| Fast worker restart (< 12 s) | New boot id: its queue and its outgoing copies are dropped, its copies kept and reconciled by its full report. No repair. |
+| Fast worker restart (< 12 s) | New boot id: a new epoch; its queue, its upload receipts and the copies to or from it are dropped, its copies kept and reconciled by its full report. No repair. |
 | Worker returns with an empty volume | Its full report lists nothing → its copies are removed → repair. Its `VERSION` is gone too, so it adopts the cluster id again. |
 | Both copies of a chunk gone (holders dead) | `missing_chunks`; `unrecoverable` recorded once; the download answers 503. Recovers automatically when a holder returns. |
 | Only corrupt copies remain | Same as missing. Corrupt files are **kept** (never served) until a good copy exists. |
@@ -889,8 +977,8 @@ the controller is down (clients retry until it is back).
 
 | Layer | How to run | What it covers |
 |---|---|---|
-| Unit tests | `make test` | chunk store and sidecars, scanner, IBR buffer; cluster state and invariants; the protocol's acceptance rules; liveness and stall detection; block report processing; the replication planner (repair, trim, invalidate, postpone, protect); placement; download classification (including corruption in transit); metadata rules; the CLI (retries, idempotency keys, exit codes) |
-| In-process system tests | `make test` | [`system-tests`](system-tests): the real controller and four real workers in one JVM, real HTTP, timers scaled down tenfold. Cluster formation, STALE/DEAD/return, quick restarts, replay protection over raw HTTP, scanner, orphan GC, safe mode after a controller restart, wiped controller database; worker-to-worker repair and trimming with a watchdog that no chunk ever drops below one OK copy, `MAX_STREAMS`, corrupt-copy replacement order, missing chunks, a copy target dying; pipeline recovery, `upload_failed`, idempotency (including 4 concurrent uploads with one key), a controller crash after a 201, deletes via commands; fsck |
+| Unit tests | `make test` | chunk store, its index and sidecars, scanner reconciliation and rate limit; the change log (numbering, acknowledgement, hold-back, overflow, `beginHold` atomicity), PUT-answer piggyback, `CMD_FAILED`; cluster state and invariants; the protocol's acceptance rules, the receipt step (duplicates, overlaps, gaps, a full queue, segment dedupe, the baseline), registration attempts and epochs, and a property test of 10⁴ random interleavings of changes and report segments; liveness and stall detection; the replication planner (repair, trim, invalidate, postpone, protect); placement; download classification (including corruption in transit); metadata rules; the CLI (retries, idempotency keys, exit codes) |
+| In-process system tests | `make test` | [`system-tests`](system-tests): the real controller and four real workers in one JVM, real HTTP, timers scaled down tenfold. Cluster formation, STALE/DEAD/return, quick restarts, replay protection over raw HTTP, read-your-writes (100 uploads each downloaded right after its 201), an upload during a slow full report, scanner, orphan GC, safe mode after a controller restart, wiped controller database; worker-to-worker repair and trimming with a watchdog that no chunk ever drops below one OK copy, `MAX_STREAMS`, corrupt-copy replacement order, missing chunks, a copy target dying; pipeline recovery, `upload_failed`, idempotency (including 4 concurrent uploads with one key), a controller crash after a 201, deletes via commands; fsck |
 | Scenario scripts | `make scenarios` | [`tests/scenarios/`](tests/scenarios): every acceptance criterion of blocks 6–9 against the real Docker stack: `docker stop/start/restart/pause/kill`, `docker network disconnect`, a wiped controller volume, network faults |
 | Chaos test | `make chaos` | [`tests/chaos.py`](tests/chaos.py), below |
 
@@ -941,7 +1029,7 @@ every disk, and `invariant_violations` was 0.
 | 4 | 1 MB chunks, unique ids, order kept; 2 copies on different workers, spread; detect and restore lost replication | `UploadService`, `PlacementPolicy`, `ReplicationPlanner` | demos 2, 3, 5, 6 |
 | 5 | The six client endpoints, JSON, binary with the right content type, status codes with JSON errors | `ObjectsController`, `GlobalExceptionHandler` | all demos |
 | 6 | Internal APIs: register, heartbeat, PUT/GET/DELETE chunk, list a worker's chunks (extended with block reports) | `InternalWorkersController`, worker `ChunkController` | logs; scenario scripts |
-| 7 | Detect unavailable workers; keep serving; detect and restore replication; `docker stop/start worker2` | `Registry`, `Reports`, `ReplicationPlanner`, worker `Reporter`/`Lifeline`/`CommandExecutor` | demo 5 |
+| 7 | Detect unavailable workers; keep serving; detect and restore replication; `docker stop/start worker2` | `Registry`, `ChangeApplier`, `ReplicationPlanner`, worker `ControllerLink`/`CommandExecutor` | demo 5 |
 | 8 | Detect corruption, never return it when a good copy exists, restore; intentional corruption | worker `ChunkStore` + `BlockScanner`, `DownloadService`, `ReplicationPlanner` | demo 6 |
 | 9 | Build, start and interact instructions | this README, `Makefile`, `oscli`, `demo.sh` | Quick start |
 | 10 | The demonstrations | `demo.sh` | `make demo` → `7/7 PASS` |
@@ -960,7 +1048,7 @@ silent, contradicted each other, or did not fit the chosen stack:
 |---|---|
 | Java 21 + Spring Boot 4.1 instead of Python + FastAPI | The project owner's choice. Every name visible from outside (endpoints, JSON keys, error codes, environment variables, states, log tags) is as specified. |
 | One namesystem lock instead of "one asyncio event loop" | Java has threads, so the equivalent of "no `await` between read and write" is "no network I/O while holding the lock", which is exactly how the HDFS NameNode works. The health loop and the monitor are two threads that each run one pass under the lock; there is no state outside it. Lock ordering is fixed: cluster lock before a database connection, never the reverse. |
-| Worker work on threads instead of `asyncio.to_thread` | The scanner, disk check, reporter and heartbeat each have their own thread, so none can delay another, which is the property the "50 ms" rule protects. |
+| Worker work on threads instead of `asyncio.to_thread` | The scanner, disk check and controller link each have their own thread, so none can delay another, which is the property the "50 ms" rule protects. |
 | Blocks 5.1 and 6 in one commit | Block 5.1 alone would delete the replica tables while leaving the controller no way to learn replica locations. |
 | `oscli` (Java) instead of `client.py`; the chaos test in Python | `oscli` is the project's existing client. The chaos test is an external harness and uses only the Python standard library, so it runs on any machine with Python 3. |
 | In-process system tests (`system-tests`) | They run the real protocol between real controller and worker code in seconds, in CI, without Docker. The Docker scenario scripts cover what needs real containers. |
@@ -973,7 +1061,7 @@ silent, contradicted each other, or did not fit the chosen stack:
 | Re-sending a delivered DELETE | `delete_delivered` stays true once set | §6.5 says `send_delete` resets it, but §6.5 and I5 also say a delivered DELETE is never taken back. Resetting it could turn a copy that a worker may still delete back into `OK`. |
 | When undelivered DELETEs are cancelled | As soon as a chunk has fewer than 2 live copies, from any cause (a worker DEAD, a report, a copy found corrupt) | Step 3a only reacts on the next monitor tick and only when `live + pending < 2`, which leaves I6 violated in between, observable by fsck. |
 | Idempotent replay and a different size | The replay reads the multipart part to learn its size (no worker is contacted) | §6.7 says "without reading the body", AC-8.3 requires 409 for a different size; the size is in the body. |
-| Copies confirmed during an upload | A worker report mentioning a chunk of an upload in progress is remembered; the copy is recorded as confirmed at commit | Otherwise every freshly uploaded copy stays "unconfirmed" until the next full report (up to 30 s) and postpones trimming. |
+| Copies of an upload | Recorded only from the worker's own `RECEIVED` (an upload receipt, usually from the PUT answer itself) or report listing; a copy whose change has not arrived at commit is an UPLOAD pending copy | A 2xx alone proves nothing about what the worker will keep reporting; the pending copy avoids a needless repair and lets reads use the copy. |
 | Orphans the controller can account for | Upload intents and deletion tombstones in the namespace; their chunks are deleted even when the orphan safety valve would refuse | The valve as specified blocks AC-8.2 for good: a worker stopped during a large failed upload comes back with *most* of its chunks belonging to that upload, and the valve refuses every report. The same happens to a large object deleted while a worker is down. The valve still applies to chunks nobody can account for. |
 | A chunk file without a valid `.meta` | Listed with checksum `unverified` once it has not changed for 5 s; the scanner reports it bad | Otherwise a planted file or a sidecar damaged at runtime would be invisible until the next worker restart. The 5 s keep a write in progress (data renamed just before its sidecar) from being misread. |
 | Registration and `MAX_MESSAGE_AGE` | Registrations are also rejected when too old | A delayed registration from an old process would otherwise reset the worker's state to that old process. |
@@ -1024,13 +1112,13 @@ millisecond timestamps (an update in the same second must show a later `updated_
 ├── worker/                     the DataNode
 │   └── src/main/java/com/objectstore/worker/
 │       ├── api/                ChunkController (PUT/GET/DELETE/list), HealthController
-│       ├── storage/            ChunkStore (.meta sidecars, fsync), VersionFile, BlockScanner, DiskCheck
-│       ├── reporting/          Reporter (register + ordered reports), Lifeline (heartbeats), IbrBuffer
+│       ├── storage/            ChunkStore (.meta sidecars, fsync, in-memory index), VersionFile, BlockScanner, TokenBucket, DiskCheck
+│       ├── reporting/          ChangeLog, ControllerLink (registration, heartbeats, report segments), ControllerClients, WorkerIdentity
 │       └── commands/           CommandExecutor (REPLICATE, DELETE)
 ├── controller/                 the NameNode
 │   └── src/main/java/com/objectstore/controller/
 │       ├── api/                ObjectsController, InternalWorkersController, ClusterController
-│       ├── cluster/            ClusterState, Registry, Reports, SafeMode, Fsck, WorkerClient, ClusterBootstrap
+│       ├── cluster/            ClusterState, Registry (registration + receipt step), Receipts, ChangeApplier, SafeMode, Fsck, WorkerClient, ClusterBootstrap
 │       ├── replication/        Monitor, ReplicationPlanner, MaintenanceLoops
 │       ├── objects/            UploadService, DownloadService, ObjectService, PlacementPolicy, MetadataValidator
 │       └── repository/         ObjectRepository, ChunkRepository, ClusterMetaRepository (+ db/migration)
@@ -1042,10 +1130,10 @@ millisecond timestamps (an update in the same second must show a later `updated_
 ```
 
 Module names from the specification: `cluster.py` → `ClusterState` · `registry.py` → `Registry` ·
-`reports.py` → `Reports` · `monitor.py` → `Monitor` + `ReplicationPlanner` · `placement.py` →
+`reports.py` → `Receipts` + `ChangeApplier` · `monitor.py` → `Monitor` + `ReplicationPlanner` · `placement.py` →
 `PlacementPolicy` · `safemode.py` → `SafeMode` · `fsck.py` → `Fsck` · `faults.py` →
 `FaultInjectingRequestFactory` · worker `store.py` → `ChunkStore` · `version.py` → `VersionFile` ·
-`reporter.py` → `Reporter` + `IbrBuffer` · `executor.py` → `CommandExecutor` · `scanner.py` →
+`reporter.py` → `ControllerLink` + `ChangeLog` · `executor.py` → `CommandExecutor` · `scanner.py` →
 `BlockScanner` · `diskcheck.py` → `DiskCheck`.
 
 ---
