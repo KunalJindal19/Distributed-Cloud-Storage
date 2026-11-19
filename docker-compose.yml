@@ -48,7 +48,8 @@ x-worker-environment: &worker-environment
   FULL_REPORT_INTERVAL: "30"       # full block report period (s)
   IBR_INTERVAL: "0.5"              # incremental block report flush period (s)
   IBR_BUFFER_MAX: "10000"          # on overflow: drop the buffer, send a full report
-  SCAN_INTERVAL: "10"              # block scanner period (s)
+  SCAN_INTERVAL: "10"              # block scanner: at most one pass per this many seconds
+  SCAN_MAX_BYTES_PER_SEC: "33554432" # block scanner read rate limit (32 MiB/s)
   DISK_CHECK_INTERVAL: "30"        # volume probe period (s)
 
 services:

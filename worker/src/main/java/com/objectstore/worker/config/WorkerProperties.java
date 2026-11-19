@@ -25,6 +25,8 @@ public record WorkerProperties(
         @Positive double ibrIntervalSeconds,
         @Positive int ibrBufferMax,
         @Positive double scanIntervalSeconds,
+        /** The block scanner reads at most this many bytes per second. */
+        @Positive long scanMaxBytesPerSec,
         @Positive double diskCheckIntervalSeconds,
         @Positive double connectTimeoutSeconds,
         @Positive double readTimeoutSeconds,
