@@ -95,7 +95,7 @@ public class ClusterState {
         public long lastReportAt;                   // monotonic nanos of the last completed full report
         public String registeredAt = "";
         public WorkerStats stats;
-        public final Deque<Command> commands = new ArrayDeque<>();
+        public final CommandQueue commands = new CommandQueue();
         public final Deque<Long> bootFlips = new ArrayDeque<>();  // monotonic nanos of boot id changes
         public volatile long lastDataError;         // monotonic nanos of the last failed data-path call (no lock)
         public boolean fullReportRequested;         // set by the monitor; cleared by the next heartbeat reply
@@ -209,6 +209,7 @@ public class ClusterState {
 
     private volatile String clusterId = "";
     private final Map<String, WorkerInfo> workers = new ConcurrentHashMap<>();
+    private final DeletionLedger ledger = new DeletionLedger(this);
     private final Map<String, ChunkInfo> chunks = new HashMap<>();
     private final Map<String, Map<String, Replica>> blocks = new HashMap<>();
     private final Map<String, Set<String>> workerBlocks = new HashMap<>();
@@ -650,9 +651,9 @@ public class ClusterState {
 
     /**
      * Keeps invariant I6 true at every instant: if a chunk has fewer than RF live copies, every
-     * DELETE for it (other than object/orphan deletions) that has not been handed to a worker yet
-     * is cancelled, and an EXCESS copy whose DELETE was cancelled counts as OK again. A DELETE
-     * that was already delivered cannot be called back (invariant I5).
+     * excess or corrupt deletion of it that has not been handed to a worker yet (WAITING or QUEUED
+     * in the ledger) is cancelled, and an EXCESS copy whose deletion was cancelled counts as OK
+     * again. A DELETE that was already delivered cannot be called back (invariant I5).
      *
      * @return number of EXCESS copies turned back to OK
      */
@@ -661,39 +662,41 @@ public class ClusterState {
             return 0;
         }
         int restored = 0;
-        for (Map.Entry<String, Replica> entry : replicasOf(chunkId).entrySet()) {
-            Replica replica = entry.getValue();
-            if (replica.deleteDelivered || replica.deleteQueuedAt == 0) {
+        for (DeletionLedger.Entry entry : ledger.entriesFor(chunkId)) {
+            if (!entry.linkedToReplica() || entry.state == DeletionLedger.State.DELIVERED) {
                 continue;
             }
-            if (replica.deleteCmdId != null) {
-                cancelCommand(entry.getKey(), replica.deleteCmdId);
-            }
-            replica.deleteCmdId = null;
-            replica.deleteQueuedAt = 0;
-            if (replica.state == ReplicaState.EXCESS) {
-                replica.state = ReplicaState.OK;
-                restored++;
-                record("restored", chunkId, entry.getKey(), null,
-                        "a live copy was lost; the surplus copy's undelivered DELETE was cancelled");
+            String workerId = entry.workerId;
+            if (ledger.cancel(chunkId, workerId)) {
+                Replica replica = replica(chunkId, workerId);
+                if (replica != null && replica.state == ReplicaState.EXCESS) {
+                    replica.state = ReplicaState.OK;
+                    restored++;
+                    record("restored", chunkId, workerId, null,
+                            "a live copy was lost; the surplus copy's undelivered DELETE was cancelled");
+                }
             }
         }
         return restored;
     }
 
-    /** Queues a DELETE for a surplus or corrupt copy and remembers when, for the retry rule. */
+    /** Asks the ledger to delete a surplus or corrupt copy ({@code excess} / {@code corrupt}). */
     public void sendDelete(String workerId, String chunkId, String reason) {
-        Replica replica = replica(chunkId, workerId);
-        if (replica == null) {
-            return;
+        if (replica(chunkId, workerId) != null) {
+            ledger.request(chunkId, workerId, reason);
         }
-        Command command = queueCommand(workerId, InternalApi.COMMAND_DELETE, chunkId, null, null, reason);
-        if (command == null) {
-            return;
-        }
-        replica.deleteCmdId = command.cmdId();
-        replica.deleteQueuedAt = now();
-        // delete_delivered stays true once true: a delivered DELETE may still run (I5).
+    }
+
+    public DeletionLedger ledger() {
+        return ledger;
+    }
+
+    int maxCommandsPerWorker() {
+        return properties.maxCommandsPerWorker();
+    }
+
+    long pendingTimeoutNanos() {
+        return properties.pendingTimeout().toNanos();
     }
 
     /** Forgets every copy on a worker (it is DEAD: nothing it holds can be counted on). */
@@ -889,73 +892,79 @@ public class ClusterState {
     // ---- commands -------------------------------------------------------------------------
 
     /**
-     * Queues a command for a worker. Identical commands (type, chunk, target) are queued once.
-     * The queue is capped: when full, the oldest DELETE is dropped first (it is re-planned by the
-     * monitor), then the oldest command of any kind.
+     * Queues a REPLICATE for a worker. Identical commands (type, chunk, target) are queued once
+     * (an O(1) lookup). A full queue (MAX_COMMANDS_PER_WORKER) refuses: commands are never dropped.
+     * DELETE commands come only from the {@link DeletionLedger}.
      *
-     * @return the queued (or the already queued identical) command, with its id and expiry
+     * @return the queued (or the already queued identical) command, or null if refused
      */
     public Command queueCommand(String workerId, String type, String chunkId, String checksum, String targetUrl,
                                 String reason) {
+        if (InternalApi.COMMAND_DELETE.equals(type)) {
+            throw new IllegalArgumentException("DELETE commands are created by the deletion ledger");
+        }
         WorkerInfo worker = workers.get(workerId);
         if (worker == null) {
             return null;
         }
-        for (Command existing : worker.commands) {
-            if (existing.type().equals(type) && existing.chunkId().equals(chunkId)
-                    && java.util.Objects.equals(existing.targetUrl(), targetUrl)) {
-                return existing;
-            }
+        Command existing = worker.commands.find(type, chunkId, targetUrl);
+        if (existing != null) {
+            return existing;
         }
-        while (worker.commands.size() >= properties.maxCommandsPerWorker()) {
-            Command victim = null;
-            for (Command candidate : worker.commands) {
-                if (InternalApi.COMMAND_DELETE.equals(candidate.type())) {
-                    victim = candidate;
-                    break;
-                }
-            }
-            if (victim == null) {
-                victim = worker.commands.peekFirst();
-            }
-            worker.commands.remove(victim);
-            Replica replica = replica(victim.chunkId(), workerId);
-            if (replica != null && victim.cmdId().equals(replica.deleteCmdId) && !replica.deleteDelivered) {
-                replica.deleteQueuedAt = 0;
-                replica.deleteCmdId = null;
-            }
-            increment("commands_dropped");
+        if (worker.commands.size() >= properties.maxCommandsPerWorker()) {
+            return null;
         }
+        return enqueue(worker, type, chunkId, checksum, targetUrl, reason);
+    }
+
+    /** Adds a command to a worker's queue (the caller checked the cap and duplicates). */
+    Command enqueue(WorkerInfo worker, String type, String chunkId, String checksum, String targetUrl, String reason) {
         Command command = new Command(UUID.randomUUID().toString(), type, chunkId, checksum, targetUrl, reason,
                 InternalApi.nowSeconds() + properties.commandTtlSeconds());
-        worker.commands.addLast(command);
+        worker.commands.add(command);
         return command;
     }
 
-    /** Removes a queued command that was not delivered yet. */
+    /** Removes a queued REPLICATE that was not delivered yet (DELETEs are cancelled through the ledger). */
     public boolean cancelCommand(String workerId, String cmdId) {
         WorkerInfo worker = workers.get(workerId);
-        return worker != null && worker.commands.removeIf(c -> c.cmdId().equals(cmdId));
+        return worker != null && worker.commands.remove(cmdId);
+    }
+
+    /** Removes the queued REPLICATE commands for these chunks (the chunks are being forgotten). */
+    void cancelReplicatesFor(Set<String> chunkIds) {
+        for (WorkerInfo worker : workers.values()) {
+            worker.commands.removeIf(command -> !InternalApi.COMMAND_DELETE.equals(command.type())
+                    && chunkIds.contains(command.chunkId()));
+        }
+    }
+
+    /** The worker is DEAD or registers again: its queue is cleared and its ledger entries wait. */
+    public void clearCommands(WorkerInfo worker) {
+        worker.commands.clear();
+        ledger.pause(worker.workerId);
     }
 
     /**
-     * Takes the commands to hand to a worker in a heartbeat reply, dropping expired ones. A
-     * DELETE handed over is marked delivered on its replica: from now on it cannot be cancelled.
+     * Takes the commands to hand to a worker in a heartbeat reply, dropping expired ones (an
+     * expired DELETE's ledger entry waits again). A DELETE handed over is DELIVERED in the ledger
+     * and on its replica: from now on it cannot be cancelled.
      */
     public List<Command> takeCommands(WorkerInfo worker) {
         List<Command> delivered = new ArrayList<>();
         double now = InternalApi.nowSeconds();
         while (delivered.size() < MAX_COMMANDS_PER_HEARTBEAT && !worker.commands.isEmpty()) {
-            Command command = worker.commands.pollFirst();
+            Command command = worker.commands.poll();
+            boolean delete = InternalApi.COMMAND_DELETE.equals(command.type());
             if (command.expiresAt() < now) {
                 increment("commands_expired");
+                if (delete) {
+                    ledger.commandLost(command.cmdId());
+                }
                 continue;
             }
-            if (InternalApi.COMMAND_DELETE.equals(command.type())) {
-                Replica replica = replica(command.chunkId(), worker.workerId);
-                if (replica != null && command.cmdId().equals(replica.deleteCmdId)) {
-                    replica.deleteDelivered = true;
-                }
+            if (delete) {
+                ledger.delivered(command);
             }
             delivered.add(command);
         }
@@ -1093,7 +1102,7 @@ public class ClusterState {
         for (WorkerInfo worker : workers.values()) {
             for (Command command : worker.commands) {
                 if (InternalApi.COMMAND_DELETE.equals(command.type())
-                        && !"object_deleted".equals(command.reason()) && !"orphan".equals(command.reason())) {
+                        && (DeletionLedger.EXCESS.equals(command.reason()) || DeletionLedger.CORRUPT.equals(command.reason()))) {
                     Replica replica = replica(command.chunkId(), worker.workerId);
                     if (replica == null) {
                         continue;
@@ -1107,6 +1116,8 @@ public class ClusterState {
                 }
             }
         }
+        // I12: the deletion ledger.
+        violations.addAll(ledger.check());
         // I11: applied <= received for every worker.
         for (WorkerInfo worker : workers.values()) {
             if (worker.applied > worker.received) {

@@ -62,16 +62,21 @@ class ClusterStateTest {
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         cluster.locked(() -> {
-            Command first = cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "excess");
-            Command again = cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "excess");
+            Command first = cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://w2:1", null);
+            Command again = cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://w2:1", null);
             assertThat(again.cmdId()).isEqualTo(first.cmdId());
             assertThat(cluster.worker("worker1").commands).hasSize(1);
+            cluster.takeCommands(cluster.worker("worker1"));
             cluster.replica(chunk(0), "worker1").state = ReplicaState.EXCESS;
-            cluster.replica(chunk(0), "worker1").deleteCmdId = first.cmdId();
+            cluster.sendDelete("worker1", chunk(0), "excess");
+            cluster.sendDelete("worker1", chunk(0), "excess");                  // one entry per pair
+            assertThat(cluster.worker("worker1").commands).hasSize(1);
+            Command delete = cluster.worker("worker1").commands.iterator().next();
 
             List<Command> delivered = cluster.takeCommands(cluster.worker("worker1"));
 
-            assertThat(delivered).containsExactly(first);
+            assertThat(delivered).containsExactly(delete);
+            assertThat(cluster.ledger().entry(chunk(0), "worker1").state).isEqualTo(DeletionLedger.State.DELIVERED);
             assertThat(cluster.replica(chunk(0), "worker1").deleteDelivered).isTrue();
             assertThat(cluster.worker("worker1").commands).isEmpty();
         });

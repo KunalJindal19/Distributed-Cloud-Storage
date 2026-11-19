@@ -171,7 +171,7 @@ public class Registry {
         worker.resetReceipt();
         worker.hasReported = false;
         worker.fullReportRequested = false;
-        worker.commands.clear();
+        cluster.clearCommands(worker);                  // its ledger entries wait for the new process
         int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
         int purged = cluster.purgeReceipts(worker.workerId);
         if (dropped + purged > 0) {
@@ -295,7 +295,7 @@ public class Registry {
                 worker.epoch++;                            // whatever was queued for the old epoch is dropped
                 worker.purging = true;
                 worker.hasReported = false;
-                worker.commands.clear();
+                cluster.clearCommands(worker);
                 cluster.closeSession(worker);
                 worker.resetReceipt();
                 dropped[0] = cluster.dropPendingForWorker(workerId, true, true);

@@ -77,7 +77,7 @@ public final class TestSupport {
     public static ControllerProperties properties(double staleAfter, double deadAfter, double orphanGcDelay) {
         return new ControllerProperties(1_048_576, 2, Path.of("/tmp/unused.db"), staleAfter, deadAfter, 0.5,
                 0.1, 0.3, 2, 3, 2, 30, 1000, 10, 0.999, 0.1, 5, orphanGcDelay, 0.5, 16 * 1024 * 1024, 30, 2, 10, true,
-                5, 10_000, 5, 2);
+                5, 10_000, 5, 2, 2000);
     }
 
     public static String chunk(int index) {

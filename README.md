@@ -337,8 +337,8 @@ changes_gap, apply_queue_full, writer_task_failures, namespace_reconciled, uploa
 `invalidated`, `deleted`, `restored`, `orphan`, `unrecoverable`); and the writer's health:
 `lock_max_hold_ms` (the longest continuous write-lock hold since the previous status read, also per
 holder in `lock_max_hold_by`; reading resets it), `apply_queue_depth`, `apply_oldest_task_age_ms`,
-`writer_busy_ratio` (share of the time since the previous read that the writer held the lock) and
-`report_sessions_open`.
+`writer_busy_ratio` (share of the time since the previous read that the writer held the lock),
+`report_sessions_open` and `ledger{waiting, queued, delivered}`.
 
 ### fsck — `GET /api/v1/fsck`
 
@@ -346,8 +346,8 @@ Takes the namespace lock, queues a barrier for the writer and waits for it (ever
 queued before is applied), reads the `chunks` table and snapshots the block map, and releases the
 lock. Then it asks every ALIVE worker, in parallel, for its chunks with checksums **recomputed from
 the files**, compares that with the snapshot and the namespace, and runs the invariant checks plus
-I7 (memory mirrors the `chunks` table). `quiescent` also requires an empty apply queue, no report
-session open and no worker being purged.
+I7 (memory mirrors the `chunks` table). `quiescent` also requires an empty apply queue, an empty
+deletion ledger, no report session open and no worker being purged.
 
 ```json
 {"status": "HEALTHY",
@@ -481,12 +481,39 @@ change-log overflow (which abandons any report in progress and starts a new one)
 
 ```json
 {"cmd_id": "…", "type": "REPLICATE", "chunk_id": "…", "checksum": "…", "target_url": "http://worker3:8003", "expires_at": 1763350030.0}
-{"cmd_id": "…", "type": "DELETE", "chunk_id": "…", "reason": "excess|corrupt|orphan|object_deleted", "expires_at": 1763350030.0}
+{"cmd_id": "…", "type": "DELETE", "chunk_id": "…", "reason": "excess|corrupt|orphan|object_deleted|upload_failed", "expires_at": 1763350030.0}
 ```
 
 A worker executes a `cmd_id` at most once and drops a command whose `expires_at` has passed, both
-on arrival and right before running it. A lost heartbeat reply loses its commands; the pending
-time-out (REPLICATE) and the DELETE retry rule recover them, as in HDFS.
+on arrival and right before running it. A lost heartbeat reply loses its commands: a REPLICATE
+ends by the pending time-out and is planned again; a DELETE is sent again by the deletion ledger
+until the worker's `DELETED` change confirms it (below).
+
+### The deletion ledger
+
+Every DELETE is created by the controller's **deletion ledger** and tracked until the worker
+confirms it, so deletions complete without relying on full reports:
+
+- **One entry per (chunk, worker):** `reason` (`excess`, `corrupt`, `orphan`, `object_deleted`,
+  `upload_failed`), `state`, `cmd_id`, `deadline`, `attempts`.
+- **WAITING → QUEUED** when the worker is ALIVE, has reported and its command queue has room: tried
+  when the entry is created and when the worker completes a report, otherwise every monitor tick
+  (at most `CLEANUP_BUDGET` entries).
+- **QUEUED → DELIVERED** when a heartbeat reply hands the command out; `deadline = now +
+  PENDING_TIMEOUT`. **Completed** when the worker's `DELETED(chunk)` is applied. A deadline that
+  passes sends it again (`[ledger] DELETE … sending it again`, `attempts + 1`).
+- **A worker DEAD or re-registering:** its queue is cleared and its entries wait for the new
+  process (its `excess`/`corrupt` entries are dropped: its copies are judged again after its report).
+- **Cancelling:** a WAITING or QUEUED excess/corrupt deletion is cancelled as soon as its chunk
+  falls below RF; a DELIVERED one cannot be called back (I5).
+- **Command queues never drop a command.** Each worker's queue has an O(1) dedupe index; the cap
+  `MAX_COMMANDS_PER_WORKER` is kept by the ledger (entries wait) and the monitor (no REPLICATE from
+  a source whose queue is full).
+- **Garbage is deleted as soon as it is seen:** a `RECEIVED` for a chunk of a deleted or failed
+  object (a repair landing after a delete, say) gets a DELETE at once, once orphan GC is allowed.
+  When orphan GC becomes allowed (safe mode off and `ORPHAN_GC_DELAY` after the start), every worker
+  is asked for a full report once, so leftovers seen before are collected without waiting for
+  `FULL_REPORT_INTERVAL`.
 
 ---
 
@@ -502,11 +529,12 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `STALE_RATIO` | 0.5 | controller | above this fraction of STALE workers, stop avoiding STALE workers for writes |
 | `HEALTH_INTERVAL` | 1 | controller | liveness check period |
 | `MONITOR_INTERVAL` | 3 | controller | replication monitor period |
-| `PENDING_TIMEOUT` | 15 | controller | a pending copy, or an unconfirmed DELETE, is retried after this |
+| `PENDING_TIMEOUT` | 15 | controller | a pending copy times out, and a delivered DELETE not yet confirmed is sent again, after this |
 | `TARGET_BACKOFF` | 30 | controller | after a failed copy, avoid that (chunk, target) pair for this long |
 | `MAX_STREAMS` | 2 | controller | copies in flight per source worker |
 | `COMMAND_TTL` | 30 | controller | a command carries `expires_at = issued + TTL` |
-| `MAX_COMMANDS_PER_WORKER` | 1000 | controller | queue cap (oldest DELETEs dropped first; they are re-planned) |
+| `MAX_COMMANDS_PER_WORKER` | 1000 | controller | queue cap; never exceeded and nothing is dropped (deletions wait in the ledger) |
+| `CLEANUP_BUDGET` | 2000 | controller | waiting ledger deletions re-checked per monitor tick |
 | `MAX_MESSAGE_AGE` | 10 | controller | reject worker messages sent longer ago than this |
 | `SAFE_MODE_THRESHOLD` | 0.999 | controller | fraction of chunks with a reported OK copy needed to leave safe mode |
 | `SAFE_MODE_EXTENSION` | 5 | controller | stay in safe mode this long after the threshold is reached |
@@ -711,6 +739,7 @@ same copy twice.
 | I7 | the in-memory chunk table equals the database's (fsck only) |
 | I8 | a chunk never has two pending copies to the same worker |
 | I11 | for every worker, `applied ≤ received` |
+| I12 | at most one ledger entry per (chunk, worker); every DELETE in a command queue has a QUEUED ledger entry with its `cmd_id`; an `excess`/`corrupt` entry points to an `EXCESS`/`CORRUPT` copy or to none |
 | I13 | no upload receipt belongs to an old epoch or to an object that is not being uploaded |
 
 ### The concurrency rule
@@ -818,8 +847,8 @@ then for every chunk, fewest live copies first:
    pending.
 2. **Over-replicated** (and nothing pending, no holder STALE or without a completed full report): mark the copies on the
    busiest workers `EXCESS` and queue their DELETE.
-3. **Clean-up** on ALIVE workers: re-send a DELETE not confirmed within `PENDING_TIMEOUT`; delete a
-   `CORRUPT` copy only once 2 live copies exist.
+3. **Clean-up** on ALIVE workers: a surplus copy, and a `CORRUPT` copy once 2 live copies exist,
+   gets a deletion in the ledger (which re-sends it until confirmed).
 
 Then it asks workers whose full report is overdue for one, and checks the invariants.
 
@@ -937,7 +966,7 @@ the controller is down (clients retry until it is back).
 | Worker reaches the controller but not other workers | Copies from or to it time out → that (chunk, target) pair is avoided → other pairs chosen. Reads try it last. |
 | Controller cannot reach a worker for data, but heartbeats arrive | Uploads replace it chunk by chunk; reads fall back; repairs avoid it. |
 | Very late heartbeat from a dead worker | Rejected as `too_old` or by sequence number; it never revives a DEAD worker. |
-| Heartbeat answer lost | Its commands are lost: a REPLICATE is re-planned after `PENDING_TIMEOUT`, a DELETE re-sent. |
+| Heartbeat answer lost | Its commands are lost: a REPLICATE is re-planned after `PENDING_TIMEOUT`; the ledger sends a DELETE again after `PENDING_TIMEOUT` until the worker confirms it. |
 | Heartbeat answer lost (changes, segment) | The worker sends the same changes and segment again on its next heartbeat; change numbers and segment indexes make the repeat harmless (only re-acknowledged). |
 | Old or reordered heartbeat delivered after a newer one | Lower heartbeat `seq` → `duplicate`: only the acknowledgement is echoed. |
 | A gap in a worker's change numbers | Nothing from that message is accepted, the acknowledgement never moves past the gap, and a full report is requested (`changes_gap`). |
@@ -979,6 +1008,17 @@ the controller is down (clients retry until it is back).
 | A writer task throws | Caught, logged, counted; a failed commit or delete is reconciled from the database by the helper. |
 | Reads while a task is half applied | Readers use the read lock and see a consistent state at every step; a download waits (bounded) for a chunk committed but not yet in memory; fsck waits on a barrier. |
 | An upload's commit task takes longer than `UPLOAD_COMMIT_WAIT` | The upload answers `201` anyway (the object is durable) and counts it; the download settle wait covers the gap. |
+
+**Deletions**
+
+| Situation | Behaviour |
+|---|---|
+| A copy lands for a deleted or failed object (a late repair, a timed-out upload PUT) | Its `RECEIVED` gets a ledger DELETE at once (once orphan GC is allowed). |
+| A DELETE for a deleted object is lost, now that full reports are rare | The ledger sends it again after `PENDING_TIMEOUT` until the worker's `DELETED` arrives. |
+| More deletions than `MAX_COMMANDS_PER_WORKER` | Nothing is dropped: the rest wait in the ledger and are queued as the queue drains. |
+| An upload fails | Its copies get ledger DELETEs (`upload_failed`), not best-effort HTTP calls. |
+| Orphans seen before orphan GC is allowed | When it becomes allowed, every worker is asked for one full report. |
+| A holder is DEAD when its object is deleted | Its copies are garbage; the report it sends when it registers again lists them, and the ledger deletes them. |
 
 **Data path**
 

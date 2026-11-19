@@ -179,6 +179,7 @@ public class ChangeApplier {
             };
             cluster.record(event, chunkId, workerId, null, "worker reported the copy deleted");
         }
+        cluster.ledger().completed(chunkId, workerId);
         cluster.removeReceipt(chunkId, workerId);
     }
 
@@ -370,6 +371,7 @@ public class ChangeApplier {
             worker.lastReportAt = cluster.now();
             worker.applied = Math.max(worker.applied, baseline);
             cluster.closeSession(worker);
+            cluster.ledger().retryWorker(workerId);        // its deletions can be queued now
             log.info("[report] {} full report {} complete: listed={} missing={} garbage={} orphans={} baseline={}",
                     workerId, worker.rxSession == number ? Registry.shortId(worker.rxReportId) : "#" + number,
                     session.listed, missing, garbage, orphans, baseline);
@@ -405,11 +407,12 @@ public class ChangeApplier {
 
     // ---- helpers -----------------------------------------------------------------------------
 
-    /** Queues a DELETE for a chunk the namespace does not know (orphan GC). */
+    /** A ledger DELETE for a chunk the namespace does not know (orphan GC); false if one was already tracked. */
     private boolean deleteUnknown(String workerId, String chunkId, String reason) {
-        if (cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunkId, null, null, "orphan") == null) {
+        if (cluster.ledger().entry(chunkId, workerId) != null) {
             return false;
         }
+        cluster.ledger().request(chunkId, workerId, DeletionLedger.ORPHAN);
         cluster.record("orphan", chunkId, workerId, null, reason);
         return true;
     }
@@ -431,11 +434,7 @@ public class ChangeApplier {
         if (replica.deleteDelivered) {
             return;
         }
-        if (replica.deleteCmdId != null) {
-            cluster.cancelCommand(workerId, replica.deleteCmdId);
-        }
-        replica.deleteCmdId = null;
-        replica.deleteQueuedAt = 0;
+        cluster.ledger().cancel(chunkId, workerId);   // a corrupt copy's undelivered DELETE
         replica.state = ReplicaState.OK;
         log.info("[report] chunk={} on {} OK again ({})", chunkId, workerId, why);
     }
