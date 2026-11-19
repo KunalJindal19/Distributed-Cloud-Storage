@@ -19,7 +19,8 @@ import org.springframework.stereotype.Service;
  *
  * <ol start="0">
  *   <li>forget expired (chunk, worker) failure back-offs;</li>
- *   <li>time out pending copies that were never confirmed, and remember to avoid that pair;</li>
+ *   <li>time out pending copies (repairs and upload copies) that were never confirmed, and
+ *       remember to avoid that pair for a repair;</li>
  *   <li>evaluate safe mode; while it is on, nothing below runs;</li>
  *   <li>plan repairs and trims, fewest live copies first ({@link ReplicationPlanner});</li>
  *   <li>ask workers that have not reported for a long time for a full report;</li>
@@ -72,9 +73,14 @@ public class Monitor {
             for (PendingCopy copy : new ArrayList<>(entry.getValue())) {
                 if (copy.deadline() < now) {
                     entry.getValue().remove(copy);
-                    cluster.recordFailure(entry.getKey(), copy.target());
-                    cluster.record("timeout", entry.getKey(), copy.source(), copy.target(),
-                            "copy not confirmed within " + properties.pendingTimeoutSeconds() + " s; avoiding this target for a while");
+                    if (copy.kind() == ClusterState.PendingKind.UPLOAD) {
+                        cluster.record("timeout", entry.getKey(), null, copy.target(),
+                                "upload copy not confirmed within " + properties.pendingTimeoutSeconds() + " s; normal repair takes over");
+                    } else {
+                        cluster.recordFailure(entry.getKey(), copy.target());
+                        cluster.record("timeout", entry.getKey(), copy.source(), copy.target(),
+                                "copy not confirmed within " + properties.pendingTimeoutSeconds() + " s; avoiding this target for a while");
+                    }
                 }
             }
             if (entry.getValue().isEmpty()) {
@@ -87,7 +93,8 @@ public class Monitor {
         long limit = 2 * properties.fullReportInterval().toNanos();
         long now = cluster.now();
         for (WorkerInfo worker : cluster.workers().values()) {
-            if (!worker.isDead() && (!worker.hasReported || now - worker.lastReportAt > limit)) {
+            boolean overdue = worker.hasReported ? now - worker.lastReportAt > limit : worker.session == null;
+            if (!worker.isDead() && overdue) {
                 worker.fullReportRequested = true;
                 log.info("[monitor] asking {} for a full report", worker.workerId);
             }

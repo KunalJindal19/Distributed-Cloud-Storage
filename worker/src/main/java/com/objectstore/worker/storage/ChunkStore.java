@@ -5,7 +5,8 @@ import com.objectstore.common.ChunkIds;
 import com.objectstore.common.dto.ChunkInfo;
 import com.objectstore.common.dto.WorkerStats;
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.worker.reporting.IbrBuffer;
+import com.objectstore.common.dto.ReportEntry;
+import com.objectstore.worker.reporting.ChangeLog;
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -56,8 +57,8 @@ import org.springframework.stereotype.Component;
  * removed behind the store's back. {@link #knownBad} holds the chunks whose data failed
  * verification in this process.
  *
- * <p>Every change is reported to the {@link IbrBuffer}, so the controller learns about it in the
- * next incremental block report.
+ * <p>Every change is appended to the {@link ChangeLog} after the index reflects it, so the
+ * controller learns about it in order, on the next heartbeat or PUT answer.
  */
 @Component
 public class ChunkStore {
@@ -121,16 +122,16 @@ public class ChunkStore {
     }
 
     private final Path chunkDir;
-    private final IbrBuffer ibr;
+    private final ChangeLog changes;
     private final ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
     private final ConcurrentHashMap<String, Entry> index = new ConcurrentHashMap<>();
     private final AtomicLong chunkCount = new AtomicLong();
     private final AtomicLong usedBytes = new AtomicLong();
     private final Set<String> knownBad = ConcurrentHashMap.newKeySet();
 
-    public ChunkStore(WorkerProperties properties, IbrBuffer ibr) {
+    public ChunkStore(WorkerProperties properties, ChangeLog changes) {
         this.chunkDir = properties.chunkDir().toAbsolutePath().normalize();
-        this.ibr = ibr;
+        this.changes = changes;
         for (int i = 0; i < locks.length; i++) {
             locks[i] = new ReentrantLock();
         }
@@ -218,7 +219,7 @@ public class ChunkStore {
                     }
                     indexPut(chunkId, new Entry(data.length, actual));
                     knownBad.remove(chunkId);
-                    ibr.received(new ChunkInfo(chunkId, data.length, actual)); // re-announced
+                    changes.received(chunkId, data.length, actual); // re-announced
                     return WriteResult.EXISTS;
                 }
                 if (meta.isEmpty()) {
@@ -230,7 +231,7 @@ public class ChunkStore {
             writeNew(chunkId, target, data, actual);
             indexPut(chunkId, new Entry(data.length, actual));
             knownBad.remove(chunkId);
-            ibr.received(new ChunkInfo(chunkId, data.length, actual));
+            changes.received(chunkId, data.length, actual);
             return WriteResult.CREATED;
         } catch (IOException e) {
             throw new UncheckedIOException("could not write chunk " + chunkId, e);
@@ -287,7 +288,7 @@ public class ChunkStore {
             FsyncSupport.fsyncDirectory(chunkDir);
             indexRemove(chunkId);
             knownBad.remove(chunkId);
-            ibr.deleted(chunkId);
+            changes.deleted(chunkId);
             return removed;
         } catch (IOException e) {
             throw new UncheckedIOException("could not delete chunk " + chunkId, e);
@@ -297,12 +298,12 @@ public class ChunkStore {
     }
 
     /** The chunk's data failed verification: remember it, and report it the first time. */
-    boolean markBad(String chunkId, String by) {
+    public boolean markBad(String chunkId, String by) {
         if (knownBad.add(chunkId)) {
             if (!"scanner".equals(by)) {          // the scanner logs its own [scanner] CORRUPT line
                 log.warn("[store] chunk={} failed verification ({}); reported bad", chunkId, by);
             }
-            ibr.bad(chunkId);
+            changes.bad(chunkId);
             return true;
         }
         return false;
@@ -365,6 +366,18 @@ public class ChunkStore {
                 knownBad.contains(chunkId) ? UNVERIFIED : entry.checksum())));
         chunks.sort(Comparator.comparing(ChunkInfo::chunkId));
         return chunks;
+    }
+
+    /**
+     * The listing for a full report: every indexed chunk with its size, sidecar checksum and
+     * whether it is known bad, sorted by id. From memory only.
+     */
+    public List<ReportEntry> reportEntries() {
+        List<ReportEntry> entries = new ArrayList<>(index.size());
+        index.forEach((chunkId, entry) -> entries.add(
+                new ReportEntry(chunkId, entry.size(), entry.checksum(), knownBad.contains(chunkId))));
+        entries.sort(Comparator.comparing(ReportEntry::chunkId));
+        return entries;
     }
 
     /** Ids of all indexed chunks, in no particular order. */
@@ -436,7 +449,7 @@ public class ChunkStore {
                     FsyncSupport.fsyncDirectory(chunkDir);
                 }
                 indexPut(chunkId, new Entry(meta.get().size(), meta.get().checksum()));
-                ibr.received(new ChunkInfo(chunkId, meta.get().size(), meta.get().checksum()));
+                changes.received(chunkId, meta.get().size(), meta.get().checksum());
                 added++;
                 log.warn("[scanner] chunk={} appeared on disk; added to the index", chunkId);
             } catch (IOException e) {
@@ -457,7 +470,7 @@ public class ChunkStore {
                 }
                 indexRemove(chunkId);
                 knownBad.remove(chunkId);
-                ibr.deleted(chunkId);
+                changes.deleted(chunkId);
                 removed++;
                 log.warn("[scanner] chunk={} is gone from the disk; removed from the index", chunkId);
             } finally {

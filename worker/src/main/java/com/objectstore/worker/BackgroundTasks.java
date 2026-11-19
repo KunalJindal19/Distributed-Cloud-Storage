@@ -1,8 +1,7 @@
 package com.objectstore.worker;
 
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.worker.reporting.Lifeline;
-import com.objectstore.worker.reporting.Reporter;
+import com.objectstore.worker.reporting.ControllerLink;
 import com.objectstore.worker.storage.BlockScanner;
 import com.objectstore.worker.storage.DiskCheck;
 import com.objectstore.worker.storage.VersionFile;
@@ -16,9 +15,9 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 /**
- * Starts the worker's background loops once the HTTP server accepts requests: the reporter
- * (which registers first), the heartbeat lifeline, the block scanner and the disk check. A worker
- * whose volume belongs to another worker starts none of them.
+ * Starts the worker's background loops once the HTTP server accepts requests: the controller
+ * link (registration, heartbeats with the change stream, full-report segments), the block scanner
+ * and the disk check. A worker whose volume belongs to another worker starts none of them.
  */
 @Component
 public class BackgroundTasks {
@@ -27,18 +26,16 @@ public class BackgroundTasks {
 
     private final WorkerProperties properties;
     private final VersionFile version;
-    private final Reporter reporter;
-    private final Lifeline lifeline;
+    private final ControllerLink link;
     private final BlockScanner scanner;
     private final DiskCheck diskCheck;
     private final List<Thread> threads = new ArrayList<>();
 
-    public BackgroundTasks(WorkerProperties properties, VersionFile version, Reporter reporter, Lifeline lifeline,
+    public BackgroundTasks(WorkerProperties properties, VersionFile version, ControllerLink link,
                            BlockScanner scanner, DiskCheck diskCheck) {
         this.properties = properties;
         this.version = version;
-        this.reporter = reporter;
-        this.lifeline = lifeline;
+        this.link = link;
         this.scanner = scanner;
         this.diskCheck = diskCheck;
     }
@@ -52,8 +49,7 @@ public class BackgroundTasks {
             log.error("[worker] CRITICAL not joining the cluster: the volume belongs to another worker");
             return;
         }
-        threads.add(Thread.ofPlatform().name("reporter").daemon(true).start(reporter));
-        threads.add(Thread.ofPlatform().name("lifeline").daemon(true).start(lifeline));
+        threads.add(Thread.ofPlatform().name("link").daemon(true).start(link));
         threads.add(Thread.ofPlatform().name("block-scanner").daemon(true).start(scanner));
         threads.add(Thread.ofPlatform().name("disk-check").daemon(true).start(diskCheck));
     }

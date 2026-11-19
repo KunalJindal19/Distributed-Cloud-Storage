@@ -5,12 +5,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.objectstore.common.InternalApi;
-import com.objectstore.common.dto.BlockReportRequest;
-import com.objectstore.common.dto.ChunkInfo;
+import com.objectstore.common.dto.ReportEntry;
 import com.objectstore.common.dto.HeartbeatRequest;
 import com.objectstore.common.dto.HeartbeatResponse;
 import com.objectstore.common.dto.RegisterRequest;
-import com.objectstore.common.dto.ReportResponse;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerState;
@@ -29,30 +27,22 @@ class ProtocolTest {
     }
 
     @Test
-    void reportsAreAcceptedInOrderOnceAndOldOrForeignOnesAreRejectedWithoutEffect() {
+    void heartbeatsFromAnotherProcessOrSentLongAgoAreRejectedWithoutEffect() {
         t.knowChunk(chunk(0));
-        t.knowChunk(chunk(1));
-        String boot = t.register("worker1");
-        BlockReportRequest first = new BlockReportRequest("worker1", boot, 5, InternalApi.nowSeconds(),
-                List.of(new ChunkInfo(chunk(0), 10, TestSupport.SUM)));
-        assertThat(t.reports.fullReport(first).ignored()).isNull();
+        String boot = t.join("worker1");
+        java.util.List<com.objectstore.common.dto.Change> changes = java.util.List.of(
+                new com.objectstore.common.dto.Change(1, com.objectstore.common.dto.ChangeType.RECEIVED, chunk(0), 10L,
+                        TestSupport.SUM, null, null, null));
 
-        // The same seq again: a retry after a lost response. Acknowledged, nothing applied.
-        BlockReportRequest retry = new BlockReportRequest("worker1", boot, 5, InternalApi.nowSeconds(),
-                List.of(new ChunkInfo(chunk(1), 10, TestSupport.SUM)));
-        ReportResponse response = t.reports.fullReport(retry);
-        assertThat(response.ignored()).isEqualTo("duplicate");
-        assertThat(cluster.locked(() -> cluster.chunksOn("worker1"))).containsExactly(chunk(0));
+        assertCode(() -> t.registry.heartbeat(new HeartbeatRequest("worker1", "other-boot", 5, InternalApi.nowSeconds(),
+                TestSupport.STATS, changes, null)), 409, "stale_boot");
+        assertCode(() -> t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 5, InternalApi.nowSeconds() - 20,
+                TestSupport.STATS, changes, null)), 409, "too_old");
 
-        // A delayed older report, a report from another process, a report sent long ago.
-        assertCode(() -> t.reports.fullReport(new BlockReportRequest("worker1", boot, 4, InternalApi.nowSeconds(), List.of())),
-                409, "stale_seq");
-        assertCode(() -> t.reports.fullReport(new BlockReportRequest("worker1", "other-boot", 6, InternalApi.nowSeconds(), List.of())),
-                409, "stale_boot");
-        assertCode(() -> t.reports.fullReport(new BlockReportRequest("worker1", boot, 6, InternalApi.nowSeconds() - 20, List.of())),
-                409, "too_old");
-        assertThat(cluster.locked(() -> cluster.chunksOn("worker1"))).containsExactly(chunk(0));
-        assertThat(cluster.locked(() -> cluster.worker("worker1").lastReportSeq)).isEqualTo(5);
+        cluster.locked(() -> {
+            assertThat(cluster.chunksOn("worker1")).isEmpty();
+            assertThat(cluster.worker("worker1").received).isZero();
+        });
     }
 
     @Test
@@ -94,7 +84,7 @@ class ProtocolTest {
     @Test
     void aWorkerFromAnotherClusterIsRefused() {
         assertCode(() -> t.registry.register(new RegisterRequest("worker1", "http://w:1", "boot", "other-cluster",
-                -1, -1, InternalApi.nowSeconds(), TestSupport.STATS)), 409, "cluster_id_mismatch");
+                1, 0, -1, InternalApi.nowSeconds(), TestSupport.STATS)), 409, "cluster_id_mismatch");
         assertThat(cluster.locked(() -> cluster.workers())).isEmpty();
     }
 
@@ -116,13 +106,13 @@ class ProtocolTest {
         assertThat(cluster.locked(() -> cluster.worker("worker1").state)).isEqualTo(WorkerState.STALE);
         assertThat(cluster.locked(() -> cluster.live(chunk(0)))).containsExactly("worker1"); // still counts
 
-        t.heartbeat("worker1", boot, 0);
+        t.send("worker1", List.of(), null);
         assertThat(cluster.locked(() -> cluster.worker("worker1").state)).isEqualTo(WorkerState.ALIVE);
 
         tickHealth(500); // silent for > DEAD_AFTER (0.4 s)
         assertThat(cluster.locked(() -> cluster.worker("worker1").state)).isEqualTo(WorkerState.DEAD);
         assertThat(cluster.locked(() -> cluster.replicasOf(chunk(0)))).isEmpty();
-        assertCode(() -> t.heartbeat("worker1", boot, 1), 404, "unknown_worker");
+        assertCode(() -> t.send("worker1", List.of(), null), 404, "unknown_worker");
         assertThat(cluster.locked(cluster::checkInvariants)).isEmpty();
     }
 
@@ -147,26 +137,27 @@ class ProtocolTest {
         String boot = t.join("worker1", chunk(0), chunk(1));
 
         // chunk 1 is gone from the disk; chunk 2 appeared; chunk 0 now has a wrong checksum.
-        t.reports.fullReport(new BlockReportRequest("worker1", boot, t.nextSeq("worker1"), InternalApi.nowSeconds(), List.of(
-                new ChunkInfo(chunk(0), 10, "b".repeat(64)),
-                new ChunkInfo(chunk(2), 10, TestSupport.SUM))));
+        t.report("worker1", List.of(
+                new ReportEntry(chunk(0), 10, "b".repeat(64), false),
+                new ReportEntry(chunk(2), 10, TestSupport.SUM, false)));
 
         cluster.locked(() -> {
             assertThat(cluster.chunksOn("worker1")).containsExactlyInAnyOrder(chunk(0), chunk(2));
             assertThat(cluster.replica(chunk(0), "worker1").state).isEqualTo(ReplicaState.CORRUPT);
-            assertThat(cluster.replica(chunk(2), "worker1").confirmed).isTrue();
+            assertThat(cluster.worker("worker1").hasReported).isTrue();
+            assertThat(cluster.worker("worker1").session).isNull();
         });
+        t.assertNoViolations();
     }
 
     @Test
-    void anUnconfirmedRecentCopyIsKeptWhenAReportDoesNotMentionIt() {
+    void edge19_aReportEntryMarkedBadMakesTheCopyCorrupt() {
         t.knowChunk(chunk(0));
-        String boot = t.join("worker1");
-        cluster.locked(() -> cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, null));
+        t.join("worker1", chunk(0));
 
-        t.fullReport("worker1", boot); // snapshot taken before the upload's copy landed
+        t.report("worker1", List.of(new ReportEntry(chunk(0), 10, TestSupport.SUM, true)));
 
-        assertThat(cluster.locked(() -> cluster.replica(chunk(0), "worker1"))).isNotNull();
+        assertThat(cluster.locked(() -> cluster.replica(chunk(0), "worker1").state)).isEqualTo(ReplicaState.CORRUPT);
     }
 
     @Test
@@ -176,8 +167,8 @@ class ProtocolTest {
         assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands)).isEmpty();
 
         Thread.sleep(350);
-        delayed.fullReport("worker1", boot, chunk(7));
-        assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
+        // Completion queues the DELETE; the same heartbeat's reply hands it over.
+        assertThat(delayed.fullReport("worker1", boot, chunk(7)).commands())
                 .singleElement().satisfies(c -> assertThat(c.reason()).isEqualTo("orphan"));
 
         String[] many = java.util.stream.IntStream.range(10, 30).mapToObj(TestSupport::chunk).toArray(String[]::new);
@@ -197,17 +188,18 @@ class ProtocolTest {
                         java.util.stream.IntStream.range(0, 20).mapToObj(i -> "%s-%05d".formatted(unknown, i)))
                 .toArray(String[]::new);
 
-        delayed.join("worker1", reported);
+        delayed.register("worker1");
+        HeartbeatResponse reply = delayed.fullReport("worker1", delayed.fake("worker1").boot, reported);
 
         // All 10 known-garbage chunks are deleted; the 20 unaccountable ones (2/3 > 1/2) trip the valve.
-        assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
+        assertThat(reply.commands())
                 .hasSize(10)
                 .allSatisfy(c -> assertThat(c.chunkId()).startsWith(failedUpload));
         assertThat(delayed.cluster.counter("orphan_gc_refused")).isEqualTo(1);
     }
 
     @Test
-    void incrementalReportsAddDeleteAndFlagCopies() {
+    void changesAddDeleteAndFlagCopies() {
         t.knowChunk(chunk(0));
         t.knowChunk(chunk(1));
         String boot = t.join("worker1", chunk(0));

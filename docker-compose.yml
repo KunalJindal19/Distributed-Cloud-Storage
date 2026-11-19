@@ -43,11 +43,14 @@ x-worker-environment: &worker-environment
   CONTROLLER_URL: http://controller:8000
   DATA_DIR: /data
   CHUNK_SIZE: "1048576"
-  HEARTBEAT_INTERVAL: "2"          # lifeline period (s)
+  HEARTBEAT_INTERVAL: "2"          # heartbeat period (s); sooner when changes are waiting
+  HEARTBEAT_MIN_GAP_MS: "250"      # earliest next heartbeat when changes or report segments wait
   HEARTBEAT_HTTP_TIMEOUT: "3"      # must stay below STALE_AFTER
-  FULL_REPORT_INTERVAL: "30"       # full block report period (s)
-  IBR_INTERVAL: "0.5"              # incremental block report flush period (s)
-  IBR_BUFFER_MAX: "10000"          # on overflow: drop the buffer, send a full report
+  FULL_REPORT_INTERVAL: "30"       # full report period (s); sent in segments on heartbeats
+  CHANGE_LOG_MAX: "10000"          # un-acknowledged changes kept; overflow -> full report
+  MAX_CHANGES_PER_MESSAGE: "2000"  # changes per heartbeat
+  MAX_CHANGES_PER_PUT_ANSWER: "256" # changes per answer to a controller's chunk PUT
+  REPORT_SEGMENT_SIZE: "2000"      # entries per full-report segment
   SCAN_INTERVAL: "10"              # block scanner: at most one pass per this many seconds
   SCAN_MAX_BYTES_PER_SEC: "33554432" # block scanner read rate limit (32 MiB/s)
   DISK_CHECK_INTERVAL: "30"        # volume probe period (s)
