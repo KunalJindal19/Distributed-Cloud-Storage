@@ -177,7 +177,6 @@ public class Reporter implements Runnable {
                 sentAt -> new BlockReportRequest(message.workerId(), message.bootId(), message.seq(), sentAt, message.chunks()));
         if (acked) {
             lastFullReportNanos = System.nanoTime();
-            scanner.afterFullReport();
             log.info("[report] full report seq={} chunks={}", message.seq(), message.chunks().size());
         }
     }

@@ -18,9 +18,14 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,12 +42,21 @@ import org.springframework.stereotype.Component;
  *       to the device and renamed; the directory is forced afterwards. A crash never leaves a
  *       half-written file under a chunk id, and a 201 means the bytes are on the platter.</li>
  *   <li><b>No silent corruption on write.</b> The bytes are hashed and compared with the checksum
- *       the sender declared before anything touches the disk.</li>
+ *       the sender declared before anything touches the disk. Writing a chunk that already
+ *       exists verifies the stored data; rotten data is replaced by the new, verified bytes.</li>
  *   <li><b>No corruption served.</b> A read re-hashes the data and compares it with the sidecar.</li>
  *   <li><b>No path traversal.</b> Only ids matching the strict chunk id pattern are resolved.</li>
  * </ul>
  *
- * Every change is reported to the {@link IbrBuffer}, so the controller learns about it in the
+ * <p><b>The in-memory index.</b> Every chunk on disk is in {@link #index} with its size and
+ * sidecar checksum, plus running totals, so statistics are O(1) and listing needs no disk walk.
+ * The index is built in {@link #initialise()} (the only full walk at start-up) and changed only
+ * under the chunk's stripe lock, in this order: the disk operation, its fsync, the index, then
+ * the change event. The block scanner reconciles the index with the directory for files added or
+ * removed behind the store's back. {@link #knownBad} holds the chunks whose data failed
+ * verification in this process.
+ *
+ * <p>Every change is reported to the {@link IbrBuffer}, so the controller learns about it in the
  * next incremental block report.
  */
 @Component
@@ -53,13 +67,12 @@ public class ChunkStore {
     private static final String TMP_SUFFIX = ".tmp";
     private static final long WRITE_HEADROOM = 1_048_576;
     private static final int LOCK_STRIPES = 64;
+    /** A file modified more recently than this may be a write in progress: reconciliation leaves it alone. */
+    public static final java.time.Duration SETTLE_TIME = java.time.Duration.ofSeconds(5);
     /**
-     * A data file without a valid sidecar is normally a write in progress (the data is renamed
-     * into place a moment before its sidecar). One that has been like that for longer than this
-     * is damaged or foreign, and is reported with {@link #UNVERIFIED} as its checksum.
+     * The checksum listed for a chunk whose data failed verification ({@link #knownBad}): it
+     * matches nothing, so the controller treats the copy as corrupt.
      */
-    static final java.time.Duration SETTLE_TIME = java.time.Duration.ofSeconds(5);
-    /** The checksum reported for a chunk whose sidecar is missing or unreadable; matches nothing. */
     public static final String UNVERIFIED = "unverified";
 
     public enum WriteResult { CREATED, EXISTS }
@@ -69,6 +82,18 @@ public class ChunkStore {
     }
 
     public record Meta(String checksum, long size) {
+    }
+
+    /** One chunk in the index: its size and the checksum from its sidecar. */
+    public record Entry(long size, String checksum) {
+    }
+
+    /** What one reconciliation of the index with the directory changed. */
+    public record Reconciled(int added, int removed) {
+
+        public boolean isEmpty() {
+            return added + removed == 0;
+        }
     }
 
     public static class InvalidChunkIdException extends RuntimeException {
@@ -98,6 +123,10 @@ public class ChunkStore {
     private final Path chunkDir;
     private final IbrBuffer ibr;
     private final ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
+    private final ConcurrentHashMap<String, Entry> index = new ConcurrentHashMap<>();
+    private final AtomicLong chunkCount = new AtomicLong();
+    private final AtomicLong usedBytes = new AtomicLong();
+    private final Set<String> knownBad = ConcurrentHashMap.newKeySet();
 
     public ChunkStore(WorkerProperties properties, IbrBuffer ibr) {
         this.chunkDir = properties.chunkDir().toAbsolutePath().normalize();
@@ -108,9 +137,9 @@ public class ChunkStore {
     }
 
     /**
-     * Start-up cleanup: remove temporary files left by a crash, rebuild a missing or unreadable
-     * sidecar from the data (the data was verified before it was renamed into place), and drop
-     * sidecars whose data is gone.
+     * Start-up: one walk of the chunk directory that removes temporary files left by a crash,
+     * rebuilds a missing or unreadable sidecar from the data (the data was verified before it was
+     * renamed into place), drops sidecars whose data is gone, and fills the index.
      */
     @PostConstruct
     void initialise() throws IOException {
@@ -130,10 +159,15 @@ public class ChunkStore {
                         Files.deleteIfExists(file);
                         strayMeta++;
                     }
-                } else if (ChunkIds.isValid(name) && readMeta(name).isEmpty()) {
-                    byte[] data = Files.readAllBytes(file);
-                    writeMeta(name, new Meta(Checksums.sha256Hex(data), data.length));
-                    rebuilt++;
+                } else if (ChunkIds.isValid(name)) {
+                    Optional<Meta> meta = readMeta(name);
+                    if (meta.isEmpty()) {
+                        byte[] data = Files.readAllBytes(file);
+                        meta = Optional.of(new Meta(Checksums.sha256Hex(data), data.length));
+                        writeMeta(name, meta.get());
+                        rebuilt++;
+                    }
+                    indexPut(name, new Entry(meta.get().size(), meta.get().checksum()));
                 }
             }
         }
@@ -142,11 +176,16 @@ public class ChunkStore {
             log.warn("[store] start-up cleanup: {} temporary files removed, {} sidecars rebuilt, {} stray sidecars removed",
                     tmp, rebuilt, strayMeta);
         }
-        log.info("[store] chunk directory {} ready with {} chunks", chunkDir, list().size());
+        log.info("[store] chunk directory {} ready with {} chunks ({} bytes)", chunkDir, chunkCount.get(), usedBytes.get());
     }
 
+    // ---- writes, reads, deletes ------------------------------------------------------------
+
     /**
-     * Stores a chunk. Idempotent: writing identical content again reports {@link WriteResult#EXISTS}.
+     * Stores a chunk. Idempotent: writing identical content again verifies the stored data and
+     * reports {@link WriteResult#EXISTS} (the chunk is announced again). If the stored data no
+     * longer matches its sidecar it is rotten: it is replaced by the new, verified bytes and
+     * {@link WriteResult#CREATED} is reported.
      *
      * @throws InvalidChunkIdException      if the id is not a well-formed chunk id
      * @throws InsufficientStorageException if the volume lacks room for the chunk plus headroom
@@ -168,24 +207,29 @@ public class ChunkStore {
         try {
             if (Files.exists(target)) {
                 Optional<Meta> meta = readMeta(chunkId);
-                String existing = meta.map(Meta::checksum).orElseGet(() -> hashFile(target));
-                if (existing.equals(expectedChecksum)) {
+                if (meta.isPresent() && !meta.get().checksum().equals(expectedChecksum)) {
+                    throw new ChunkConflictException(chunkId);
+                }
+                String stored = hashFile(target);
+                if (stored.equals(expectedChecksum)) {
                     if (meta.isEmpty()) {
                         writeMeta(chunkId, new Meta(actual, data.length));
+                        FsyncSupport.fsyncDirectory(chunkDir);
                     }
+                    indexPut(chunkId, new Entry(data.length, actual));
+                    knownBad.remove(chunkId);
+                    ibr.received(new ChunkInfo(chunkId, data.length, actual)); // re-announced
                     return WriteResult.EXISTS;
                 }
-                throw new ChunkConflictException(chunkId);
+                if (meta.isEmpty()) {
+                    throw new ChunkConflictException(chunkId); // no sidecar: rotten or different, unknowable
+                }
+                log.warn("[store] chunk={} stored data is rotten (disk={}); replacing it with the verified bytes",
+                        chunkId, stored);
             }
-            Path tmp = chunkDir.resolve(chunkId + "." + UUID.randomUUID() + TMP_SUFFIX);
-            try {
-                FsyncSupport.writeAndForce(tmp, data);
-                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
-            } finally {
-                Files.deleteIfExists(tmp);
-            }
-            writeMeta(chunkId, new Meta(actual, data.length));
-            FsyncSupport.fsyncDirectory(chunkDir);
+            writeNew(chunkId, target, data, actual);
+            indexPut(chunkId, new Entry(data.length, actual));
+            knownBad.remove(chunkId);
             ibr.received(new ChunkInfo(chunkId, data.length, actual));
             return WriteResult.CREATED;
         } catch (IOException e) {
@@ -195,9 +239,23 @@ public class ChunkStore {
         }
     }
 
+    /** The normal write path: unique temporary file, fsync, atomic rename, sidecar, directory fsync. */
+    private void writeNew(String chunkId, Path target, byte[] data, String checksum) throws IOException {
+        Path tmp = chunkDir.resolve(chunkId + "." + UUID.randomUUID() + TMP_SUFFIX);
+        try {
+            FsyncSupport.writeAndForce(tmp, data);
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+        writeMeta(chunkId, new Meta(checksum, data.length));
+        FsyncSupport.fsyncDirectory(chunkDir);
+    }
+
     /**
      * Reads a chunk and verifies it against its sidecar. A mismatch is returned as
-     * {@code corrupt = true} and reported; the bytes are never served.
+     * {@code corrupt = true}, the chunk joins {@link #knownBad} and is reported once; the bytes are
+     * never served.
      */
     public Optional<StoredChunk> read(String chunkId) {
         Path target = pathFor(chunkId);
@@ -212,7 +270,7 @@ public class ChunkStore {
         String actual = Checksums.sha256Hex(data);
         Optional<Meta> meta = readMeta(chunkId);
         if (meta.isEmpty() || !meta.get().checksum().equals(actual) || meta.get().size() != data.length) {
-            ibr.bad(chunkId);
+            markBad(chunkId, "read");
             return Optional.of(new StoredChunk(data, meta.map(Meta::checksum).orElse(actual), true));
         }
         return Optional.of(new StoredChunk(data, actual, false));
@@ -227,6 +285,8 @@ public class ChunkStore {
             boolean removed = Files.deleteIfExists(target);
             Files.deleteIfExists(metaPath(chunkId));
             FsyncSupport.fsyncDirectory(chunkDir);
+            indexRemove(chunkId);
+            knownBad.remove(chunkId);
             ibr.deleted(chunkId);
             return removed;
         } catch (IOException e) {
@@ -234,6 +294,27 @@ public class ChunkStore {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** The chunk's data failed verification: remember it, and report it the first time. */
+    boolean markBad(String chunkId, String by) {
+        if (knownBad.add(chunkId)) {
+            if (!"scanner".equals(by)) {          // the scanner logs its own [scanner] CORRUPT line
+                log.warn("[store] chunk={} failed verification ({}); reported bad", chunkId, by);
+            }
+            ibr.bad(chunkId);
+            return true;
+        }
+        return false;
+    }
+
+    /** The chunk's data verified again (the file was replaced): no longer known bad. */
+    boolean clearBad(String chunkId) {
+        return knownBad.remove(chunkId);
+    }
+
+    public boolean isKnownBad(String chunkId) {
+        return knownBad.contains(chunkId);
     }
 
     public Optional<Meta> readMeta(String chunkId) {
@@ -249,47 +330,52 @@ public class ChunkStore {
         }
     }
 
+    // ---- the index ---------------------------------------------------------------------------
+
+    private void indexPut(String chunkId, Entry entry) {
+        Entry old = index.put(chunkId, entry);
+        if (old == null) {
+            chunkCount.incrementAndGet();
+            usedBytes.addAndGet(entry.size());
+        } else {
+            usedBytes.addAndGet(entry.size() - old.size());
+        }
+    }
+
+    private void indexRemove(String chunkId) {
+        Entry old = index.remove(chunkId);
+        if (old != null) {
+            chunkCount.decrementAndGet();
+            usedBytes.addAndGet(-old.size());
+        }
+    }
+
+    /** The index, read-only. */
+    public Map<String, Entry> index() {
+        return java.util.Collections.unmodifiableMap(index);
+    }
+
     /**
-     * Every chunk on disk with the size and checksum from its sidecar. Cheap: no data is read. A
-     * settled data file without a valid sidecar is listed with checksum {@link #UNVERIFIED}, so
-     * the controller treats it as a corrupt copy (if it knows the chunk) or an orphan (if not).
+     * Every chunk with its size and sidecar checksum, from the index (no disk access), sorted by
+     * id. A chunk in {@link #knownBad} is listed with {@link #UNVERIFIED} as its checksum.
      */
     public List<ChunkInfo> list() {
-        List<ChunkInfo> chunks = new ArrayList<>();
-        for (String chunkId : chunkIds()) {
-            Optional<Meta> meta = readMeta(chunkId);
-            if (meta.isPresent()) {
-                chunks.add(new ChunkInfo(chunkId, meta.get().size(), meta.get().checksum()));
-            } else if (isSettled(chunkId)) {
-                chunks.add(new ChunkInfo(chunkId, sizeOf(chunkId), UNVERIFIED));
-            }
-        }
+        List<ChunkInfo> chunks = new ArrayList<>(index.size());
+        index.forEach((chunkId, entry) -> chunks.add(new ChunkInfo(chunkId, entry.size(),
+                knownBad.contains(chunkId) ? UNVERIFIED : entry.checksum())));
         chunks.sort(Comparator.comparing(ChunkInfo::chunkId));
         return chunks;
     }
 
-    /** True if the data file has not been modified for {@link #SETTLE_TIME}. */
-    public boolean isSettled(String chunkId) {
-        try {
-            long modified = Files.getLastModifiedTime(pathFor(chunkId)).toMillis();
-            return System.currentTimeMillis() - modified > SETTLE_TIME.toMillis();
-        } catch (IOException e) {
-            return false;
-        }
+    /** Ids of all indexed chunks, in no particular order. */
+    public List<String> chunkIds() {
+        return new ArrayList<>(index.keySet());
     }
 
-    private long sizeOf(String chunkId) {
-        try {
-            return Files.size(pathFor(chunkId));
-        } catch (IOException e) {
-            return -1;
-        }
-    }
-
-    /** Every chunk with its checksum recomputed from the data right now. Used by fsck. */
+    /** Every chunk with its checksum recomputed from the data right now (a disk walk). Used by fsck. */
     public List<ChunkInfo> listVerified() {
         List<ChunkInfo> chunks = new ArrayList<>();
-        for (String chunkId : chunkIds()) {
+        for (String chunkId : chunkIdsOnDisk()) {
             try {
                 byte[] data = Files.readAllBytes(chunkDir.resolve(chunkId));
                 chunks.add(new ChunkInfo(chunkId, data.length, Checksums.sha256Hex(data)));
@@ -303,9 +389,9 @@ public class ChunkStore {
         return chunks;
     }
 
-    /** Ids of all data files on disk, in no particular order. */
-    public List<String> chunkIds() {
-        List<String> ids = new ArrayList<>();
+    /** Names of the data files in the chunk directory (names only: no file is opened). */
+    Set<String> chunkIdsOnDisk() {
+        Set<String> ids = new HashSet<>();
         try (DirectoryStream<Path> files = Files.newDirectoryStream(chunkDir)) {
             for (Path file : files) {
                 String name = file.getFileName().toString();
@@ -319,23 +405,111 @@ public class ChunkStore {
         return ids;
     }
 
-    /** Hashes the data of one chunk from disk; empty if it is gone. */
-    public Optional<String> hashOnDisk(String chunkId) {
-        Path target = pathFor(chunkId);
-        if (!Files.exists(target)) {
-            return Optional.empty();
+    /**
+     * Brings the index in line with the directory (the scanner's first step). A valid chunk file
+     * that is not in the index (copied in by hand) is added, its sidecar rebuilt from the data if
+     * missing, and reported {@code received}; an indexed chunk whose data file is gone (deleted by
+     * hand) is removed and reported {@code deleted}. Each is re-checked under its stripe lock.
+     * Files modified within {@link #SETTLE_TIME} are skipped: they may be writes in progress.
+     */
+    public Reconciled reconcile() {
+        Set<String> onDisk = chunkIdsOnDisk();
+        long settledBefore = System.currentTimeMillis() - SETTLE_TIME.toMillis();
+        int added = 0;
+        int removed = 0;
+        for (String chunkId : onDisk) {
+            if (index.containsKey(chunkId) || !isSettled(chunkId, settledBefore)) {
+                continue;
+            }
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                Path file = chunkDir.resolve(chunkId);
+                if (index.containsKey(chunkId) || !Files.exists(file)) {
+                    continue;
+                }
+                Optional<Meta> meta = readMeta(chunkId);
+                if (meta.isEmpty()) {
+                    byte[] data = Files.readAllBytes(file);
+                    meta = Optional.of(new Meta(Checksums.sha256Hex(data), data.length));
+                    writeMeta(chunkId, meta.get());
+                    FsyncSupport.fsyncDirectory(chunkDir);
+                }
+                indexPut(chunkId, new Entry(meta.get().size(), meta.get().checksum()));
+                ibr.received(new ChunkInfo(chunkId, meta.get().size(), meta.get().checksum()));
+                added++;
+                log.warn("[scanner] chunk={} appeared on disk; added to the index", chunkId);
+            } catch (IOException e) {
+                log.warn("[scanner] chunk={} could not be added to the index: {}", chunkId, e.toString());
+            } finally {
+                lock.unlock();
+            }
         }
-        return Optional.of(hashFile(target));
+        for (String chunkId : chunkIds()) {
+            if (onDisk.contains(chunkId)) {
+                continue;
+            }
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                if (!index.containsKey(chunkId) || Files.exists(chunkDir.resolve(chunkId))) {
+                    continue;
+                }
+                indexRemove(chunkId);
+                knownBad.remove(chunkId);
+                ibr.deleted(chunkId);
+                removed++;
+                log.warn("[scanner] chunk={} is gone from the disk; removed from the index", chunkId);
+            } finally {
+                lock.unlock();
+            }
+        }
+        return new Reconciled(added, removed);
     }
 
-    public WorkerStats stats(int activeTransfers) {
-        long used = 0;
-        long count = 0;
-        for (ChunkInfo chunk : list()) {
-            used += chunk.size();
-            count++;
+    private boolean isSettled(String chunkId, long settledBefore) {
+        try {
+            return Files.getLastModifiedTime(chunkDir.resolve(chunkId)).toMillis() < settledBefore;
+        } catch (IOException gone) {
+            return false;
         }
-        return new WorkerStats(count, used, freeBytes(), activeTransfers);
+    }
+
+    /**
+     * Verifies one chunk's data against its sidecar on disk (the scanner's second step).
+     *
+     * @return true if it matches; false if it does not (or its sidecar is missing or invalid);
+     *         empty if the chunk is gone
+     */
+    public Optional<Boolean> verify(String chunkId) {
+        Path file = pathFor(chunkId);
+        try {
+            String actual = Checksums.sha256Hex(file);
+            Optional<Meta> meta = readMeta(chunkId);
+            return Optional.of(meta.isPresent() && meta.get().checksum().equals(actual)
+                    && meta.get().size() == Files.size(file));
+        } catch (NoSuchFileException gone) {
+            return Optional.empty();
+        } catch (IOException e) {
+            log.warn("[scanner] chunk={} could not be read: {}", chunkId, e.toString());
+            return Optional.of(false);
+        }
+    }
+
+    /** Re-verifies a chunk under its stripe lock (so a write in progress cannot look like damage). */
+    public Optional<Boolean> verifyLocked(String chunkId) {
+        ReentrantLock lock = lockFor(chunkId);
+        lock.lock();
+        try {
+            return verify(chunkId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** O(1): the index's running totals and the volume's free space. Never walks the disk. */
+    public WorkerStats stats(int activeTransfers) {
+        return new WorkerStats(chunkCount.get(), usedBytes.get(), freeBytes(), activeTransfers);
     }
 
     public long freeBytes() {
