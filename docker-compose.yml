@@ -92,6 +92,10 @@ services:
       MIN_FREE_BYTES: "16777216"
       FULL_REPORT_INTERVAL: "30"     # as configured on the workers
       INVARIANT_CHECKS: "1"
+      MAX_LOCK_HOLD_MS: "5"          # longest continuous write-lock hold by the writer before it yields
+      APPLY_QUEUE_CAPACITY: "10000"  # tasks; when full, worker changes are not acknowledged
+      UPLOAD_COMMIT_WAIT: "10"       # an upload or delete waits this long for its task, then answers anyway
+      DOWNLOAD_SETTLE_WAIT: "5"      # a download waits this long for a just-committed chunk
     volumes:
       - controller_data:/data
     healthcheck:

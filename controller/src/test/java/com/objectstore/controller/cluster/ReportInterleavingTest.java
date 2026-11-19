@@ -157,6 +157,7 @@ class ReportInterleavingTest {
             }
         }
         heartbeat(t, w, boot, List.of(), new ReportSegment("stale", 0, true, 0, stale), true);
+        t.sync();
 
         // Phase A: changes before the report, partly delivered (with losses).
         for (int step = random.nextInt(12); step > 0; step--) {
@@ -187,8 +188,9 @@ class ReportInterleavingTest {
                 deliver(random, t, w, boot);
             }
         }
-        // One clean heartbeat at the end (nothing pending).
+        // One clean heartbeat at the end (nothing pending), and everything applied.
         heartbeat(t, w, boot, w.suffix(w.acked, Integer.MAX_VALUE), null, true);
+        t.sync();
 
         // The block map for the worker equals the disk.
         cluster.locked(() -> {
@@ -226,6 +228,7 @@ class ReportInterleavingTest {
             if (random.nextInt(5) != 0) {                          // the answer may be lost
                 t.receipts.acceptPiggyback("worker1", boot, items);
             }
+            maybeApply(random, t);
             return;
         }
         List<Change> changes = w.suffix(w.acked, 1 + random.nextInt(4));
@@ -241,6 +244,14 @@ class ReportInterleavingTest {
             }
         } else {
             w.hbSeq++;
+        }
+        maybeApply(random, t);
+    }
+
+    /** The writer applies the queue at random moments, so acceptance and application interleave too. */
+    private static void maybeApply(Random random, TestSupport t) {
+        if (random.nextBoolean()) {
+            t.sync();
         }
     }
 

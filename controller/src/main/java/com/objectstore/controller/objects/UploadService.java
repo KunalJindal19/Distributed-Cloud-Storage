@@ -7,10 +7,12 @@ import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectResponse;
 import com.objectstore.common.dto.ChunkPutResponse;
 import com.objectstore.controller.cluster.ClusterState;
-import com.objectstore.controller.cluster.ClusterState.Receipt;
-import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
+import com.objectstore.controller.cluster.ApplyQueue;
+import com.objectstore.controller.cluster.NamespaceLock;
+import com.objectstore.controller.cluster.NamespaceTasks;
 import com.objectstore.controller.cluster.Receipts;
+import com.objectstore.controller.cluster.Task;
+import com.objectstore.controller.cluster.Writer;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.cluster.WorkerClient;
@@ -52,8 +54,9 @@ import org.springframework.web.multipart.MultipartFile;
  *   <li><b>All or nothing.</b> The namespace is written once, at the very end, in one durable
  *       transaction, and only after every chunk is fsynced on two workers. A 201 therefore
  *       survives a controller crash and the loss of any one worker. If the upload fails before
- *       that, nothing is recorded and every copy written so far is deleted (best effort; whatever
- *       is left is garbage, which the workers' streams and reports clean up).</li>
+ *       that, nothing is recorded and every copy written so far gets a DELETE command
+ *       ({@code EndUpload}); whatever is left is garbage, which the workers' streams and reports
+ *       clean up.</li>
  *   <li><b>Copies come from the workers.</b> A 2xx answer to a PUT never creates a replica by
  *       itself. The PUT carries {@code X-Change-Ack} and the answer usually carries the worker's
  *       {@code RECEIVED} for the chunk, which becomes an upload receipt; at commit a receipt
@@ -100,6 +103,11 @@ public class UploadService {
 
     private static final int MAX_KEY_LENGTH = 128;
 
+    /** Test hook: called with the object id and its target worker ids just before the commit. */
+    public static volatile java.util.function.BiConsumer<String, List<String>> beforeCommitForTests;
+    /** Test hook: called with the object id right after the SQLite insert, still under the namespace lock. */
+    public static volatile java.util.function.Consumer<String> afterInsertForTests;
+
     private final ControllerProperties properties;
     private final MetadataValidator metadataValidator;
     private final ClusterState cluster;
@@ -111,10 +119,15 @@ public class UploadService {
     private final ObjectViewAssembler views;
     private final Clock clock;
     private final Receipts receipts;
+    private final NamespaceLock namespaceLock;
+    private final NamespaceTasks namespaceTasks;
+    private final ApplyQueue queue;
+    private final Writer writer;
 
     public UploadService(ControllerProperties properties, MetadataValidator metadataValidator, ClusterState cluster,
                          SafeMode safeMode, PlacementPolicy placement, WorkerClient workers, WorkerIo io,
-                         ObjectRepository objects, ObjectViewAssembler views, Clock clock, Receipts receipts) {
+                         ObjectRepository objects, ObjectViewAssembler views, Clock clock, Receipts receipts,
+                         NamespaceLock namespaceLock, NamespaceTasks namespaceTasks, ApplyQueue queue, Writer writer) {
         this.properties = properties;
         this.metadataValidator = metadataValidator;
         this.cluster = cluster;
@@ -126,6 +139,10 @@ public class UploadService {
         this.views = views;
         this.clock = clock;
         this.receipts = receipts;
+        this.namespaceLock = namespaceLock;
+        this.namespaceTasks = namespaceTasks;
+        this.queue = queue;
+        this.writer = writer;
     }
 
     /**
@@ -134,7 +151,7 @@ public class UploadService {
      */
     public void checkWritable() {
         safeMode.requireWritable();
-        int eligible = cluster.locked(() -> placement.writeEligibleWorkers().size());
+        int eligible = cluster.read(() -> placement.writeEligibleWorkers().size());
         if (eligible < properties.replicationFactor()) {
             throw ApiException.unavailable(ErrorCodes.INSUFFICIENT_WORKERS,
                     "%d storage worker(s) can accept writes but %d are required to store an object"
@@ -186,7 +203,7 @@ public class UploadService {
         Set<String> exclude = ConcurrentHashMap.newKeySet();
         boolean committed = false;
 
-        cluster.locked(() -> cluster.beginUpload(objectId));
+        cluster.write(() -> cluster.beginUpload(objectId));
         // Durable before the first chunk is written: if this upload never commits (it fails, or
         // the controller crashes), its chunks are known garbage after any restart.
         objects.recordUploadIntent(objectId, clock.instant());
@@ -213,6 +230,11 @@ public class UploadService {
             Instant now = clock.instant();
             StoredObject object = new StoredObject(objectId, name, size, contentType, Checksums.hex(objectDigest),
                     stored.size(), now, now);
+            var beforeCommit = beforeCommitForTests;
+            if (beforeCommit != null) {
+                beforeCommit.accept(objectId, stored.stream().flatMap(c -> c.holders().stream()).map(Target::workerId)
+                        .distinct().toList());
+            }
             try {
                 commit(object, metadata, stored, idempotencyKey);
             } catch (LostIdempotencyRace race) {
@@ -234,70 +256,87 @@ public class UploadService {
             throw new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.BAD_REQUEST,
                     "the uploaded file could not be read completely", e);
         } finally {
-            boolean done = committed;
-            cluster.locked(() -> {
-                cluster.endUpload(objectId);
-                if (!done) {
-                    cluster.addGarbage(objectId);
-                }
-            });
             if (!committed) {
-                cleanUp(objectId, attempted);
+                endUpload(objectId, attempted);
             }
         }
     }
 
     /**
-     * Commits the namespace and records the copies, as one synchronous block under the cluster
-     * lock: the durable transaction first, then the in-memory mirror (v4 §5.6 step 5). For each
-     * target still in the epoch it was written in: a receipt becomes a replica (OK, or CORRUPT if
-     * the receipt's checksum differs) carrying the receipt's report mark; no receipt yet means an
-     * UPLOAD pending copy. A copy whose worker died or re-registered since is not recorded at all;
-     * the monitor repairs that chunk like any other under-replicated one.
+     * Commits the namespace (v4 §5.6 step 4): under the namespace lock, the idempotency check, the
+     * durable SQLite transaction and queuing {@code CommitObject}; then, with no lock held, a wait
+     * of at most UPLOAD_COMMIT_WAIT for the task. If the wait times out the object is still
+     * durable, so the upload answers 201 anyway (counted as {@code upload_commit_wait_timeouts});
+     * a download meanwhile waits for the mirror (DOWNLOAD_SETTLE_WAIT).
+     *
+     * <p>The task records the copies (§5.6 step 5): a receipt becomes a replica, a copy without one
+     * becomes an UPLOAD pending copy, a copy whose worker died or re-registered meanwhile is not
+     * recorded at all; never a replica just because the PUT answered 2xx.
      */
     private void commit(StoredObject object, Map<String, String> metadata, List<StoredChunk> stored, String idempotencyKey) {
-        cluster.locked(() -> {
-            // All commits run under the cluster lock, so this check and the insert cannot interleave
+        List<NamespaceTasks.CommittedChunk> chunks = stored.stream()
+                .map(entry -> new NamespaceTasks.CommittedChunk(entry.chunk(), entry.holders().stream()
+                        .map(t -> new NamespaceTasks.Target(t.workerId(), t.epoch())).toList()))
+                .toList();
+        Task task = namespaceTasks.commitObject(object.objectId(), chunks);
+        namespaceLock.lock();
+        try {
+            // Every commit holds the namespace lock, so this check and the insert cannot interleave
             // with another commit using the same key.
             if (idempotencyKey != null) {
                 objects.findIdempotent(idempotencyKey).ifPresent(winner -> {
                     throw new LostIdempotencyRace(winner);
                 });
             }
-            objects.insert(object, metadata, stored.stream().map(StoredChunk::chunk).toList(), idempotencyKey);
-            int refused = 0;
-            int awaited = 0;
-            for (StoredChunk entry : stored) {
-                Chunk chunk = entry.chunk();
-                cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(
-                        chunk.objectId(), chunk.index(), chunk.size(), chunk.checksum()));
-                for (Target holder : entry.holders()) {
-                    WorkerInfo worker = cluster.worker(holder.workerId());
-                    if (worker == null || worker.isDead() || worker.epoch != holder.epoch()) {
-                        refused++;
-                        continue;
-                    }
-                    Receipt receipt = cluster.removeReceipt(chunk.chunkId(), holder.workerId());
-                    if (receipt != null && receipt.epoch == worker.epoch) {
-                        boolean intact = chunk.checksum().equals(receipt.checksum) && chunk.size() == receipt.size;
-                        Replica replica = cluster.addReplica(chunk.chunkId(), holder.workerId(),
-                                intact ? ReplicaState.OK : ReplicaState.CORRUPT);
-                        replica.mark = receipt.seenInSession;
-                    } else {
-                        cluster.addUploadPending(chunk.chunkId(), holder.workerId());
-                        awaited++;
-                    }
-                }
+            try {
+                objects.insert(object, metadata, stored.stream().map(StoredChunk::chunk).toList(), idempotencyKey);
+            } catch (ObjectRepository.IdempotencyConflictException lost) {
+                throw new LostIdempotencyRace(objects.findIdempotent(idempotencyKey).orElseThrow());
             }
-            cluster.endUpload(object.objectId());
-            if (refused > 0) {
-                log.warn("[upload] object={}: {} copies not recorded because their worker died or re-registered meanwhile; "
-                        + "the monitor will re-replicate", object.objectId(), refused);
+            var afterInsert = afterInsertForTests;
+            if (afterInsert != null) {
+                afterInsert.accept(object.objectId());
             }
-            if (awaited > 0) {
-                log.debug("[upload] object={}: {} copies await their RECEIVED", object.objectId(), awaited);
+            putUninterruptibly(task);
+        } finally {
+            namespaceLock.unlock();
+        }
+        try {
+            writer.await(task, properties.uploadCommitWait());
+        } catch (java.util.concurrent.TimeoutException e) {
+            cluster.increment("upload_commit_wait_timeouts");
+            log.warn("[upload] object={} is committed but its CommitObject task did not finish within {} s; answering anyway",
+                    object.objectId(), properties.uploadCommitWaitSeconds());
+        } catch (RuntimeException e) {
+            log.warn("[upload] object={} is committed; applying it to memory failed ({}), so it is reconciled",
+                    object.objectId(), e.toString());
+        }
+    }
+
+    /** §5.6 step 6: an upload that did not commit queues {@code EndUpload} (DELETEs, garbage, receipts). */
+    private void endUpload(String objectId, Set<WrittenCopy> attempted) {
+        List<NamespaceTasks.Attempt> attempts = attempted.stream()
+                .map(copy -> new NamespaceTasks.Attempt(copy.chunkId(), copy.target().workerId()))
+                .toList();
+        putUninterruptibly(namespaceTasks.endUpload(objectId, attempts));
+        if (!attempts.isEmpty()) {
+            log.warn("[upload] failed object={}; DELETE queued for {} chunk copies written so far", objectId, attempts.size());
+        }
+    }
+
+    private void putUninterruptibly(Task task) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                queue.put(task);
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
             }
-        });
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -308,7 +347,7 @@ public class UploadService {
     private List<Target> storeChunk(String objectId, int index, String chunkId, byte[] data, String checksum,
                                     Set<String> exclude, Set<WrittenCopy> attempted) {
         int rf = properties.replicationFactor();
-        List<Target> ring = cluster.locked(() -> {
+        List<Target> ring = cluster.read(() -> {
             List<Target> targets = new ArrayList<>();
             for (WorkerInfo worker : placement.ringForUpload(objectId, index, exclude)) {
                 targets.add(new Target(worker.workerId, worker.url, worker.bootId, worker.epoch));
@@ -347,7 +386,7 @@ public class UploadService {
         // Recorded before the call: a write that timed out may still have reached the disk.
         attempted.add(new WrittenCopy(target, chunkId));
         try {
-            String changeAck = cluster.locked(() -> receipts.changeAck(target.workerId()));
+            String changeAck = cluster.read(() -> receipts.changeAck(target.workerId()));
             ChunkPutResponse answer = workers.putChunk(target.url(), chunkId, data, checksum, changeAck);
             if (answer != null && answer.changes() != null) {
                 receipts.acceptPiggyback(target.workerId(), answer.changes().bootId(), answer.changes().items());
@@ -356,32 +395,12 @@ public class UploadService {
         } catch (WorkerException e) {
             log.warn("[upload] chunk={} worker={} write failed ({}); replacing it for this upload",
                     chunkId, target.workerId(), e.getMessage());
-            cluster.locked(() -> {
-                WorkerInfo worker = cluster.worker(target.workerId());
-                if (worker != null) {
-                    worker.lastDataError = cluster.now();
-                }
-            });
+            WorkerInfo worker = cluster.worker(target.workerId());
+            if (worker != null) {
+                worker.lastDataError = System.nanoTime();          // a volatile field: no lock
+            }
             return false;
         }
-    }
-
-    /** A failed upload: delete every copy that was or may have been written. Fire and forget. */
-    private void cleanUp(String objectId, Set<WrittenCopy> attempted) {
-        if (attempted.isEmpty()) {
-            return;
-        }
-        List<WrittenCopy> copies = List.copyOf(attempted);
-        io.execute(() -> {
-            for (WrittenCopy copy : copies) {
-                try {
-                    workers.deleteChunk(copy.target().url(), copy.chunkId());
-                } catch (WorkerException unreachable) {
-                    // An orphan now; block reports clean it up.
-                }
-            }
-        });
-        log.warn("[upload] failed object={}; deleting {} chunk copies written so far", objectId, copies.size());
     }
 
     /** The uploaded file name without any client-side directory, or "unnamed". */

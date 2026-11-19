@@ -21,8 +21,8 @@ import org.springframework.web.client.RestClientException;
 
 /**
  * The controller's direct HTTP calls to workers: writing chunks during an upload, reading them
- * for a download, best-effort cleanup after a failed upload, and listing a worker's disk for
- * fsck. Repairs do <em>not</em> go through here: workers copy chunks to each other on command.
+ * for a download, and listing a worker's disk for fsck. Repairs and deletions do <em>not</em> go
+ * through here: workers copy and delete chunks on command.
  */
 @Component
 public class WorkerClient {
@@ -84,19 +84,6 @@ public class WorkerClient {
                     }
                     String checksum = response.getHeaders().getFirst(InternalApi.CHECKSUM_HEADER);
                     return new FetchedChunk(response.getBody().readAllBytes(), checksum);
-                }));
-    }
-
-    /** {@code DELETE /internal/chunks/{chunk_id}}: best-effort cleanup of a failed upload. */
-    public void deleteChunk(String workerUrl, String chunkId) {
-        call(workerUrl, () -> chunks.delete()
-                .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
-                .exchange((request, response) -> {
-                    int status = response.getStatusCode().value();
-                    if (status != 204 && status != 404) {
-                        throw failure(workerUrl, response);
-                    }
-                    return Boolean.TRUE;
                 }));
     }
 

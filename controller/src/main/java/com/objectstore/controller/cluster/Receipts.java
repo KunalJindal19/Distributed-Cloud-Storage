@@ -4,7 +4,6 @@ import com.objectstore.common.dto.Change;
 import com.objectstore.common.dto.ReportEntry;
 import com.objectstore.common.dto.ReportSegment;
 import com.objectstore.common.dto.SegmentAck;
-import com.objectstore.controller.cluster.ClusterState.ReportSession;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,11 +37,12 @@ public class Receipts {
 
     private final ClusterState cluster;
     private final ChangeApplier applier;
-    private volatile ApplySink sink = ApplySink.INLINE;
+    private volatile ApplySink sink;
 
-    public Receipts(ClusterState cluster, ChangeApplier applier) {
+    public Receipts(ClusterState cluster, ChangeApplier applier, ApplyQueue queue) {
         this.cluster = cluster;
         this.applier = applier;
+        this.sink = queue;
     }
 
     public void setSink(ApplySink sink) {
@@ -77,60 +77,61 @@ public class Receipts {
         if (run.isEmpty()) {
             return;
         }
-        ApplySink target = sink;
-        if (!target.hasRoom(1)) {
-            cluster.increment("apply_queue_full");
-            return;
-        }
         String workerId = worker.workerId;
         long epoch = worker.epoch;
         List<Change> accepted = List.copyOf(run);
+        if (!sink.offer(applier.applyChangesTask(workerId, epoch, accepted))) {
+            cluster.increment("apply_queue_full");
+            return;
+        }
         worker.received = accepted.getLast().seq();
-        target.submit("ApplyChanges", () -> applier.applyChanges(workerId, epoch, accepted));
     }
 
-    /** §4.6 step 4: one full-report segment. Returns the acknowledgement, or null. Under the lock. */
+    /**
+     * §4.6 step 4: one full-report segment. Returns the acknowledgement, or null. Under the lock.
+     * The receipt side of the report lives in {@code WorkerInfo.rx*}: which report is being
+     * received, its session number and baseline, and the last segment accepted.
+     */
     public SegmentAck acceptSegment(WorkerInfo worker, ReportSegment segment) {
         if (segment == null || segment.reportId() == null || segment.index() < 0) {
             return null;
         }
         String reportId = segment.reportId();
-        ReportSession session = worker.session;
-        boolean inOpenSession = session != null && session.reportId.equals(reportId);
-        if (!inOpenSession && reportId.equals(worker.closedReportId) && segment.index() <= worker.closedLastSegment) {
-            return new SegmentAck(reportId, segment.index());   // a resent segment of a completed report
+        int index = segment.index();
+        boolean known = reportId.equals(worker.rxReportId);
+        if (known && index <= worker.rxLastSegment) {
+            return new SegmentAck(reportId, index);            // a duplicate: re-acknowledge only
         }
-        if (segment.index() == 0 && !inOpenSession) {
-            session = cluster.openSession(worker, reportId, segment.baseline());
-            log.info("[report] {} full report {} started (baseline {})", worker.workerId, Registry.shortId(reportId),
-                    segment.baseline());
+        boolean opening = !known && index == 0;
+        if (!opening && !(known && !worker.rxDone && index == worker.rxLastSegment + 1)) {
+            return null;                                       // not the segment we expect: ignore it
         }
-        if (session == null || !session.reportId.equals(reportId)) {
-            return null;                                     // a segment of a report we do not follow
-        }
-        if (segment.index() <= session.lastSegment) {
-            return new SegmentAck(reportId, segment.index());   // a duplicate: re-acknowledge only
-        }
-        if (segment.index() != session.lastSegment + 1) {
-            return null;
-        }
-        ApplySink target = sink;
-        if (!target.hasRoom(segment.last() ? 2 : 1)) {
+        long number = opening ? cluster.nextSessionNumber() : worker.rxSession;
+        long baseline = opening ? segment.baseline() : worker.rxBaseline;
+        String workerId = worker.workerId;
+        long epoch = worker.epoch;
+        List<ReportEntry> entries = segment.entries() == null ? List.of() : segment.entries();
+        Task apply = applier.applySegmentTask(workerId, epoch, number, baseline, opening, entries);
+        boolean accepted = segment.last()
+                ? sink.offer(apply, applier.completeReportTask(workerId, epoch, number, baseline))
+                : sink.offer(apply);
+        if (!accepted) {
             cluster.increment("apply_queue_full");
             return null;
         }
-        String workerId = worker.workerId;
-        long epoch = worker.epoch;
-        long number = session.number;
-        long baseline = session.baseline;
-        List<ReportEntry> entries = segment.entries() == null ? List.of() : segment.entries();
-        session.lastSegment = segment.index();
-        target.submit("ApplySegment", () -> applier.applySegment(workerId, epoch, number, entries));
-        if (segment.last()) {
-            worker.received = Math.max(worker.received, baseline);
-            target.submit("CompleteReport", () -> applier.completeReport(workerId, epoch, number, baseline));
+        if (opening) {
+            worker.rxReportId = reportId;
+            worker.rxSession = number;
+            worker.rxBaseline = baseline;
+            worker.rxDone = false;
+            log.info("[report] {} full report {} started (baseline {})", workerId, Registry.shortId(reportId), baseline);
         }
-        return new SegmentAck(reportId, segment.index());
+        worker.rxLastSegment = index;
+        if (segment.last()) {
+            worker.rxDone = true;
+            worker.received = Math.max(worker.received, baseline);
+        }
+        return new SegmentAck(reportId, index);
     }
 
     /**
@@ -142,7 +143,7 @@ public class Receipts {
         if (items == null || items.isEmpty()) {
             return;
         }
-        cluster.locked(() -> {
+        cluster.write(() -> {
             WorkerInfo worker = cluster.worker(workerId);
             if (worker == null || worker.isDead() || bootId == null || !bootId.equals(worker.bootId)) {
                 cluster.increment("piggyback_ignored");
@@ -152,7 +153,7 @@ public class Receipts {
         });
     }
 
-    /** The {@code X-Change-Ack} value for a PUT to this worker, or null if it is unknown. Under the lock. */
+    /** The {@code X-Change-Ack} value for a PUT to this worker, or null if it is unknown. Under the (read) lock. */
     public String changeAck(String workerId) {
         WorkerInfo worker = cluster.worker(workerId);
         return worker == null || worker.bootId == null ? null : worker.bootId + ":" + worker.received;

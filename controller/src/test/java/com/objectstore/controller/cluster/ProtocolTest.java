@@ -167,8 +167,9 @@ class ProtocolTest {
         assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands)).isEmpty();
 
         Thread.sleep(350);
-        // Completion queues the DELETE; the same heartbeat's reply hands it over.
-        assertThat(delayed.fullReport("worker1", boot, chunk(7)).commands())
+        // Completion (a task) queues the DELETE; the next heartbeat hands it over.
+        delayed.fullReport("worker1", boot, chunk(7));
+        assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
                 .singleElement().satisfies(c -> assertThat(c.reason()).isEqualTo("orphan"));
 
         String[] many = java.util.stream.IntStream.range(10, 30).mapToObj(TestSupport::chunk).toArray(String[]::new);
@@ -188,11 +189,10 @@ class ProtocolTest {
                         java.util.stream.IntStream.range(0, 20).mapToObj(i -> "%s-%05d".formatted(unknown, i)))
                 .toArray(String[]::new);
 
-        delayed.register("worker1");
-        HeartbeatResponse reply = delayed.fullReport("worker1", delayed.fake("worker1").boot, reported);
+        delayed.join("worker1", reported);
 
         // All 10 known-garbage chunks are deleted; the 20 unaccountable ones (2/3 > 1/2) trip the valve.
-        assertThat(reply.commands())
+        assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
                 .hasSize(10)
                 .allSatisfy(c -> assertThat(c.chunkId()).startsWith(failedUpload));
         assertThat(delayed.cluster.counter("orphan_gc_refused")).isEqualTo(1);
@@ -217,6 +217,7 @@ class ProtocolTest {
         while (System.nanoTime() < end) {
             Thread.sleep(40);
             t.registry.healthPass();
+            t.sync();                       // MarkDead is a task
         }
     }
 

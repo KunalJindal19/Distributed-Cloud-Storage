@@ -19,8 +19,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * Applies a worker's changes and full-report segments to the block map (v4 §4.9). Every method
- * must run under the cluster lock, and none does network or database I/O.
+ * Applies a worker's changes and full-report segments to the block map (v4 §4.9). These are the
+ * bodies of the writer's {@code ApplyChanges}, {@code ApplySegment} and {@code CompleteReport}
+ * tasks: every method runs under the cluster write lock, and none does network or database I/O.
  *
  * <p>Each method carries the worker's epoch: work that belongs to an earlier life of the worker
  * (before a re-registration or DEAD) is dropped.
@@ -68,13 +69,31 @@ public class ChangeApplier {
 
     // ---- changes -------------------------------------------------------------------------------
 
-    /** Applies a contiguous run of changes, skipping those already applied. */
+    /** The {@code ApplyChanges} task: yields at the deadline and resumes where it stopped. */
+    public Task applyChangesTask(String workerId, long epoch, List<Change> run) {
+        int[] cursor = {0};
+        return Task.steps("ApplyChanges", deadline -> {
+            cursor[0] = applyChanges(workerId, epoch, run, cursor[0], deadline);
+            return cursor[0] < run.size() ? Task.Step.MORE : Task.Step.DONE;
+        });
+    }
+
+    /** Applies a contiguous run of changes at once, skipping those already applied. */
     public void applyChanges(String workerId, long epoch, List<Change> run) {
+        applyChanges(workerId, epoch, run, 0, Long.MAX_VALUE);
+    }
+
+    /** Applies {@code run} from index {@code from} until done or the deadline; returns where to resume. */
+    private int applyChanges(String workerId, long epoch, List<Change> run, int from, long deadline) {
         WorkerInfo worker = current(workerId, epoch);
         if (worker == null) {
-            return;
+            return run.size();
         }
-        for (Change change : run) {
+        for (int i = from; i < run.size(); i++) {
+            if (i > from && System.nanoTime() >= deadline) {
+                return i;
+            }
+            Change change = run.get(i);
             if (change.seq() <= worker.applied) {
                 continue;
             }
@@ -86,6 +105,7 @@ public class ChangeApplier {
             }
             worker.applied = change.seq();
         }
+        return run.size();
     }
 
     private void apply(WorkerInfo worker, Change change) {
@@ -187,18 +207,45 @@ public class ChangeApplier {
 
     // ---- report segments ---------------------------------------------------------------------
 
-    /** Applies one segment of a full report to the open session {@code sessionNumber}. */
-    public void applySegment(String workerId, long epoch, long sessionNumber, List<ReportEntry> entries) {
+    /**
+     * Applies one segment of a full report to session {@code sessionNumber}. The first segment
+     * ({@code open}) opens the writer-side session, replacing any older one of this worker.
+     */
+    public void applySegment(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
+                             List<ReportEntry> entries) {
+        applySegment(workerId, epoch, sessionNumber, baseline, open, entries, 0, Long.MAX_VALUE);
+    }
+
+    /** The {@code ApplySegment} task: yields at the deadline and resumes where it stopped. */
+    public Task applySegmentTask(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
+                                 List<ReportEntry> entries) {
+        int[] cursor = {0};
+        return Task.steps("ApplySegment", deadline -> {
+            cursor[0] = applySegment(workerId, epoch, sessionNumber, baseline, open && cursor[0] == 0, entries,
+                    cursor[0], deadline);
+            return cursor[0] < entries.size() ? Task.Step.MORE : Task.Step.DONE;
+        });
+    }
+
+    private int applySegment(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
+                             List<ReportEntry> entries, int from, long deadline) {
         WorkerInfo worker = current(workerId, epoch);
         if (worker == null) {
-            return;
+            return entries.size();
+        }
+        if (open) {
+            cluster.openSession(worker, sessionNumber, baseline);
         }
         ReportSession session = worker.session;
         if (session == null || session.closed || session.number != sessionNumber) {
             cluster.increment("stale_tasks_dropped");
-            return;
+            return entries.size();
         }
-        for (ReportEntry entry : entries == null ? List.<ReportEntry>of() : entries) {
+        for (int i = from; i < entries.size(); i++) {
+            if (i > from && System.nanoTime() >= deadline) {
+                return i;
+            }
+            ReportEntry entry = entries.get(i);
             String chunkId = entry.chunkId();
             if (chunkId == null || !ChunkIds.isValid(chunkId)) {
                 continue;
@@ -210,6 +257,7 @@ public class ChangeApplier {
                 log.error("[report] {} entry {} could not be applied", workerId, chunkId, e);
             }
         }
+        return entries.size();
     }
 
     private void listed(WorkerInfo worker, ReportSession session, ReportEntry entry) {
@@ -248,23 +296,90 @@ public class ChangeApplier {
         }
     }
 
-    /**
-     * Completes a report session: orphan GC (if allowed), removal of the copies the report did not
-     * list, and the bookkeeping. {@code applied} catches up with the baseline.
-     */
+    /** The {@code CompleteReport} task: {@link #completeReport} in steps of at most 1000 items. */
+    public Task completeReportTask(String workerId, long epoch, long sessionNumber, long baseline) {
+        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline);
+        return Task.steps("CompleteReport", completion::step);
+    }
+
+    /** Completes a report at once (tests). */
     public void completeReport(String workerId, long epoch, long sessionNumber, long baseline) {
-        WorkerInfo worker = current(workerId, epoch);
-        if (worker == null) {
-            return;
+        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline);
+        while (completion.step(Long.MAX_VALUE) == Task.Step.MORE) {
+            // all steps in one go
         }
-        ReportSession session = worker.session;
-        if (session == null || session.closed || session.number != sessionNumber) {
-            cluster.increment("stale_tasks_dropped");
-            return;
+    }
+
+    /**
+     * Completing a report session (a multi-step task): orphan GC (if allowed), then removal of the
+     * worker's copies that the report did not list (their mark is not this session's), then the
+     * bookkeeping; {@code applied} catches up with the baseline. Every step re-checks the epoch
+     * and the session, and leaves the state consistent.
+     */
+    private final class Completion {
+        private final String workerId;
+        private final long epoch;
+        private final long number;
+        private final long baseline;
+        private int phase;                    // 0 = GC, 1 = sweep, 2 = done
+        private List<String> sweep;
+        private int cursor;
+        private int garbage;
+        private int orphans;
+        private int missing;
+
+        Completion(String workerId, long epoch, long number, long baseline) {
+            this.workerId = workerId;
+            this.epoch = epoch;
+            this.number = number;
+            this.baseline = baseline;
         }
-        int garbage = 0;
-        int orphans = 0;
-        if (gcAllowed()) {
+
+        Task.Step step(long deadline) {
+            WorkerInfo worker = current(workerId, epoch);
+            if (worker == null) {
+                return Task.Step.DONE;
+            }
+            ReportSession session = worker.session;
+            if (session == null || session.closed || session.number != number) {
+                cluster.increment("stale_tasks_dropped");
+                return Task.Step.DONE;
+            }
+            if (phase == 0) {
+                collectGarbage(session);
+                sweep = new ArrayList<>(cluster.chunksOn(workerId));
+                phase = 1;
+                return Task.Step.MORE;
+            }
+            int items = 0;
+            while (cursor < sweep.size()) {
+                String chunkId = sweep.get(cursor++);
+                Replica replica = cluster.replica(chunkId, workerId);
+                if (replica != null && replica.mark != number) {
+                    cluster.removeReplica(chunkId, workerId);   // runs protect()
+                    missing++;
+                    log.warn("[report] missing chunk={} on {} (was {})", chunkId, workerId, replica.state);
+                }
+                if (++items >= NamespaceTasks.STEP_ITEMS || System.nanoTime() >= deadline) {
+                    if (cursor < sweep.size()) {
+                        return Task.Step.MORE;
+                    }
+                }
+            }
+            worker.hasReported = true;
+            worker.lastReportAt = cluster.now();
+            worker.applied = Math.max(worker.applied, baseline);
+            cluster.closeSession(worker);
+            log.info("[report] {} full report {} complete: listed={} missing={} garbage={} orphans={} baseline={}",
+                    workerId, worker.rxSession == number ? Registry.shortId(worker.rxReportId) : "#" + number,
+                    session.listed, missing, garbage, orphans, baseline);
+            return Task.Step.DONE;
+        }
+
+        private void collectGarbage(ReportSession session) {
+            if (!gcAllowed()) {
+                return;                       // asked again later (Block 14)
+            }
             for (String chunkId : session.garbage) {
                 if (cluster.chunk(chunkId) == null && deleteUnknown(workerId, chunkId,
                         "chunk of a failed upload or a deleted object; DELETE queued")) {
@@ -286,23 +401,6 @@ public class ChangeApplier {
                 }
             }
         }
-        int missing = 0;
-        for (String chunkId : new ArrayList<>(cluster.chunksOn(workerId))) {
-            Replica replica = cluster.replica(chunkId, workerId);
-            if (replica != null && replica.mark != session.number) {
-                cluster.removeReplica(chunkId, workerId);   // runs protect()
-                missing++;
-                log.warn("[report] missing chunk={} on {} (was {})", chunkId, workerId, replica.state);
-            }
-        }
-        worker.hasReported = true;
-        worker.lastReportAt = cluster.now();
-        worker.applied = Math.max(worker.applied, baseline);
-        worker.closedReportId = session.reportId;
-        worker.closedLastSegment = session.lastSegment;
-        cluster.closeSession(worker);
-        log.info("[report] {} full report {} complete: listed={} missing={} garbage={} orphans={} baseline={}", workerId,
-                Registry.shortId(session.reportId), session.listed, missing, garbage, orphans, baseline);
     }
 
     // ---- helpers -----------------------------------------------------------------------------
