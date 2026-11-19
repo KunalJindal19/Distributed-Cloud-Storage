@@ -28,7 +28,9 @@ public record ClusterStatusResponse(
         long applyOldestTaskAgeMs,
         /** Fraction of the time since the last status read that the writer held the lock. */
         double writerBusyRatio,
-        long reportSessionsOpen) {
+        long reportSessionsOpen,
+        /** The deletion ledger: {waiting, queued, delivered}. */
+        Map<String, Integer> ledger) {
 
     public record Config(
             int chunkSize,

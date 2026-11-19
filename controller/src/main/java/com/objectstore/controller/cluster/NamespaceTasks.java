@@ -124,10 +124,8 @@ public class NamespaceTasks {
             int items = 0;
             while (cursor[0] < attempts.size()) {
                 Attempt attempt = attempts.get(cursor[0]++);
-                WorkerInfo worker = cluster.worker(attempt.workerId());
-                if (worker != null && !worker.isDead() && cluster.chunk(attempt.chunkId()) == null) {
-                    cluster.queueCommand(attempt.workerId(), InternalApi.COMMAND_DELETE, attempt.chunkId(), null, null,
-                            "upload_failed");
+                if (cluster.worker(attempt.workerId()) != null && cluster.chunk(attempt.chunkId()) == null) {
+                    cluster.ledger().request(attempt.chunkId(), attempt.workerId(), DeletionLedger.UPLOAD_FAILED);
                 }
                 if (stepDone(++items, deadline) && cursor[0] < attempts.size()) {
                     return Step.MORE;
@@ -162,32 +160,32 @@ public class NamespaceTasks {
                     return Step.MORE;
                 }
             }
-            log.info("[api] deleted object={}; {} DELETE commands queued", objectId, commands[0]);
+            log.info("[api] deleted object={}; {} copies to delete (ledger)", objectId, commands[0]);
             return Step.DONE;
         });
     }
 
-    /** Forgets a batch of chunks: cancels their queued commands, queues DELETEs, removes them. */
+    /**
+     * Forgets a batch of chunks: their queued copies are cancelled, their excess/corrupt deletions
+     * become namespace deletions, every holder (any state) and every pending target gets a ledger
+     * DELETE, and the chunks are removed.
+     */
     private int forget(List<String> chunkIds, String reason) {
-        Set<String> batch = new HashSet<>(chunkIds);
-        for (WorkerInfo worker : cluster.workers().values()) {
-            worker.commands.removeIf(command -> batch.contains(command.chunkId()));
-        }
-        int commands = 0;
+        cluster.cancelReplicatesFor(new HashSet<>(chunkIds));
+        int deletions = 0;
         for (String chunkId : chunkIds) {
+            cluster.ledger().chunkRemoved(chunkId, reason);
             Set<String> holders = new LinkedHashSet<>(cluster.replicasOf(chunkId).keySet());
             for (PendingCopy copy : cluster.pendingOf(chunkId)) {
                 holders.add(copy.target());          // a copy on its way may land
             }
             for (String workerId : holders) {
-                Command queued = cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunkId, null, null, reason);
-                if (queued != null) {
-                    commands++;
-                }
+                cluster.ledger().request(chunkId, workerId, reason);
+                deletions++;
             }
             cluster.removeChunk(chunkId);
         }
-        return commands;
+        return deletions;
     }
 
     // ---- reconciling after a failed namespace task ---------------------------------------------

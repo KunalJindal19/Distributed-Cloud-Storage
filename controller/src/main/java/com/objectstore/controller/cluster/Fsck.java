@@ -36,7 +36,7 @@ import org.springframework.stereotype.Service;
  *
  * Differences between disks and the block map are only meaningful while the cluster is
  * quiescent: no copies pending, no commands queued, not in safe mode, nothing in the apply queue,
- * no report session open and no worker being purged.
+ * an empty deletion ledger, no report session open and no worker being purged.
  *
  * <p>Order (v4 §5.10): take the namespace lock; queue a {@code Barrier} and wait for it (every
  * namespace task queued before is applied); read the database's chunk table and snapshot the
@@ -169,7 +169,8 @@ public class Fsck {
             violations.addAll(i7);
             ObjectCounts counts = countObjects(totalObjects);
             boolean quiescent = !cluster.isSafeMode() && cluster.pendingTotal() == 0 && cluster.queuedCommands() == 0
-                    && queue.depth() == 0 && cluster.openSessions() == 0 && !cluster.anyPurging();
+                    && queue.depth() == 0 && cluster.openSessions() == 0 && !cluster.anyPurging()
+                    && cluster.ledger().isEmpty();
             DiskVsMap diskVsMap = new DiskVsMap(List.copyOf(onDiskNotInMap), List.copyOf(inMapNotOnDisk),
                     List.copyOf(checksumMismatch));
             String status;
