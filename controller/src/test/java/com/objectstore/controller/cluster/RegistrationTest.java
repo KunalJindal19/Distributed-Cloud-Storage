@@ -52,7 +52,7 @@ class RegistrationTest {
         t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds()));
         t.fake("worker1").boot = "boot-a";
         t.fullReport("worker1", "boot-a", chunk(0));
-        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "orphan"));
+        cluster.locked(() -> cluster.ledger().request(chunk(0), "worker1", DeletionLedger.ORPHAN));
         long epoch = cluster.locked(() -> cluster.worker("worker1").epoch);
 
         assertThat(t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds())).ok()).isTrue();
@@ -81,7 +81,7 @@ class RegistrationTest {
             cluster.beginUpload(upload);
             cluster.putReceipt(upload + "-00000", "worker1", cluster.worker("worker1").epoch, 10, TestSupport.SUM, 0);
             cluster.addPending(chunk(0), "worker1", "worker2", "cmd-1");
-            cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "orphan");
+            cluster.ledger().request(chunk(0), "worker1", DeletionLedger.ORPHAN);
         });
         // A report is in progress when the process restarts.
         t.send("worker1", List.of(), new ReportSegment("r", 0, false, 0, List.of()));

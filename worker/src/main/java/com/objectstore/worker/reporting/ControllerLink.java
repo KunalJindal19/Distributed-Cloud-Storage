@@ -74,6 +74,8 @@ public class ControllerLink implements Runnable {
 
     /** Test hook: a pause before each full-report segment after the first, per worker id. */
     private static final Map<String, Long> SEGMENT_DELAY_FOR_TESTS = new ConcurrentHashMap<>();
+    /** Test hook: the fraction of heartbeat replies treated as lost, per worker id. */
+    private static final Map<String, Double> LOST_REPLIES_FOR_TESTS = new ConcurrentHashMap<>();
 
     private final WorkerProperties properties;
     private final WorkerIdentity identity;
@@ -115,6 +117,15 @@ public class ControllerLink implements Runnable {
             SEGMENT_DELAY_FOR_TESTS.remove(workerId);
         } else {
             SEGMENT_DELAY_FOR_TESTS.put(workerId, millis);
+        }
+    }
+
+    /** Test hook: treat this fraction of heartbeat replies as lost on the way (0 turns it off). */
+    public static void loseRepliesForTests(String workerId, double fraction) {
+        if (fraction <= 0) {
+            LOST_REPLIES_FOR_TESTS.remove(workerId);
+        } else {
+            LOST_REPLIES_FOR_TESTS.put(workerId, fraction);
         }
     }
 
@@ -291,6 +302,10 @@ public class ControllerLink implements Runnable {
                         .retrieve()
                         .body(HeartbeatResponse.class);
                 controllerReachable();
+                double lose = LOST_REPLIES_FOR_TESTS.getOrDefault(properties.id(), 0.0);
+                if (lose > 0 && java.util.concurrent.ThreadLocalRandom.current().nextDouble() < lose) {
+                    return false;                        // test hook: the reply "never arrived"
+                }
                 if (response != null) {
                     handle(response, reportWasOpen);
                 }

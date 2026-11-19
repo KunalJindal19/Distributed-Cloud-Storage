@@ -108,6 +108,7 @@ public class PlacementPolicy {
             WorkerInfo worker = cluster.worker(entry.getKey());
             if (entry.getValue().state == ReplicaState.OK && worker != null && worker.state == WorkerState.ALIVE
                     && worker.hasReported && cluster.pendingFrom(worker.workerId) < properties.maxStreams()
+                    && worker.commands.size() < properties.maxCommandsPerWorker()     // never drop a command
                     && !cluster.recentlyFailed(chunkId, worker.workerId)) {
                 candidates.add(worker.workerId);
             }
