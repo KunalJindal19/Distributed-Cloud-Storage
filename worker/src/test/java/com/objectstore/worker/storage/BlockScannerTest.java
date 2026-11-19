@@ -5,7 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.objectstore.common.Checksums;
 import com.objectstore.common.dto.ChunkInfo;
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.worker.reporting.IbrBuffer;
+import com.objectstore.worker.TestSupport;
+import com.objectstore.worker.reporting.ChangeLog;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -26,7 +27,7 @@ class BlockScannerTest {
     @TempDir
     Path dataDir;
 
-    private IbrBuffer ibr;
+    private ChangeLog changes;
     private ChunkStore store;
     private BlockScanner scanner;
     private Path chunkDir;
@@ -36,16 +37,15 @@ class BlockScannerTest {
     }
 
     private static WorkerProperties properties(Path dataDir, long rate) {
-        return new WorkerProperties("worker1", dataDir, "http://controller:8000", "", 1_048_576,
-                2, 3, 30, 0.5, 100_000, 10, rate, 30, 2, 10, false);
+        return TestSupport.properties(dataDir, rate, 100_000);
     }
 
     private void open(long rate) {
         WorkerProperties properties = properties(dataDir, rate);
-        ibr = new IbrBuffer(properties);
-        store = new ChunkStore(properties, ibr);
+        changes = new ChangeLog(properties);
+        store = new ChunkStore(properties, changes);
         ReflectionTestUtils.invokeMethod(store, "initialise");
-        scanner = new BlockScanner(store, ibr, properties);
+        scanner = new BlockScanner(store, properties);
         chunkDir = properties.chunkDir();
     }
 
@@ -69,13 +69,13 @@ class BlockScannerTest {
     void aFileRemovedByHandIsReportedDeletedWithinOnePass() throws Exception {
         write(0, 1000);
         write(1, 1000);
-        ibr.drain();
+        TestSupport.drain(changes);
         Files.delete(chunkDir.resolve(chunk(0)));
         Files.delete(chunkDir.resolve(chunk(0) + ".meta"));
 
         scanner.scanOnce();
 
-        assertThat(ibr.drain().deleted()).containsExactly(chunk(0));
+        assertThat(TestSupport.drain(changes).deleted()).containsExactly(chunk(0));
         assertThat(store.index()).containsOnlyKeys(chunk(1));
         assertThat(store.stats(0).chunks()).isEqualTo(1);
         assertThat(store.stats(0).usedBytes()).isEqualTo(1000);
@@ -96,7 +96,7 @@ class BlockScannerTest {
 
         scanner.scanOnce();
 
-        assertThat(ibr.drain().received()).containsExactlyInAnyOrder(
+        assertThat(TestSupport.drain(changes).received()).containsExactlyInAnyOrder(
                 new ChunkInfo(chunk(5), 700, Checksums.sha256Hex(data)),
                 new ChunkInfo(chunk(6), 300, Checksums.sha256Hex(other)));
         assertThat(store.readMeta(chunk(5)).orElseThrow().checksum()).isEqualTo(Checksums.sha256Hex(data));
@@ -108,32 +108,32 @@ class BlockScannerTest {
     void aCorruptedFileIsReportedBadExactlyOnceAndClearedWhenReplaced() throws Exception {
         byte[] data = write(0, 2000);
         write(1, 2000);
-        ibr.drain();
+        TestSupport.drain(changes);
         Files.write(chunkDir.resolve(chunk(0)), "XXXX".getBytes(StandardCharsets.US_ASCII), StandardOpenOption.WRITE);
 
         assertThat(scanner.scanOnce()).isEqualTo(1);
         assertThat(scanner.scanOnce()).isEqualTo(1);
         assertThat(scanner.scanOnce()).isEqualTo(1);
 
-        assertThat(ibr.drain().bad()).containsExactly(chunk(0));          // exactly one BAD over three passes
+        assertThat(TestSupport.drain(changes).bad()).containsExactly(chunk(0));          // exactly one BAD over three passes
         assertThat(store.isKnownBad(chunk(0))).isTrue();
         assertThat(Files.exists(chunkDir.resolve(chunk(0)))).as("the scanner never deletes").isTrue();
 
         Files.write(chunkDir.resolve(chunk(0)), data);                     // the file is replaced by good bytes
         assertThat(scanner.scanOnce()).isZero();
         assertThat(store.isKnownBad(chunk(0))).isFalse();
-        assertThat(ibr.hasEvents()).isFalse();
+        assertThat(TestSupport.pending(changes)).isFalse();
     }
 
     @Test
     void aMissingSidecarAtRuntimeMakesTheChunkBad() throws Exception {
         write(0, 500);
-        ibr.drain();
+        TestSupport.drain(changes);
         Files.delete(chunkDir.resolve(chunk(0) + ".meta"));
 
         assertThat(scanner.scanOnce()).isEqualTo(1);
 
-        assertThat(ibr.drain().bad()).containsExactly(chunk(0));
+        assertThat(TestSupport.drain(changes).bad()).containsExactly(chunk(0));
         assertThat(store.list()).containsExactly(new ChunkInfo(chunk(0), 500, ChunkStore.UNVERIFIED));
     }
 

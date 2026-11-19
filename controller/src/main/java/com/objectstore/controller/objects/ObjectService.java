@@ -102,7 +102,10 @@ public class ObjectService {
             cluster.addGarbage(objectId);
             int commands = 0;
             for (Chunk chunk : chunkRows) {
-                for (String workerId : new ArrayList<>(cluster.replicasOf(chunk.chunkId()).keySet())) {
+                java.util.Set<String> holders = new java.util.LinkedHashSet<>(cluster.replicasOf(chunk.chunkId()).keySet());
+                // A copy on its way (a repair or an upload copy) may land: delete it there too.
+                cluster.pendingOf(chunk.chunkId()).forEach(copy -> holders.add(copy.target()));
+                for (String workerId : holders) {
                     cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunk.chunkId(), null, null, "object_deleted");
                     commands++;
                 }

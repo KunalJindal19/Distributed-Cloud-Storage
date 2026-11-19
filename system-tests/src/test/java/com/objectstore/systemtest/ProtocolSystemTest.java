@@ -14,7 +14,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 
-/** Block 6: protocol, liveness, block reports, safe mode, cluster identity, scanner, orphan GC. */
+/** Block 6 (with the v4 change-stream protocol): liveness, reports, safe mode, cluster identity, scanner, orphan GC. */
 class ProtocolSystemTest extends ClusterTest {
 
     @Test
@@ -66,26 +66,34 @@ class ProtocolSystemTest extends ClusterTest {
     }
 
     @Test
-    void replayedReorderedAndForeignReportsChangeNothing() {
+    void replayedReorderedAndForeignMessagesChangeNothing() {
         // A fake worker speaking the protocol over raw HTTP.
         String boot = UUID.randomUUID().toString();
         double now = System.currentTimeMillis() / 1000.0;
-        HttpResponse<String> register = api.postJson("/internal/workers/register",
-                "{\"worker_id\":\"worker9\",\"url\":\"http://127.0.0.1:1\",\"boot_id\":\"%s\",\"cluster_id\":null,\"hb_seq\":-1,\"report_seq\":-1,\"sent_at\":%f}"
-                        .formatted(boot, now));
+        HttpResponse<String> register = register(boot, 2, now);
         assertThat(register.statusCode()).isEqualTo(200);
         assertThat(api.json(register.body()).get("cluster_id").asString()).isEqualTo(api.status().get("cluster_id").asString());
 
-        assertThat(report(boot, 3, now).statusCode()).isEqualTo(200);
-        HttpResponse<String> duplicate = report(boot, 3, now);
+        // A report segment and a change on a heartbeat; then the same heartbeat again.
+        HttpResponse<String> first = heartbeat(boot, 3, now, "[{\"seq\":1,\"type\":\"DELETED\",\"chunk_id\":\"%s-00000\"}]"
+                .formatted(UUID.randomUUID()), "{\"report_id\":\"r1\",\"index\":0,\"last\":true,\"baseline\":0,\"entries\":[]}");
+        assertThat(first.statusCode()).as(first.body()).isEqualTo(200);
+        assertThat(api.json(first.body()).get("changes_received_up_to").asLong()).isEqualTo(1);
+        assertThat(api.json(first.body()).get("segment_ack").get("report_id").asString()).isEqualTo("r1");
+        HttpResponse<String> duplicate = heartbeat(boot, 3, now, "[]", null);
         assertThat(duplicate.statusCode()).isEqualTo(200);
-        assertThat(duplicate.body()).contains("\"ignored\":\"duplicate\"");
-        assertError(report(boot, 2, now), 409, "stale_seq");
-        assertError(report("another-boot", 4, now), 409, "stale_boot");
-        assertError(report(boot, 4, now - 20), 409, "too_old");
+        assertThat(duplicate.body()).contains("\"ignored\":\"duplicate\"", "\"changes_received_up_to\":1");
+
+        assertError(heartbeat("another-boot", 4, now, "[]", null), 409, "stale_boot");
+        assertError(heartbeat(boot, 4, now - 20, "[]", null), 409, "too_old");
+        assertError(register(boot, 1, now), 409, "stale_registration");   // a delayed older attempt
+        assertError(register(boot, 3, now - 20), 409, "too_old");
         assertError(api.postJson("/internal/workers/heartbeat",
                 "{\"worker_id\":\"nobody\",\"boot_id\":\"x\",\"seq\":0,\"sent_at\":%f}".formatted(now)), 404, "unknown_worker");
         assertThat(api.status().get("counters").get("stale_messages").asLong()).isGreaterThanOrEqualTo(2);
+        // The separate report endpoints are gone.
+        assertThat(api.postJson("/internal/workers/blockreport", "{}").statusCode()).isEqualTo(404);
+        assertThat(api.postJson("/internal/workers/ibr", "{}").statusCode()).isEqualTo(404);
     }
 
     @Test
@@ -159,9 +167,16 @@ class ProtocolSystemTest extends ClusterTest {
         api = null; // the base class's invariant check would query an empty cluster: nothing to check
     }
 
-    private HttpResponse<String> report(String boot, long seq, double sentAt) {
-        return api.postJson("/internal/workers/blockreport",
-                "{\"worker_id\":\"worker9\",\"boot_id\":\"%s\",\"seq\":%d,\"sent_at\":%f,\"chunks\":[]}".formatted(boot, seq, sentAt));
+    private HttpResponse<String> register(String boot, long attempt, double sentAt) {
+        return api.postJson("/internal/workers/register",
+                "{\"worker_id\":\"worker9\",\"url\":\"http://127.0.0.1:1\",\"boot_id\":\"%s\",\"cluster_id\":null,\"attempt\":%d,\"change_seq\":0,\"hb_seq\":-1,\"sent_at\":%f}"
+                        .formatted(boot, attempt, sentAt));
+    }
+
+    private HttpResponse<String> heartbeat(String boot, long seq, double sentAt, String changes, String segment) {
+        return api.postJson("/internal/workers/heartbeat",
+                "{\"worker_id\":\"worker9\",\"boot_id\":\"%s\",\"seq\":%d,\"sent_at\":%f,\"changes\":%s%s}"
+                        .formatted(boot, seq, sentAt, changes, segment == null ? "" : ",\"segment\":" + segment));
     }
 
     private String locationState(String objectId, int index, String workerId) {

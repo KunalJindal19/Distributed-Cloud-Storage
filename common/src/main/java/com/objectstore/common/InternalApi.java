@@ -6,11 +6,17 @@ public final class InternalApi {
     /** Carries the SHA-256 of a chunk body, on PUT requests and GET responses. */
     public static final String CHECKSUM_HEADER = "X-Checksum";
 
+    /**
+     * On the controller's chunk PUTs: {@code <boot_id>:<n>}, the last change of that worker process
+     * the controller has received. The worker forgets changes up to {@code n} and answers with the
+     * next ones.
+     */
+    public static final String CHANGE_ACK_HEADER = "X-Change-Ack";
+
     // Worker -> controller (DatanodeProtocol)
     public static final String REGISTER_PATH = "/internal/workers/register";
+    /** Heartbeats carry the change stream and full-report segments: there are no report endpoints. */
     public static final String HEARTBEAT_PATH = "/internal/workers/heartbeat";
-    public static final String BLOCK_REPORT_PATH = "/internal/workers/blockreport";
-    public static final String IBR_PATH = "/internal/workers/ibr";
 
     // Controller -> worker and worker -> worker (DataTransferProtocol)
     public static final String CHUNK_PATH = "/internal/chunks/{chunkId}";

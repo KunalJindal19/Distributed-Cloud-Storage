@@ -145,7 +145,9 @@ public class PlacementPolicy {
     public List<String> chooseExcess(String chunkId, int count) {
         Set<String> sources = new java.util.HashSet<>();
         for (ClusterState.PendingCopy copy : cluster.pendingOf(chunkId)) {
-            sources.add(copy.source());
+            if (copy.source() != null) {
+                sources.add(copy.source());
+            }
         }
         List<String> live = new ArrayList<>(cluster.live(chunkId));
         live.removeIf(sources::contains);

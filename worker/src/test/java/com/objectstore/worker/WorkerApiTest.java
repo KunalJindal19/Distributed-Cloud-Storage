@@ -14,7 +14,12 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import com.objectstore.worker.reporting.ChangeLog;
+import com.objectstore.worker.reporting.WorkerIdentity;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -37,6 +42,14 @@ class WorkerApiTest {
 
     @Value("${local.server.port}")
     int port;
+
+    @Autowired
+    ChangeLog changes;
+
+    @Autowired
+    WorkerIdentity identity;
+
+    private final ObjectMapper json = new ObjectMapper();
 
     private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
 
@@ -70,6 +83,70 @@ class WorkerApiTest {
         assertThat(created.body()).contains("\"chunk_id\":\"" + id + "\"", "\"size\":1048576", "\"checksum\":\"" + checksum + "\"");
         assertThat(repeated.statusCode()).isEqualTo(200);
         assertThat(Files.readAllBytes(dataDir.resolve("chunks").resolve(id))).isEqualTo(data);
+    }
+
+    @Test
+    void aControllerPutGetsTheNextChangesAndAcknowledgesTheOldOnes() throws Exception {
+        changes.ack(changes.lastSeq());
+        long before = changes.lastSeq();
+        byte[] a = bytes(100, 7);
+        byte[] b = bytes(100, 8);
+        put(chunkId(5), a, Checksums.sha256Hex(a));                         // a repair PUT: no header
+        long afterFirst = changes.lastSeq();
+
+        HttpResponse<String> answer = put(chunkId(6), b, Checksums.sha256Hex(b), identity.bootId() + ":" + afterFirst);
+
+        assertThat(answer.statusCode()).isEqualTo(201);
+        JsonNode body = json.readTree(answer.body());
+        assertThat(body.path("changes").path("boot_id").asString()).isEqualTo(identity.bootId());
+        JsonNode items = body.path("changes").path("items");
+        assertThat(items).hasSize(1);
+        assertThat(items.get(0).path("seq").asLong()).isEqualTo(afterFirst + 1);
+        assertThat(items.get(0).path("type").asString()).isEqualTo("RECEIVED");
+        assertThat(items.get(0).path("chunk_id").asString()).isEqualTo(chunkId(6));
+        assertThat(items.get(0).path("checksum").asString()).isEqualTo(Checksums.sha256Hex(b));
+        assertThat(changes.suffix(0, 100)).extracting(c -> c.seq()).doesNotContain(before + 1); // acknowledged
+    }
+
+    @Test
+    void edge12_aPutAnswerForAnotherBootCarriesNoChanges() throws Exception {
+        byte[] data = bytes(100, 9);
+        HttpResponse<String> answer = put(chunkId(7), data, Checksums.sha256Hex(data), "some-other-boot:0");
+        HttpResponse<String> repair = put(chunkId(8), data(10), Checksums.sha256Hex(data(10)));
+
+        assertThat(answer.statusCode()).isEqualTo(201);
+        assertThat(json.readTree(answer.body()).has("changes")).isFalse();
+        assertThat(json.readTree(repair.body()).has("changes")).as("a worker-to-worker PUT gets no changes").isFalse();
+        assertThat(changes.size()).as("nothing was acknowledged").isGreaterThan(0);
+    }
+
+    @Test
+    void edge11_aPutAnswerIsBoundedAndRespectsTheHold() throws Exception {
+        changes.ack(changes.lastSeq());
+        for (int i = 0; i < 300; i++) {
+            changes.deleted(chunkId(100 + i));
+        }
+        long m = changes.beginHold();
+        changes.deleted(chunkId(999));                                       // above M: held back
+        try {
+            byte[] data = data(11);
+            long acked = m - 300;
+            HttpResponse<String> answer = put(chunkId(9), data, Checksums.sha256Hex(data), identity.bootId() + ":" + acked);
+            JsonNode items = json.readTree(answer.body()).path("changes").path("items");
+            assertThat(items).hasSize(256);                                  // MAX_CHANGES_PER_PUT_ANSWER
+            assertThat(items.get(0).path("seq").asLong()).isEqualTo(acked + 1);
+
+            HttpResponse<String> next = put(chunkId(9), data, Checksums.sha256Hex(data), identity.bootId() + ":" + (m - 1));
+            JsonNode rest = json.readTree(next.body()).path("changes").path("items");
+            assertThat(rest).hasSize(1);
+            assertThat(rest.get(0).path("seq").asLong()).as("nothing above M leaves during a report").isEqualTo(m);
+        } finally {
+            changes.endHold();
+        }
+    }
+
+    private static byte[] data(int seed) {
+        return bytes(64, seed);
     }
 
     @Test
@@ -224,13 +301,18 @@ class WorkerApiTest {
     }
 
     private HttpResponse<String> put(String chunkId, byte[] body, String checksum) throws Exception {
-        return http.send(
-                HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId))
-                        .header("X-Checksum", checksum)
-                        .header("Content-Type", "application/octet-stream")
-                        .PUT(HttpRequest.BodyPublishers.ofByteArray(body))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        return put(chunkId, body, checksum, null);
+    }
+
+    private HttpResponse<String> put(String chunkId, byte[] body, String checksum, String changeAck) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId))
+                .header("X-Checksum", checksum)
+                .header("Content-Type", "application/octet-stream")
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
+        if (changeAck != null) {
+            request.header("X-Change-Ack", changeAck);
+        }
+        return http.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> get(String path) throws Exception {

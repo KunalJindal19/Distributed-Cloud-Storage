@@ -45,7 +45,7 @@ public final class InProcessCluster implements AutoCloseable {
             Map.entry("worker.heartbeat-interval-seconds", "0.2"),
             Map.entry("worker.heartbeat-http-timeout-seconds", "0.5"),
             Map.entry("worker.full-report-interval-seconds", "1.5"),
-            Map.entry("worker.ibr-interval-seconds", "0.05"),
+            Map.entry("worker.heartbeat-min-gap-ms", "25"),
             Map.entry("worker.scan-interval-seconds", "0.5"),
             Map.entry("worker.disk-check-interval-seconds", "1"),
             Map.entry("worker.read-timeout-seconds", "3"));
@@ -55,6 +55,7 @@ public final class InProcessCluster implements AutoCloseable {
     private final Map<String, Integer> workerPorts = new LinkedHashMap<>();
     private final Map<String, ConfigurableApplicationContext> workers = new LinkedHashMap<>();
     private final Map<String, String> controllerOverrides = new LinkedHashMap<>();
+    private final Map<String, String> workerOverrides = new LinkedHashMap<>();
     private ConfigurableApplicationContext controller;
     private Path dbFile;
 
@@ -75,6 +76,17 @@ public final class InProcessCluster implements AutoCloseable {
     public InProcessCluster controllerSetting(String key, String value) {
         controllerOverrides.put(key, value);
         return this;
+    }
+
+    /** Overrides a worker setting (for every worker) for the next worker starts. */
+    public InProcessCluster workerSetting(String key, String value) {
+        workerOverrides.put(key, value);
+        return this;
+    }
+
+    /** A bean of a running worker, e.g. its {@code ControllerLink}. */
+    public <T> T workerBean(String workerId, Class<T> type) {
+        return workers.get(workerId).getBean(type);
     }
 
     public InProcessCluster startAll() {
@@ -113,6 +125,7 @@ public final class InProcessCluster implements AutoCloseable {
         settings.put("worker.data-dir", dataDir(workerId).toString());
         settings.put("worker.controller-url", controllerUrl());
         settings.put("worker.advertise-url", "http://127.0.0.1:" + port);
+        settings.putAll(workerOverrides);
         workers.put(workerId, start(WorkerApplication.class, WorkerApplication.CONFIG_NAME, settings));
     }
 
