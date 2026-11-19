@@ -49,10 +49,10 @@ class ProtocolTest {
     void aDuplicateHeartbeatDeliversNoCommands() {
         t.knowChunk(chunk(0));
         String boot = t.join("worker1", chunk(0));
-        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "orphan"));
+        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://a:1", null));
 
         HeartbeatResponse first = t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 3, InternalApi.nowSeconds(), TestSupport.STATS));
-        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "orphan"));
+        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://b:1", null));
         HeartbeatResponse duplicate = t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 3, InternalApi.nowSeconds(), TestSupport.STATS));
 
         assertThat(first.commands()).hasSize(1);

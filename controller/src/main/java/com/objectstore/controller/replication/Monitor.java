@@ -40,6 +40,7 @@ public class Monitor {
     private final ReplicationPlanner planner;
     private final ControllerProperties properties;
     private long ticks;
+    private boolean gcAnnounced;
 
     public Monitor(ClusterState cluster, SafeMode safeMode, ReplicationPlanner planner, ControllerProperties properties) {
         this.cluster = cluster;
@@ -53,9 +54,12 @@ public class Monitor {
             ticks++;
             cluster.purgeExpiredFailures();
             expirePendingCopies();
+            cluster.ledger().expireDeadlines(cluster.now());
             if (safeMode.evaluate()) {
                 return;
             }
+            announceGc();
+            cluster.ledger().retryWaiting(properties.cleanupBudget());
             planner.plan();
             if (ticks % 10 == 0) {
                 requestOverdueReports();
@@ -87,6 +91,24 @@ public class Monitor {
                 it.remove();
             }
         }
+    }
+
+    /**
+     * §6.4: when orphan GC becomes allowed (safe mode off and ORPHAN_GC_DELAY since the start),
+     * every non-dead worker is asked for a full report, once, so orphans seen before are collected
+     * without waiting for FULL_REPORT_INTERVAL.
+     */
+    private void announceGc() {
+        if (gcAnnounced || cluster.now() - cluster.startedAt() < properties.orphanGcDelay().toNanos()) {
+            return;
+        }
+        gcAnnounced = true;
+        for (WorkerInfo worker : cluster.workers().values()) {
+            if (!worker.isDead()) {
+                worker.fullReportRequested = true;
+            }
+        }
+        log.info("[monitor] orphan GC is allowed now; asking every worker for a full report");
     }
 
     private void requestOverdueReports() {

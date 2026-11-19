@@ -10,7 +10,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  *   <li>{@code REPLICATE} (HDFS {@code DNA_TRANSFER}): send your copy of {@code chunk_id}
  *       directly to the worker at {@code target_url}.</li>
  *   <li>{@code DELETE} (HDFS {@code DNA_INVALIDATE}): delete your copy; {@code reason} is
- *       {@code excess}, {@code corrupt}, {@code orphan} or {@code object_deleted}.</li>
+ *       {@code excess}, {@code corrupt}, {@code orphan}, {@code object_deleted} or
+ *       {@code upload_failed}. Every DELETE comes from the controller's deletion ledger, which sends
+ *       it again until the worker's {@code DELETED} change confirms it.</li>
  * </ul>
  *
  * A worker ignores a command once {@code expires_at} (wall-clock seconds) has passed, and

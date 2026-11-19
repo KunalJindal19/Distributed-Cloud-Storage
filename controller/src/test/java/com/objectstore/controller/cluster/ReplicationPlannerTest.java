@@ -17,7 +17,7 @@ class ReplicationPlannerTest {
     private final ClusterState cluster = t.cluster;
 
     private List<Command> queued(String workerId) {
-        return cluster.locked(() -> List.copyOf(cluster.worker(workerId).commands));
+        return cluster.locked(() -> cluster.worker(workerId).commands.stream().toList());
     }
 
     @Test

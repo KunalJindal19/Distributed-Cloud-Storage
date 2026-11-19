@@ -64,6 +64,7 @@ objectstore:
   apply-queue-capacity: ${APPLY_QUEUE_CAPACITY:10000}
   upload-commit-wait-seconds: ${UPLOAD_COMMIT_WAIT:10}
   download-settle-wait-seconds: ${DOWNLOAD_SETTLE_WAIT:5}
+  cleanup-budget: ${CLEANUP_BUDGET:2000}
 
 logging:
   level:

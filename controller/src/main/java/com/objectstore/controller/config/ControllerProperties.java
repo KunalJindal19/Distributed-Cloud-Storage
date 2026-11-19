@@ -47,7 +47,9 @@ public record ControllerProperties(
         /** How long an upload (or delete) waits for its task before answering anyway. */
         @Positive double uploadCommitWaitSeconds,
         /** How long a download waits for a chunk that is in the database but not yet readable in memory. */
-        @PositiveOrZero double downloadSettleWaitSeconds) {
+        @PositiveOrZero double downloadSettleWaitSeconds,
+        /** Ledger entries (and, later, cleanup chunks) re-checked per monitor tick. */
+        @Min(1) int cleanupBudget) {
 
     public Duration staleAfter() {
         return seconds(staleAfterSeconds);

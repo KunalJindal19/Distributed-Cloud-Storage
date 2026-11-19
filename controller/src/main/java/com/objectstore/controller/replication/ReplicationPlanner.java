@@ -33,9 +33,9 @@ import org.springframework.stereotype.Component;
  *       worker ({@code REPLICATE}, HDFS {@code DNA_TRANSFER}) and track the copy as pending.</li>
  *   <li><b>Over-replicated</b> ({@code live > RF}, nothing pending, no holder STALE or without a
  *       completed full report): mark the surplus copies EXCESS and order their deletion.</li>
- *   <li><b>Clean-up</b> on ALIVE workers: re-send a DELETE that was not confirmed in time; delete
- *       a CORRUPT copy, but only once RF good copies exist again (replace first, then invalidate,
- *       as HDFS does).</li>
+ *   <li><b>Clean-up</b> on ALIVE workers: a surplus copy, and a CORRUPT copy once RF good copies
+ *       exist again (replace first, then invalidate, as HDFS does), gets a deletion in the ledger,
+ *       which re-sends it until the worker confirms.</li>
  * </ol>
  *
  * Runs as part of the monitor's synchronous pass under the cluster lock. Each chunk is handled in
@@ -102,9 +102,7 @@ public class ReplicationPlanner {
             for (Map.Entry<String, Replica> entry : replicas.entrySet()) {
                 Replica replica = entry.getValue();
                 if (replica.state == ReplicaState.EXCESS && !replica.deleteDelivered) {
-                    if (replica.deleteCmdId != null) {
-                        cluster.cancelCommand(entry.getKey(), replica.deleteCmdId);
-                    }
+                    cluster.ledger().cancel(chunkId, entry.getKey());
                     replica.state = ReplicaState.OK;
                     replica.deleteCmdId = null;
                     replica.deleteQueuedAt = 0;
@@ -130,6 +128,10 @@ public class ReplicationPlanner {
             WorkerInfo targetWorker = cluster.worker(target.get());
             Command command = cluster.queueCommand(source.get(), InternalApi.COMMAND_REPLICATE, chunkId,
                     cluster.chunk(chunkId).checksum(), targetWorker.url, null);
+            if (command == null) {
+                cleanUp(chunkId, live.size(), rf, postpone);
+                return false;                                   // the source's queue is full
+            }
             cluster.addPending(chunkId, source.get(), target.get(), command.cmdId());
             log.info("[monitor] REPLICATE chunk={} copies={} {}->{} cmd={}", chunkId, live.size(),
                     source.get(), target.get(), command.cmdId());
@@ -150,20 +152,20 @@ public class ReplicationPlanner {
         return true;
     }
 
-    /** c) DELETE surplus copies (re-sending unconfirmed ones) and corrupt copies once replaced. */
+    /**
+     * c) Make sure every surplus copy, and every corrupt copy once RF good copies exist, has a
+     * deletion in the ledger (which re-sends it until the worker confirms).
+     */
     private void cleanUp(String chunkId, int live, int rf, boolean postpone) {
-        long now = cluster.now();
-        long timeout = properties.pendingTimeout().toNanos();
         for (Map.Entry<String, Replica> entry : new ArrayList<>(cluster.replicasOf(chunkId).entrySet())) {
             WorkerInfo worker = cluster.worker(entry.getKey());
             Replica replica = entry.getValue();
-            if (worker.state != WorkerState.ALIVE) {
+            if (worker.state != WorkerState.ALIVE || cluster.ledger().entry(chunkId, entry.getKey()) != null) {
                 continue;
             }
-            boolean due = replica.deleteQueuedAt == 0 || now - replica.deleteQueuedAt > timeout;
-            if (replica.state == ReplicaState.EXCESS && due) {
+            if (replica.state == ReplicaState.EXCESS) {
                 cluster.sendDelete(entry.getKey(), chunkId, "excess");
-            } else if (replica.state == ReplicaState.CORRUPT && due && live >= rf && !postpone) {
+            } else if (replica.state == ReplicaState.CORRUPT && live >= rf && !postpone) {
                 cluster.sendDelete(entry.getKey(), chunkId, "corrupt");
                 log.info("[monitor] DELETE corrupt chunk={} on {} ({} good copies exist)", chunkId, entry.getKey(), live);
             }

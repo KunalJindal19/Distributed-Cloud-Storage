@@ -126,7 +126,8 @@ public class ClusterStatusService {
                     queue.depth(),
                     queue.oldestAgeMillis(),
                     writer.takeBusyRatio(),
-                    cluster.openSessions());
+                    cluster.openSessions(),
+                    cluster.ledger().counts());
         });
     }
 
