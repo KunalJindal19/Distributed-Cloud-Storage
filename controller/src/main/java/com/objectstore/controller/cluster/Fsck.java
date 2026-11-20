@@ -35,7 +35,13 @@ import org.springframework.stereotype.Service;
  * </ol>
  *
  * Differences between disks and the block map are only meaningful while the cluster is
- * quiescent: no copies pending, no commands queued, not in safe mode.
+ * quiescent: no copies pending, no commands queued, not in safe mode, nothing in the apply queue,
+ * an empty deletion ledger, no report session open and no worker being purged.
+ *
+ * <p>Order (v4 §5.10): take the namespace lock; queue a {@code Barrier} and wait for it (every
+ * namespace task queued before is applied); read the database's chunk table and snapshot the
+ * in-memory state (read lock); release the namespace lock; list the disks; compare; run the full
+ * invariant check under the read lock.
  */
 @Service
 public class Fsck {
@@ -71,19 +77,45 @@ public class Fsck {
     private final ChunkRepository chunkRepository;
     private final ObjectRepository objects;
     private final ControllerProperties properties;
+    private final NamespaceLock namespaceLock;
+    private final Writer writer;
+    private final ApplyQueue queue;
 
     public Fsck(ClusterState cluster, WorkerClient workers, WorkerIo io, ChunkRepository chunkRepository,
-                ObjectRepository objects, ControllerProperties properties) {
+                ObjectRepository objects, ControllerProperties properties, NamespaceLock namespaceLock, Writer writer,
+                ApplyQueue queue) {
         this.cluster = cluster;
         this.workers = workers;
         this.io = io;
         this.chunkRepository = chunkRepository;
         this.objects = objects;
         this.properties = properties;
+        this.namespaceLock = namespaceLock;
+        this.writer = writer;
+        this.queue = queue;
     }
 
     public Result run() {
-        Snapshot snapshot = cluster.locked(this::snapshot);
+        Snapshot snapshot;
+        List<Chunk> database;
+        long totalObjects;
+        namespaceLock.lock();
+        try {
+            try {
+                writer.barrier(properties.uploadCommitWait());
+            } catch (java.util.concurrent.TimeoutException e) {
+                log.warn("[fsck] the writer did not reach the barrier within {} s; comparing anyway",
+                        properties.uploadCommitWaitSeconds());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            database = chunkRepository.findAll();
+            totalObjects = objects.count();
+            snapshot = cluster.read(this::snapshot);
+        } finally {
+            namespaceLock.unlock();
+        }
+        List<String> i7 = checkI7(database, snapshot.chunks());
 
         // 1. What is really on each live worker's disk (no lock held during network calls).
         List<String> workerIds = new ArrayList<>(snapshot.aliveUrls().keySet());
@@ -130,14 +162,15 @@ public class Fsck {
             }
         }
 
-        // 3. Invariants, including I7 (needs the database), and the per-object picture.
-        long totalObjects = objects.count();
+        // 3. Invariants (I7 was compared above, from the snapshot), and the per-object picture.
         long orphanCount = orphans;
-        return cluster.locked(() -> {
+        return cluster.read(() -> {
             List<String> violations = new ArrayList<>(cluster.checkInvariants());
-            violations.addAll(checkI7());
+            violations.addAll(i7);
             ObjectCounts counts = countObjects(totalObjects);
-            boolean quiescent = !cluster.isSafeMode() && cluster.pendingTotal() == 0 && cluster.queuedCommands() == 0;
+            boolean quiescent = !cluster.isSafeMode() && cluster.pendingTotal() == 0 && cluster.queuedCommands() == 0
+                    && queue.depth() == 0 && cluster.openSessions() == 0 && !cluster.anyPurging()
+                    && cluster.ledger().isEmpty();
             DiskVsMap diskVsMap = new DiskVsMap(List.copyOf(onDiskNotInMap), List.copyOf(inMapNotOnDisk),
                     List.copyOf(checksumMismatch));
             String status;
@@ -174,20 +207,20 @@ public class Fsck {
         return new Snapshot(alive, Map.copyOf(cluster.chunks()), blocks, Set.copyOf(cluster.pendingUploads()));
     }
 
-    /** I7: the in-memory chunk table mirrors the database exactly. Called under the lock. */
-    private List<String> checkI7() {
+    /** I7: the in-memory chunk table mirrors the database exactly (both read at the barrier). */
+    private List<String> checkI7(List<Chunk> rows, Map<String, ClusterState.ChunkInfo> memory) {
         List<String> violations = new ArrayList<>();
         Map<String, Chunk> database = new HashMap<>();
-        for (Chunk chunk : chunkRepository.findAll()) {
+        for (Chunk chunk : rows) {
             database.put(chunk.chunkId(), chunk);
         }
         for (Chunk chunk : database.values()) {
-            ClusterState.ChunkInfo mirror = cluster.chunk(chunk.chunkId());
+            ClusterState.ChunkInfo mirror = memory.get(chunk.chunkId());
             if (mirror == null || !mirror.checksum().equals(chunk.checksum()) || mirror.size() != chunk.size()) {
                 violations.add("I7: chunk " + chunk.chunkId() + " is in the database but not mirrored correctly in memory");
             }
         }
-        for (String chunkId : cluster.chunks().keySet()) {
+        for (String chunkId : memory.keySet()) {
             if (!database.containsKey(chunkId)) {
                 violations.add("I7: chunk " + chunkId + " is in memory but not in the database");
             }

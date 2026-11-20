@@ -38,7 +38,7 @@ public class ObjectViewAssembler {
     public ObjectResponse describe(StoredObject object) {
         List<Chunk> chunkRows = chunks.findChunksByObject(object.objectId());
         Map<String, String> metadata = objects.metadataOf(object.objectId());
-        return cluster.locked(() -> {
+        return cluster.read(() -> {
             boolean replicationOk = true;
             List<ChunkResponse> views = new ArrayList<>();
             for (Chunk chunk : chunkRows) {

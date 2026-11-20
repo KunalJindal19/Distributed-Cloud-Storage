@@ -34,14 +34,14 @@ public class SafeMode {
         this.properties = properties;
     }
 
-    /** One evaluation; runs under the lock from the monitor. @return true if safe mode is still on */
+    /** One evaluation, O(1); runs under the lock from the planner tick. @return true if safe mode is still on */
     public boolean evaluate() {
         if (!cluster.isSafeMode()) {
             return false;
         }
         long now = cluster.now();
         int total = cluster.chunks().size();
-        int reported = reportedChunks();
+        long reported = reportedChunks();
         boolean thresholdMet = total == 0 || (double) reported / total >= properties.safeModeThreshold();
         if (thresholdMet) {
             if (cluster.safeModeThresholdReachedAt() == 0) {
@@ -63,19 +63,9 @@ public class SafeMode {
         return true;
     }
 
-    /** Chunks with at least one OK copy on a worker whose full report has been processed. */
-    public int reportedChunks() {
-        int reported = 0;
-        for (String chunkId : cluster.chunks().keySet()) {
-            for (Map.Entry<String, Replica> entry : cluster.replicasOf(chunkId).entrySet()) {
-                WorkerInfo worker = cluster.worker(entry.getKey());
-                if (entry.getValue().state == ReplicaState.OK && worker != null && worker.hasReported && !worker.isDead()) {
-                    reported++;
-                    break;
-                }
-            }
-        }
-        return reported;
+    /** Chunks with at least one live OK copy: the index's O(1) {@code safeCount}. */
+    public long reportedChunks() {
+        return cluster.safeCount();
     }
 
     /** Writes are refused while safe mode is on. */

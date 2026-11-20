@@ -34,13 +34,17 @@ public class ClusterBootstrap {
 
     @PostConstruct
     void load() {
-        cluster.locked(() -> {
-            cluster.setClusterId(meta.clusterId());
-            for (Chunk chunk : chunks.findAll()) {
+        // SQLite first, with no lock held; then one write block for the mirror.
+        String clusterId = meta.clusterId();
+        java.util.List<Chunk> rows = chunks.findAll();
+        java.util.List<String> garbage = objects.garbageObjectIds();
+        cluster.write(() -> {
+            cluster.setClusterId(clusterId);
+            for (Chunk chunk : rows) {
                 cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(
                         chunk.objectId(), chunk.index(), chunk.size(), chunk.checksum()));
             }
-            objects.garbageObjectIds().forEach(cluster::addGarbage);
+            garbage.forEach(cluster::addGarbage);
             cluster.setSafeMode(true);
             log.info("[safemode] ON: cluster {} with {} chunks; waiting for block reports", cluster.clusterId(),
                     cluster.chunks().size());

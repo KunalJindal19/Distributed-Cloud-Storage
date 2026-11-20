@@ -16,17 +16,16 @@ class ClusterStateTest {
     private final ClusterState cluster = t.cluster;
 
     @Test
-    void aReplicaIsOnlyRecordedOnAKnownLiveWorkerForAKnownChunkFromTheExpectedProcess() {
-        String boot = t.join("worker1");
+    void aReplicaIsOnlyRecordedOnAKnownLiveWorkerForAKnownChunk() {
+        t.join("worker1");
         cluster.locked(() -> {
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, null)).isFalse(); // unknown chunk
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNull(); // unknown chunk
             cluster.putChunk(chunk(0), new ClusterState.ChunkInfo(TestSupport.OBJECT, 0, 10, TestSupport.SUM));
-            assertThat(cluster.addReplica(chunk(0), "worker9", false, ReplicaState.OK, null)).isFalse(); // unknown worker
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, "old-boot")).isFalse(); // restarted
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, boot)).isTrue();
+            assertThat(cluster.addReplica(chunk(0), "worker9", ReplicaState.OK)).isNull(); // unknown worker
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNotNull();
             cluster.worker("worker1").state = WorkerState.DEAD;
             cluster.removeWorkerReplicas("worker1");
-            assertThat(cluster.addReplica(chunk(0), "worker1", false, ReplicaState.OK, null)).isFalse(); // DEAD
+            assertThat(cluster.addReplica(chunk(0), "worker1", ReplicaState.OK)).isNull(); // DEAD
             assertThat(cluster.checkInvariants()).isEmpty();
         });
     }
@@ -39,8 +38,8 @@ class ClusterStateTest {
         t.join("worker3", chunk(0));
         cluster.locked(() -> {
             cluster.worker("worker1").state = WorkerState.STALE;
-            cluster.replica(chunk(0), "worker2").state = ReplicaState.CORRUPT;
-            cluster.replica(chunk(0), "worker3").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker2", ReplicaState.CORRUPT);
+            cluster.setReplicaState(chunk(0), "worker3", ReplicaState.EXCESS);
             assertThat(cluster.live(chunk(0))).containsExactly("worker1");
         });
     }
@@ -63,16 +62,21 @@ class ClusterStateTest {
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         cluster.locked(() -> {
-            Command first = cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "excess");
-            Command again = cluster.queueCommand("worker1", InternalApi.COMMAND_DELETE, chunk(0), null, null, "excess");
+            Command first = cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://w2:1", null);
+            Command again = cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://w2:1", null);
             assertThat(again.cmdId()).isEqualTo(first.cmdId());
             assertThat(cluster.worker("worker1").commands).hasSize(1);
-            cluster.replica(chunk(0), "worker1").state = ReplicaState.EXCESS;
-            cluster.replica(chunk(0), "worker1").deleteCmdId = first.cmdId();
+            cluster.takeCommands(cluster.worker("worker1"));
+            cluster.setReplicaState(chunk(0), "worker1", ReplicaState.EXCESS);
+            cluster.sendDelete("worker1", chunk(0), "excess");
+            cluster.sendDelete("worker1", chunk(0), "excess");                  // one entry per pair
+            assertThat(cluster.worker("worker1").commands).hasSize(1);
+            Command delete = cluster.worker("worker1").commands.iterator().next();
 
             List<Command> delivered = cluster.takeCommands(cluster.worker("worker1"));
 
-            assertThat(delivered).containsExactly(first);
+            assertThat(delivered).containsExactly(delete);
+            assertThat(cluster.ledger().entry(chunk(0), "worker1").state).isEqualTo(DeletionLedger.State.DELIVERED);
             assertThat(cluster.replica(chunk(0), "worker1").deleteDelivered).isTrue();
             assertThat(cluster.worker("worker1").commands).isEmpty();
         });
@@ -104,5 +108,21 @@ class ClusterStateTest {
             assertThat(cluster.pendingTotal()).isZero();
             assertThat(cluster.checkInvariants()).isEmpty();
         });
+    }
+
+    @Test
+    void edge26_theRollingCheckFindsCountsAndRepairsADriftedIndexEntry() {
+        t.knowChunk(chunk(0));
+        t.join("worker1", chunk(0));
+        t.join("worker2", chunk(0));
+        // Drift: a state change that bypasses markDirty (what a bug elsewhere would look like).
+        cluster.write(() -> cluster.replica(chunk(0), "worker2").state = ReplicaState.CORRUPT);
+
+        List<String> problems = cluster.write(() -> cluster.rollingCheck(100));
+
+        assertThat(problems).anyMatch(p -> p.startsWith("I10"));
+        assertThat(cluster.counter("index_mismatches")).isEqualTo(1);
+        assertThat(cluster.write(cluster::checkInvariants)).as("repaired").isEmpty();
+        assertThat(cluster.read(() -> cluster.levels().levelOf(chunk(0)))).isEqualTo(cluster.levels().levelFor(1, 0));
     }
 }

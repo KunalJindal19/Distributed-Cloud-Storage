@@ -22,9 +22,17 @@ public record WorkerProperties(
         @Positive double heartbeatIntervalSeconds,
         @Positive double heartbeatHttpTimeoutSeconds,
         @Positive double fullReportIntervalSeconds,
-        @Positive double ibrIntervalSeconds,
-        @Positive int ibrBufferMax,
+        /** Earliest next heartbeat when changes or report segments are waiting. */
+        @Positive long heartbeatMinGapMs,
+        /** Un-acknowledged changes kept; on overflow all are dropped and a full report starts. */
+        @Positive int changeLogMax,
+        @Positive int maxChangesPerMessage,
+        @Positive int maxChangesPerPutAnswer,
+        /** Entries per full-report segment. */
+        @Positive int reportSegmentSize,
         @Positive double scanIntervalSeconds,
+        /** The block scanner reads at most this many bytes per second. */
+        @Positive long scanMaxBytesPerSec,
         @Positive double diskCheckIntervalSeconds,
         @Positive double connectTimeoutSeconds,
         @Positive double readTimeoutSeconds,
@@ -48,8 +56,8 @@ public record WorkerProperties(
         return seconds(fullReportIntervalSeconds);
     }
 
-    public Duration ibrInterval() {
-        return seconds(ibrIntervalSeconds);
+    public Duration heartbeatMinGap() {
+        return Duration.ofMillis(heartbeatMinGapMs);
     }
 
     public Duration scanInterval() {

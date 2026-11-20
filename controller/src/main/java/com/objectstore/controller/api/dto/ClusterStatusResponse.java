@@ -20,7 +20,21 @@ public record ClusterStatusResponse(
         int pendingReplications,
         long blocked,
         Map<String, Long> counters,
-        List<RepairEvent> repairLog) {
+        List<RepairEvent> repairLog,
+        /** Longest continuous write-lock hold since the last status read (ms), and per holder. */
+        double lockMaxHoldMs,
+        Map<String, Double> lockMaxHoldBy,
+        int applyQueueDepth,
+        long applyOldestTaskAgeMs,
+        /** Fraction of the time since the last status read that the writer held the lock. */
+        double writerBusyRatio,
+        long reportSessionsOpen,
+        /** The deletion ledger: {waiting, queued, delivered}. */
+        Map<String, Integer> ledger,
+        /** Chunks needing copies by priority level {"L,P": size} (L live, P pending). */
+        Map<String, Integer> levels,
+        int cleanupSize,
+        int postponedSize) {
 
     public record Config(
             int chunkSize,

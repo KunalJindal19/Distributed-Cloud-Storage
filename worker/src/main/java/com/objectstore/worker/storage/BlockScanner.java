@@ -1,23 +1,26 @@
 package com.objectstore.worker.storage;
 
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.worker.reporting.IbrBuffer;
 import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * The DataNode block scanner: every SCAN_INTERVAL it re-hashes each chunk on disk, one at a
- * time, and compares the result with the sidecar. A mismatch is reported as {@code bad} (the
- * controller then replaces the copy and only afterwards orders its deletion). The scanner itself
- * never deletes anything.
+ * The DataNode block scanner. At most one pass per SCAN_INTERVAL; each pass:
  *
- * <p>A bad chunk is reported once per process lifetime, plus once more after each full report,
- * so a lost report does not hide the damage for ever and a known problem is not repeated every
- * ten seconds.
+ * <ol>
+ *   <li><b>Reconciles</b> the store's index with the chunk directory (names only): a chunk file
+ *       copied in by hand is indexed and reported {@code received}; an indexed chunk whose file
+ *       was deleted by hand is dropped and reported {@code deleted} ({@link ChunkStore#reconcile()}).</li>
+ *   <li><b>Verifies</b> every indexed chunk against its sidecar, reading at most
+ *       SCAN_MAX_BYTES_PER_SEC (a token bucket refilled each second). A chunk that fails and is
+ *       not already known bad becomes known bad and is reported {@code bad}, exactly once; one
+ *       that verifies again (its file was replaced) is no longer known bad.</li>
+ * </ol>
+ *
+ * The controller replaces a bad copy and only afterwards orders its deletion. The scanner itself
+ * never deletes anything.
  */
 @Component
 public class BlockScanner implements Runnable {
@@ -25,21 +28,23 @@ public class BlockScanner implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(BlockScanner.class);
 
     private final ChunkStore store;
-    private final IbrBuffer ibr;
     private final WorkerProperties properties;
-    private final Set<String> reported = ConcurrentHashMap.newKeySet();
 
-    public BlockScanner(ChunkStore store, IbrBuffer ibr, WorkerProperties properties) {
+    public BlockScanner(ChunkStore store, WorkerProperties properties) {
         this.store = store;
-        this.ibr = ibr;
         this.properties = properties;
     }
 
     @Override
     public void run() {
+        long nextPass = System.nanoTime() + properties.scanInterval().toNanos();
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                Thread.sleep(properties.scanInterval());
+                long wait = nextPass - System.nanoTime();
+                if (wait > 0) {
+                    Thread.sleep(wait / 1_000_000, (int) (wait % 1_000_000));
+                }
+                nextPass = System.nanoTime() + properties.scanInterval().toNanos();
                 scanOnce();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -50,34 +55,40 @@ public class BlockScanner implements Runnable {
         }
     }
 
-    /** One pass over every chunk. */
-    public int scanOnce() {
-        int corrupt = 0;
+    /**
+     * One pass: reconciliation, then rate-limited verification of every indexed chunk.
+     *
+     * @return number of chunks that failed verification in this pass
+     */
+    public int scanOnce() throws InterruptedException {
+        ChunkStore.Reconciled reconciled = store.reconcile();
+        if (!reconciled.isEmpty()) {
+            log.info("[scanner] reconciled: {} added, {} removed", reconciled.added(), reconciled.removed());
+        }
+        TokenBucket bucket = new TokenBucket(properties.scanMaxBytesPerSec());
+        int failed = 0;
         for (String chunkId : store.chunkIds()) {
-            Optional<String> onDisk = store.hashOnDisk(chunkId);
-            Optional<ChunkStore.Meta> meta = store.readMeta(chunkId);
-            if (onDisk.isEmpty()) {
+            ChunkStore.Entry entry = store.index().get(chunkId);
+            if (entry == null) {
                 continue; // deleted meanwhile
             }
-            if (meta.isEmpty() && !store.isSettled(chunkId)) {
-                continue; // no sidecar yet: a write in progress
+            bucket.acquire(entry.size());
+            Optional<Boolean> ok = store.verify(chunkId);
+            if (ok.isPresent() && !ok.get()) {
+                ok = store.verifyLocked(chunkId); // not a write in progress?
             }
-            if (meta.isEmpty() || !onDisk.get().equals(meta.get().checksum())) {
-                corrupt++;
-                if (reported.add(chunkId)) {
-                    log.warn("[scanner] CORRUPT chunk={} disk={} meta={}", chunkId, onDisk.get(),
-                            meta.map(ChunkStore.Meta::checksum).orElse("missing or unreadable"));
-                    ibr.bad(chunkId);
+            if (ok.isEmpty()) {
+                continue; // gone: the next reconciliation reports it
+            }
+            if (!ok.get()) {
+                failed++;
+                if (store.markBad(chunkId, "scanner")) {
+                    log.warn("[scanner] CORRUPT chunk={} (data does not match its sidecar); reported bad", chunkId);
                 }
-            } else {
-                reported.remove(chunkId);
+            } else if (store.clearBad(chunkId)) {
+                log.info("[scanner] chunk={} verifies again (its file was replaced)", chunkId);
             }
         }
-        return corrupt;
-    }
-
-    /** After a full report the controller may have lost earlier {@code bad} events: report again once. */
-    public void afterFullReport() {
-        reported.clear();
+        return failed;
     }
 }
