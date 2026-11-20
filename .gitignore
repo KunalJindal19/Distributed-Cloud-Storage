@@ -3,6 +3,7 @@ Implementation_Spec_v2.pdf
 Project_Flow_Architecture_v2.pdf
 Mini_Distributed_Cloud_Object_Store.pdf
 prompt_v2_hdfs.md
+Prompt_v4_Event_Driven.md
 
 # --- Build output ---
 target/
@@ -33,3 +34,4 @@ Thumbs.db
 # --- Python bytecode (tests/chaos.py) ---
 __pycache__/
 *.pyc
+prompt_v3_1_scale.md

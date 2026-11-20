@@ -6,16 +6,16 @@ import org.springframework.stereotype.Component;
 
 /**
  * What identifies this worker <em>process</em> to the controller: a boot id generated once per
- * start, and two sequence counters (heartbeats and reports have their own), both starting at 0.
- * Together they let the controller recognise messages from an old process and replayed or
- * reordered messages.
+ * start, the heartbeat sequence counter (the first heartbeat is 0) and the registration attempt
+ * counter (the first attempt is 1). Together they let the controller recognise messages from an
+ * old process, replayed or reordered heartbeats, and a delayed old registration.
  */
 @Component
 public class WorkerIdentity {
 
     private final String bootId = UUID.randomUUID().toString();
     private final AtomicLong hbSeq = new AtomicLong(-1);
-    private final AtomicLong reportSeq = new AtomicLong(-1);
+    private final AtomicLong attempts = new AtomicLong();
     private volatile boolean registered;
 
     public String bootId() {
@@ -26,16 +26,16 @@ public class WorkerIdentity {
         return hbSeq.incrementAndGet();
     }
 
-    public long nextReportSeq() {
-        return reportSeq.incrementAndGet();
+    public long nextRegistrationAttempt() {
+        return attempts.incrementAndGet();
     }
 
     public long lastHeartbeatSeq() {
         return hbSeq.get();
     }
 
-    public long lastReportSeq() {
-        return reportSeq.get();
+    public long lastRegistrationAttempt() {
+        return attempts.get();
     }
 
     /** True while the controller knows this process. Cleared when it answers 404 or stale_boot. */

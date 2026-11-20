@@ -11,8 +11,9 @@ import jakarta.validation.constraints.Pattern;
  * @param bootId    uuid of this worker <em>process</em>; a new one on every start
  * @param clusterId the cluster id stored in the worker's {@code /data/VERSION}, or {@code null}
  *                  for a fresh volume
+ * @param attempt   per-process registration attempt number, incremented on every attempt
+ * @param changeSeq the baseline: the last change number the coming full report will include
  * @param hbSeq     the last heartbeat sequence number this process used (-1 if none yet)
- * @param reportSeq the last report sequence number this process used (-1 if none yet)
  */
 public record RegisterRequest(
         @JsonProperty("worker_id")
@@ -27,8 +28,9 @@ public record RegisterRequest(
 
         @JsonProperty("boot_id") @NotBlank(message = "boot_id is required") String bootId,
         @JsonProperty("cluster_id") String clusterId,
+        @JsonProperty("attempt") long attempt,
+        @JsonProperty("change_seq") long changeSeq,
         @JsonProperty("hb_seq") long hbSeq,
-        @JsonProperty("report_seq") long reportSeq,
         @JsonProperty("sent_at") double sentAt,
         @JsonProperty("stats") WorkerStats stats) {
 }

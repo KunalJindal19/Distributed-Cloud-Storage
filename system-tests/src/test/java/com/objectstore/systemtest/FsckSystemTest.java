@@ -14,6 +14,15 @@ import tools.jackson.databind.JsonNode;
 /** Block 9: fsck compares every disk with the block map and the namespace. */
 class FsckSystemTest extends ClusterTest {
 
+    /**
+     * A chunk file planted by hand that belongs to no object is collected by the next full report
+     * (the orphan safety valve needs the whole listing); these tests want that within seconds.
+     */
+    @Override
+    void configure(InProcessCluster cluster) {
+        cluster.workerSetting("worker.full-report-interval-seconds", "1.5");
+    }
+
     private JsonNode fsck() {
         return api.json(api.get("/api/v1/fsck").body());
     }

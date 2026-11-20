@@ -17,7 +17,7 @@ class ReplicationPlannerTest {
     private final ClusterState cluster = t.cluster;
 
     private List<Command> queued(String workerId) {
-        return cluster.locked(() -> List.copyOf(cluster.worker(workerId).commands));
+        return cluster.locked(() -> cluster.worker(workerId).commands.stream().toList());
     }
 
     @Test
@@ -77,7 +77,7 @@ class ReplicationPlannerTest {
     }
 
     @Test
-    void surplusCopiesAreTrimmedOnlyWhenEveryHolderIsCurrent() {
+    void edge27_surplusCopiesAreTrimmedOnlyWhenEveryHolderIsCurrent() {
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         t.join("worker2", chunk(0));
@@ -87,7 +87,7 @@ class ReplicationPlannerTest {
         t.plan();
         assertThat(cluster.locked(() -> cluster.live(chunk(0)))).hasSize(3); // postponed: a holder is STALE
 
-        cluster.locked(() -> cluster.worker("worker3").state = WorkerState.ALIVE);
+        t.send("worker3", List.of(), null);                   // ALIVE again: its postponed chunks are released
         t.plan();
 
         cluster.locked(() -> {
@@ -204,7 +204,7 @@ class ReplicationPlannerTest {
         single.join("worker2", chunk(6));
         single.join("worker3");
         single.cluster.locked(() -> {
-            single.cluster.replica(chunk(5), "worker1").state = ReplicaState.CORRUPT; // chunk 5: 0 live copies
+            single.cluster.setReplicaState(chunk(5), "worker1", ReplicaState.CORRUPT); // chunk 5: 0 live copies
         });
         single.plan();
         assertThat(single.cluster.events()).anyMatch(e -> e.event().equals("unrecoverable") && e.chunkId().equals(chunk(5)));

@@ -25,12 +25,17 @@ public class ClusterStatusService {
     private final ControllerProperties properties;
     private final ObjectRepository objects;
     private final Clock clock;
+    private final ApplyQueue queue;
+    private final Writer writer;
 
-    public ClusterStatusService(ClusterState cluster, ControllerProperties properties, ObjectRepository objects, Clock clock) {
+    public ClusterStatusService(ClusterState cluster, ControllerProperties properties, ObjectRepository objects, Clock clock,
+                                ApplyQueue queue, Writer writer) {
         this.cluster = cluster;
         this.properties = properties;
         this.objects = objects;
         this.clock = clock;
+        this.queue = queue;
+        this.writer = writer;
     }
 
     /**
@@ -40,40 +45,16 @@ public class ClusterStatusService {
     public record Health(int underReplicated, int overReplicated, int missing, long ok, long corrupt, long excess) {
     }
 
+    /** O(1): every number comes from the priority index's counters. */
     public Health health() {
-        int rf = properties.replicationFactor();
-        int under = 0;
-        int over = 0;
-        int missing = 0;
-        long ok = 0;
-        long corrupt = 0;
-        long excess = 0;
-        for (String chunkId : cluster.chunks().keySet()) {
-            // Counted on live copies only: a copy that is merely ordered (pending) does not protect
-            // anything yet. (The monitor schedules on live + pending, so it does not order twice.)
-            int live = cluster.live(chunkId).size();
-            if (live == 0) {
-                missing++;
-            }
-            if (live < rf) {
-                under++;
-            } else if (live > rf) {
-                over++;
-            }
-            for (Replica replica : cluster.replicasOf(chunkId).values()) {
-                switch (replica.state) {
-                    case OK -> ok++;
-                    case CORRUPT -> corrupt++;
-                    case EXCESS -> excess++;
-                }
-            }
-        }
-        return new Health(under, over, missing, ok, corrupt, excess);
+        long[] h = cluster.health();          // missing, under (1 <= live < RF), over, ok, corrupt, excess
+        return new Health((int) (h[1] + h[0]), (int) h[2], (int) h[0], h[3], h[4], h[5]);
     }
 
     public ClusterStatusResponse status() {
         long objectCount = objects.count();
-        return cluster.locked(() -> {
+        Map<String, Double> lockMaxHold = cluster.takeLockMaxHoldMs();   // reset by reading
+        return cluster.read(() -> {
             Health health = health();
             List<WorkerView> workers = new ArrayList<>();
             for (WorkerInfo worker : cluster.workersSorted()) {
@@ -93,7 +74,9 @@ public class ClusterStatusService {
                         worker.stats));
             }
             Map<String, Long> counters = cluster.counters();
-            for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked")) {
+            for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked",
+                    "changes_gap", "apply_queue_full", "writer_task_failures", "namespace_reconciled",
+                    "index_mismatches", "upload_commit_wait_timeouts")) {
                 counters.putIfAbsent(name, 0L);
             }
             return new ClusterStatusResponse(
@@ -112,7 +95,17 @@ public class ClusterStatusService {
                     cluster.pendingTotal(),
                     cluster.blockedLastTick(),
                     counters,
-                    cluster.events());
+                    cluster.events(),
+                    lockMaxHold.values().stream().mapToDouble(Double::doubleValue).max().orElse(0),
+                    lockMaxHold,
+                    queue.depth(),
+                    queue.oldestAgeMillis(),
+                    writer.takeBusyRatio(),
+                    cluster.openSessions(),
+                    cluster.ledger().counts(),
+                    cluster.levels().sizes(),
+                    cluster.cleanupSize(),
+                    cluster.postponedSize());
         });
     }
 

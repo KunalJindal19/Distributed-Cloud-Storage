@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BASE  ?= http://localhost:8000
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down down-v restart ps logs status fsck dashboard stop start pause unpause corrupt test scenarios chaos demo
+.PHONY: help build up down down-v restart ps logs status fsck dashboard stop start pause unpause corrupt test test-scale scenarios chaos demo
 
 help:            ## show this help
 	@grep -E '^[a-z-]+: .*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -64,6 +64,9 @@ test:            ## unit tests + in-process system tests (JDK 21+ and Maven, or 
 		docker run --rm -v "$(CURDIR)":/workspace -v objectstore_m2:/root/.m2 -w /workspace \
 			maven:3.9-eclipse-temurin-21 mvn -B -ntp verify; \
 	fi
+
+test-scale:      ## the scale test: 500,000 chunks, 8 workers, no HTTP (a few minutes)
+	mvn -B -ntp -Pscale test -pl controller -am
 
 scenarios:       ## the acceptance-criteria scripts against Docker (about 15 min; wipes data)
 	@for script in tests/scenarios/block*.sh; do echo "### $$script"; BASE_URL=$(BASE) $$script || exit 1; done

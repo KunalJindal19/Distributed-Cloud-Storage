@@ -6,7 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.objectstore.common.Checksums;
 import com.objectstore.common.dto.ChunkInfo;
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.worker.reporting.IbrBuffer;
+import com.objectstore.worker.reporting.ChangeLog;
 import com.objectstore.worker.storage.BlockScanner;
 import com.objectstore.worker.storage.ChunkStore;
 import com.objectstore.worker.storage.ChunkStore.WriteResult;
@@ -30,21 +30,20 @@ class ChunkStoreTest {
     Path dataDir;
 
     private WorkerProperties properties;
-    private IbrBuffer ibr;
+    private ChangeLog changes;
     private ChunkStore store;
     private Path chunkDir;
 
     @BeforeEach
     void setUp() {
-        properties = new WorkerProperties("worker1", dataDir, "http://controller:8000", "", 1_048_576,
-                2, 3, 30, 0.5, 10_000, 10, 30, 2, 10, false);
+        properties = TestSupport.properties(dataDir);
         chunkDir = properties.chunkDir();
-        ibr = new IbrBuffer(properties);
+        changes = new ChangeLog(properties);
         store = newStore();
     }
 
     private ChunkStore newStore() {
-        ChunkStore created = new ChunkStore(properties, ibr);
+        ChunkStore created = new ChunkStore(properties, changes);
         ReflectionTestUtils.invokeMethod(created, "initialise");
         return created;
     }
@@ -59,7 +58,7 @@ class ChunkStoreTest {
         assertThat(Files.readAllBytes(chunkDir.resolve(CHUNK_A))).isEqualTo(data);
         assertThat(Files.readString(chunkDir.resolve(CHUNK_A + ".meta"))).isEqualTo(sha + " 1048576\n");
         assertThat(filesIn(chunkDir)).containsExactly(CHUNK_A, CHUNK_A + ".meta");
-        assertThat(ibr.drain().received()).containsExactly(new ChunkInfo(CHUNK_A, 1_048_576, sha));
+        assertThat(TestSupport.drain(changes).received()).containsExactly(new ChunkInfo(CHUNK_A, 1_048_576, sha));
     }
 
     @Test
@@ -68,7 +67,7 @@ class ChunkStoreTest {
                 .isInstanceOf(ChunkStore.ChecksumMismatchException.class);
 
         assertThat(filesIn(chunkDir)).isEmpty();
-        assertThat(ibr.hasEvents()).isFalse();
+        assertThat(TestSupport.pending(changes)).isFalse();
     }
 
     @Test
@@ -87,7 +86,7 @@ class ChunkStoreTest {
     void readVerifiesAgainstTheSidecarAndReportsDamage() throws IOException {
         byte[] data = bytes(5000, 3);
         store.write(CHUNK_A, data, Checksums.sha256Hex(data));
-        ibr.drain();
+        TestSupport.drain(changes);
 
         assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isFalse();
 
@@ -96,7 +95,7 @@ class ChunkStoreTest {
         Files.write(chunkDir.resolve(CHUNK_A), damaged);
 
         assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isTrue();
-        assertThat(ibr.drain().bad()).containsExactly(CHUNK_A);
+        assertThat(TestSupport.drain(changes).bad()).containsExactly(CHUNK_A);
     }
 
     @Test
@@ -106,23 +105,23 @@ class ChunkStoreTest {
         Files.writeString(chunkDir.resolve(CHUNK_A + ".meta"), "garbage");
 
         assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isTrue();
-        assertThat(store.list()).isEmpty(); // possibly a write in progress: not reported yet
-
-        Files.setLastModifiedTime(chunkDir.resolve(CHUNK_A),
-                java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() - 60_000));
+        // Known bad from now on: listed with a checksum that matches nothing, reported once.
         assertThat(store.list()).containsExactly(new ChunkInfo(CHUNK_A, 500, ChunkStore.UNVERIFIED));
+        assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isTrue();
+        assertThat(TestSupport.drain(changes).bad()).containsExactly(CHUNK_A);
     }
 
     @Test
     void deleteRemovesBothFilesAndAlwaysReportsTheDeletion() throws IOException {
         byte[] data = bytes(10, 1);
         store.write(CHUNK_A, data, Checksums.sha256Hex(data));
-        ibr.drain();
+        TestSupport.drain(changes);
 
         assertThat(store.delete(CHUNK_A)).isTrue();
         assertThat(store.delete(CHUNK_A)).isFalse();
         assertThat(filesIn(chunkDir)).isEmpty();
-        assertThat(ibr.drain().deleted()).containsExactly(CHUNK_A);
+        // DELETED is logged even when the chunk was already absent (v4 §4.1).
+        assertThat(TestSupport.drain(changes).deleted()).containsExactly(CHUNK_A, CHUNK_A);
     }
 
     @Test
@@ -170,20 +169,18 @@ class ChunkStoreTest {
     }
 
     @Test
-    void theScannerReportsABadChunkOnceUntilTheNextFullReport() throws IOException {
+    void theScannerReportsABadChunkExactlyOnceAndNeverDeletesIt() throws Exception {
         byte[] data = bytes(2000, 5);
         store.write(CHUNK_A, data, Checksums.sha256Hex(data));
-        ibr.drain();
+        TestSupport.drain(changes);
         Files.write(chunkDir.resolve(CHUNK_A), "XXXX".getBytes(StandardCharsets.US_ASCII), java.nio.file.StandardOpenOption.WRITE);
-        BlockScanner scanner = new BlockScanner(store, ibr, properties);
+        BlockScanner scanner = new BlockScanner(store, properties);
 
         assertThat(scanner.scanOnce()).isEqualTo(1);
-        assertThat(ibr.drain().bad()).containsExactly(CHUNK_A);
-        scanner.scanOnce();
-        assertThat(ibr.hasEvents()).isFalse();
-        scanner.afterFullReport();
-        scanner.scanOnce();
-        assertThat(ibr.drain().bad()).containsExactly(CHUNK_A);
+        assertThat(TestSupport.drain(changes).bad()).containsExactly(CHUNK_A);
+        assertThat(scanner.scanOnce()).isEqualTo(1);           // still bad, but already known: not reported again
+        assertThat(TestSupport.pending(changes)).isFalse();
+        assertThat(store.isKnownBad(CHUNK_A)).isTrue();
         assertThat(Files.exists(chunkDir.resolve(CHUNK_A))).isTrue(); // never deletes
     }
 
@@ -202,17 +199,78 @@ class ChunkStoreTest {
     }
 
     @Test
-    void theIbrBufferOverflowsIntoAFullReport() {
-        WorkerProperties tiny = new WorkerProperties("worker1", dataDir, "http://c", "", 1_048_576,
-                2, 3, 30, 0.5, 2, 10, 30, 2, 10, false);
-        IbrBuffer small = new IbrBuffer(tiny);
-        small.deleted(CHUNK_A);
-        small.deleted(CHUNK_B);
-        assertThat(small.takeOverflow()).isFalse();
-        small.bad("3f1c9a52-7d0e-4c1b-9a54-1f2e3d4c5b6a-00002");
+    void theIndexAndItsTotalsEqualAFreshDiskWalkAfterAnyWritesAndDeletes() throws IOException {
+        java.util.Random random = new java.util.Random(11);
+        java.util.Map<String, byte[]> contents = new java.util.HashMap<>();   // what each chunk id holds
+        for (int op = 0; op < 400; op++) {
+            String chunkId = "3f1c9a52-7d0e-4c1b-9a54-1f2e3d4c5b6a-%05d".formatted(random.nextInt(40));
+            byte[] data = contents.computeIfAbsent(chunkId, id -> bytes(100 + random.nextInt(900), id.hashCode()));
+            switch (random.nextInt(4)) {
+                case 0, 1 -> store.write(chunkId, data, Checksums.sha256Hex(data));   // CREATED or EXISTS
+                case 2 -> store.delete(chunkId);
+                default -> {
+                    if (Files.exists(chunkDir.resolve(chunkId))) {       // rot it, then write it again
+                        Files.write(chunkDir.resolve(chunkId), "rot".getBytes(StandardCharsets.US_ASCII),
+                                java.nio.file.StandardOpenOption.WRITE);
+                        assertThat(store.write(chunkId, data, Checksums.sha256Hex(data))).isEqualTo(WriteResult.CREATED);
+                        assertThat(Files.readAllBytes(chunkDir.resolve(chunkId))).isEqualTo(data);
+                    }
+                }
+            }
+        }
+        ChunkStore fresh = newStore();   // a new process: the index comes from one disk walk
+        assertThat(store.index()).isEqualTo(fresh.index());
+        long bytesOnDisk = 0;
+        for (String chunkId : fresh.index().keySet()) {
+            bytesOnDisk += Files.size(chunkDir.resolve(chunkId));
+        }
+        assertThat(store.stats(0).chunks()).isEqualTo(fresh.index().size());
+        assertThat(store.stats(0).usedBytes()).isEqualTo(bytesOnDisk);
+        assertThat(fresh.stats(0)).isEqualTo(store.stats(0));
+    }
 
-        assertThat(small.takeOverflow()).isTrue();
-        assertThat(small.hasEvents()).isFalse();
+    @Test
+    void statsAreO1AndNeverListTheChunks() {
+        byte[] data = bytes(10, 1);
+        store.write(CHUNK_A, data, Checksums.sha256Hex(data));
+        ChunkStore spy = org.mockito.Mockito.spy(store);
+
+        assertThat(spy.stats(0).chunks()).isEqualTo(1);
+
+        org.mockito.Mockito.verify(spy, org.mockito.Mockito.never()).list();
+        org.mockito.Mockito.verify(spy, org.mockito.Mockito.never()).listVerified();
+        org.mockito.Mockito.verify(spy, org.mockito.Mockito.never()).chunkIds();
+    }
+
+    @Test
+    void edge10_writingAnExistingChunkWithGoodDataReannouncesIt() {
+        byte[] data = bytes(800, 4);
+        String sha = Checksums.sha256Hex(data);
+        store.write(CHUNK_A, data, sha);
+        TestSupport.drain(changes);
+
+        assertThat(store.write(CHUNK_A, data, sha)).isEqualTo(WriteResult.EXISTS);
+
+        assertThat(TestSupport.drain(changes).received()).containsExactly(new ChunkInfo(CHUNK_A, 800, sha));
+    }
+
+    @Test
+    void edge10_writingAnExistingChunkWhoseDataIsRottenRewritesItReannouncesItAndCreatesIt() throws IOException {
+        byte[] data = bytes(800, 5);
+        String sha = Checksums.sha256Hex(data);
+        store.write(CHUNK_A, data, sha);
+        Files.write(chunkDir.resolve(CHUNK_A), "XXXX".getBytes(StandardCharsets.US_ASCII), java.nio.file.StandardOpenOption.WRITE);
+        assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isTrue();
+        assertThat(store.isKnownBad(CHUNK_A)).isTrue();
+        TestSupport.drain(changes);
+
+        assertThat(store.write(CHUNK_A, data, sha)).isEqualTo(WriteResult.CREATED);
+
+        assertThat(Files.readAllBytes(chunkDir.resolve(CHUNK_A))).isEqualTo(data);
+        assertThat(store.isKnownBad(CHUNK_A)).isFalse();
+        assertThat(store.read(CHUNK_A).orElseThrow().corrupt()).isFalse();
+        assertThat(TestSupport.drain(changes).received()).containsExactly(new ChunkInfo(CHUNK_A, 800, sha));
+        assertThat(filesIn(chunkDir)).containsExactly(CHUNK_A, CHUNK_A + ".meta");
     }
 
     private static byte[] bytes(int length, int seed) {
