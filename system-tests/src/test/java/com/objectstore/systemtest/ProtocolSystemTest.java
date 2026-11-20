@@ -17,6 +17,15 @@ import tools.jackson.databind.JsonNode;
 /** Block 6 (with the v4 change-stream protocol): liveness, reports, safe mode, cluster identity, scanner, orphan GC. */
 class ProtocolSystemTest extends ClusterTest {
 
+    /**
+     * A chunk file planted by hand that belongs to no object is collected by the next full report
+     * (the orphan safety valve needs the whole listing); these tests want that within seconds.
+     */
+    @Override
+    void configure(InProcessCluster cluster) {
+        cluster.workerSetting("worker.full-report-interval-seconds", "1.5");
+    }
+
     @Test
     void theClusterFormsAndEveryVolumeRecordsTheClusterId() throws Exception {
         JsonNode status = api.status();

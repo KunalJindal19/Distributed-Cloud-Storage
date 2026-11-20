@@ -46,7 +46,7 @@ x-worker-environment: &worker-environment
   HEARTBEAT_INTERVAL: "2"          # heartbeat period (s); sooner when changes are waiting
   HEARTBEAT_MIN_GAP_MS: "250"      # earliest next heartbeat when changes or report segments wait
   HEARTBEAT_HTTP_TIMEOUT: "3"      # must stay below STALE_AFTER
-  FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-30}" # full report period (s); sent in segments on heartbeats
+  FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-300}" # full report period (s): rare; sent in segments on heartbeats
   CHANGE_LOG_MAX: "10000"          # un-acknowledged changes kept; overflow -> full report
   MAX_CHANGES_PER_MESSAGE: "2000"  # changes per heartbeat
   MAX_CHANGES_PER_PUT_ANSWER: "256" # changes per answer to a controller's chunk PUT
@@ -90,8 +90,11 @@ services:
       ORPHAN_GC_DELAY: "60"          # no orphan deletion during the first minute after a start
       ORPHAN_GC_MAX_FRACTION: "0.5"
       MIN_FREE_BYTES: "16777216"
-      FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-30}" # as configured on the workers
-      INVARIANT_CHECKS: "1"
+      FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-300}" # as on the workers; overdue at 2x
+      INVARIANT_CHECKS: "1"            # the rolling invariant check, every planner tick
+      PLANNER_VISIT_BUDGET: "2000"   # chunks visited in the under-replication levels per tick
+      POSTPONED_BUDGET: "1000"       # postponed chunks re-checked per tick
+      ROLLING_CHECK_CHUNKS: "1000"   # chunks checked by the rolling invariant check per tick
       MAX_LOCK_HOLD_MS: "5"          # longest continuous write-lock hold by the writer before it yields
       APPLY_QUEUE_CAPACITY: "10000"  # tasks; when full, worker changes are not acknowledged
       UPLOAD_COMMIT_WAIT: "10"       # an upload or delete waits this long for its task, then answers anyway

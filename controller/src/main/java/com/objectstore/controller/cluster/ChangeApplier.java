@@ -372,6 +372,7 @@ public class ChangeApplier {
             worker.applied = Math.max(worker.applied, baseline);
             cluster.closeSession(worker);
             cluster.ledger().retryWorker(workerId);        // its deletions can be queued now
+            cluster.releasePostponed(properties.postponedBudget());
             log.info("[report] {} full report {} complete: listed={} missing={} garbage={} orphans={} baseline={}",
                     workerId, worker.rxSession == number ? Registry.shortId(worker.rxReportId) : "#" + number,
                     session.listed, missing, garbage, orphans, baseline);
@@ -435,7 +436,7 @@ public class ChangeApplier {
             return;
         }
         cluster.ledger().cancel(chunkId, workerId);   // a corrupt copy's undelivered DELETE
-        replica.state = ReplicaState.OK;
+        cluster.setReplicaState(chunkId, workerId, ReplicaState.OK);
         log.info("[report] chunk={} on {} OK again ({})", chunkId, workerId, why);
     }
 

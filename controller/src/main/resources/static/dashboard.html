@@ -76,6 +76,9 @@
 
   <section class="grid kpis" id="kpis"></section>
 
+  <h2>Writer, priority levels and deletion ledger</h2>
+  <section class="grid kpis" id="engine"></section>
+
   <h2>Workers</h2>
   <section class="grid workers" id="workers"></section>
 
@@ -140,6 +143,23 @@ function renderStatus(status) {
       kpi("Corrupt copies", r.corrupt, r.corrupt > 0 ? "alert" : ""),
       kpi("Excess copies", r.excess, r.excess > 0 ? "warn" : ""),
       kpi("Invariant violations", violations, violations > 0 ? "alert" : ""));
+
+  // The event-driven core: the writer's queue, the (L,P) levels and the deletion ledger.
+  const levels = status.levels || {};
+  const ledger = status.ledger || {waiting: 0, queued: 0, delivered: 0};
+  const levelCards = Object.entries(levels).map(([lp, size]) => {
+    const live = Number(lp.split(",")[0]);
+    return kpi(`Level (${lp})${live === 0 ? " · no live copy" : ""}`, size, size > 0 ? (live === 0 ? "alert" : "warn") : "");
+  });
+  $("engine").replaceChildren(
+      kpi("Apply queue", status.apply_queue_depth, status.apply_queue_depth > 100 ? "warn" : ""),
+      kpi("Oldest task (ms)", status.apply_oldest_task_age_ms),
+      kpi("Writer busy", Math.round((status.writer_busy_ratio || 0) * 100) + " %"),
+      kpi("Longest lock hold (ms)", status.lock_max_hold_ms),
+      ...levelCards,
+      kpi("Cleanup / postponed", `${status.cleanup_size} / ${status.postponed_size}`),
+      kpi("Ledger waiting · queued · delivered", `${ledger.waiting} · ${ledger.queued} · ${ledger.delivered}`),
+      kpi("Report sessions open", status.report_sessions_open));
 
   const workers = [...status.workers].sort((a, b) => a.worker_id.localeCompare(b.worker_id, undefined, {numeric: true}));
   $("workers").replaceChildren(...workers.map((w) =>

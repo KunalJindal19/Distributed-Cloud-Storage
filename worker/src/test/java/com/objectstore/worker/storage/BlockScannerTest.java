@@ -66,7 +66,7 @@ class BlockScannerTest {
     }
 
     @Test
-    void aFileRemovedByHandIsReportedDeletedWithinOnePass() throws Exception {
+    void edge18_aFileRemovedByHandIsReportedDeletedWithinOnePass() throws Exception {
         write(0, 1000);
         write(1, 1000);
         TestSupport.drain(changes);
@@ -82,7 +82,7 @@ class BlockScannerTest {
     }
 
     @Test
-    void aFileAddedByHandIsIndexedAndReportedReceivedWithItsSidecarRebuilt() throws Exception {
+    void edge18_aFileAddedByHandIsIndexedAndReportedReceivedWithItsSidecarRebuilt() throws Exception {
         byte[] data = new byte[700];
         new java.util.Random(9).nextBytes(data);
         Files.write(chunkDir.resolve(chunk(5)), data);                    // no sidecar

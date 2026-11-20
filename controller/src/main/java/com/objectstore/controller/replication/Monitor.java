@@ -1,39 +1,37 @@
 package com.objectstore.controller.replication;
 
 import com.objectstore.controller.cluster.ClusterState;
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.config.ControllerProperties;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * The replication monitor (HDFS RedundancyMonitor). Every MONITOR_INTERVAL, as one synchronous
- * block under the cluster lock:
+ * The planner tick (thread {@code planner-loop}, every MONITOR_INTERVAL; v4 §7.3). All its work
+ * runs under the write lock in slices of at most MAX_LOCK_HOLD_MS: between slices the lock is
+ * released, so heartbeats and the writer are never held up for long.
  *
- * <ol start="0">
- *   <li>forget expired (chunk, worker) failure back-offs;</li>
- *   <li>time out pending copies (repairs and upload copies) that were never confirmed, and
- *       remember to avoid that pair for a repair;</li>
- *   <li>evaluate safe mode; while it is on, nothing below runs;</li>
- *   <li>plan repairs and trims, fewest live copies first ({@link ReplicationPlanner});</li>
- *   <li>ask workers that have not reported for a long time for a full report;</li>
- *   <li>check the invariants.</li>
+ * <ol>
+ *   <li>safe mode, from the O(1) {@code safeCount}; while it is on, nothing else runs;</li>
+ *   <li>to 5. the {@link ReplicationPlanner}: free streams, under-replication by level, cleanup,
+ *       postponed;</li>
+ *   <li value="6">the deletion ledger: waiting entries are queued (at most CLEANUP_BUDGET);</li>
+ *   <li>every 10th tick, workers whose last full report is older than 2 × FULL_REPORT_INTERVAL are
+ *       asked for one;</li>
+ *   <li>once orphan GC becomes allowed, every worker is asked for a full report (§6.4);</li>
+ *   <li>the rolling invariant check on ROLLING_CHECK_CHUNKS chunks (INVARIANT_CHECKS);</li>
+ *   <li>the results are published ({@code blocked}; the levels and sets are read from the index).</li>
  * </ol>
  *
- * The monitor only decides; the workers do the copying and deleting when they pick up their
- * commands with the next heartbeat.
+ * Pending copies and ledger deadlines expire through the pending-timer, not here.
  */
 @Service
 public class Monitor {
 
     private static final Logger log = LoggerFactory.getLogger(Monitor.class);
+    private static final long BLOCKED_WARNING_NANOS = 60_000_000_000L;
 
     private final ClusterState cluster;
     private final SafeMode safeMode;
@@ -41,6 +39,8 @@ public class Monitor {
     private final ControllerProperties properties;
     private long ticks;
     private boolean gcAnnounced;
+    private long lastBlockedWarning;
+    private volatile ReplicationPlanner.TickResult lastTick;
 
     public Monitor(ClusterState cluster, SafeMode safeMode, ReplicationPlanner planner, ControllerProperties properties) {
         this.cluster = cluster;
@@ -49,47 +49,55 @@ public class Monitor {
         this.properties = properties;
     }
 
+    public ReplicationPlanner.TickResult lastTick() {
+        return lastTick;
+    }
+
     public void tick() {
-        cluster.write(() -> {
+        long maxHold = properties.maxLockHold().toNanos();
+        long[] sliceEnd = {0};
+        ReplicationPlanner.Slicer slicer = () -> {
+            if (System.nanoTime() >= sliceEnd[0]) {
+                cluster.unlockWrite();               // flushes the index, lets everyone else in
+                cluster.lockWrite();
+                sliceEnd[0] = System.nanoTime() + maxHold;
+            }
+        };
+        cluster.lockWrite();
+        sliceEnd[0] = System.nanoTime() + maxHold;
+        try {
             ticks++;
             cluster.purgeExpiredFailures();
-            expirePendingCopies();
-            cluster.ledger().expireDeadlines(cluster.now());
             if (safeMode.evaluate()) {
                 return;
             }
-            announceGc();
+            ReplicationPlanner.TickResult result = planner.tick(slicer);
+            lastTick = result;
+            warnIfBlocked(result);
+            slicer.check();
             cluster.ledger().retryWaiting(properties.cleanupBudget());
-            planner.plan();
+            slicer.check();
             if (ticks % 10 == 0) {
                 requestOverdueReports();
             }
-            if (properties.invariantChecks()) {
-                cluster.checkInvariants();
+            announceGc();
+            if (properties.invariantChecks() && properties.rollingCheckChunks() > 0) {
+                cluster.rollingCheck(properties.rollingCheckChunks());
             }
-        });
+        } finally {
+            cluster.unlockWrite();
+        }
     }
 
-    private void expirePendingCopies() {
+    /** RF larger than the eligible workers (or no free target) blocks repairs: one warning per minute, no spinning. */
+    private void warnIfBlocked(ReplicationPlanner.TickResult result) {
         long now = cluster.now();
-        for (Iterator<Map.Entry<String, List<PendingCopy>>> it = cluster.pending().entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, List<PendingCopy>> entry = it.next();
-            for (PendingCopy copy : new ArrayList<>(entry.getValue())) {
-                if (copy.deadline() < now) {
-                    entry.getValue().remove(copy);
-                    if (copy.kind() == ClusterState.PendingKind.UPLOAD) {
-                        cluster.record("timeout", entry.getKey(), null, copy.target(),
-                                "upload copy not confirmed within " + properties.pendingTimeoutSeconds() + " s; normal repair takes over");
-                    } else {
-                        cluster.recordFailure(entry.getKey(), copy.target());
-                        cluster.record("timeout", entry.getKey(), copy.source(), copy.target(),
-                                "copy not confirmed within " + properties.pendingTimeoutSeconds() + " s; avoiding this target for a while");
-                    }
-                }
-            }
-            if (entry.getValue().isEmpty()) {
-                it.remove();
-            }
+        if (result.blocked() > 0 && now - lastBlockedWarning > BLOCKED_WARNING_NANOS) {
+            lastBlockedWarning = now;
+            cluster.increment("blocked_warnings");
+            log.warn("[monitor] {} chunks need a copy but no source or target is available now "
+                    + "(REPLICATION_FACTOR={}, {} free streams)", result.blocked(), properties.replicationFactor(),
+                    result.freeTotal());
         }
     }
 

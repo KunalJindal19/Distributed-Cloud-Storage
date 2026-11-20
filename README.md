@@ -70,7 +70,8 @@ make fsck                                                # end-to-end consistenc
 | `make pause W=worker2` / `make unpause W=worker2` | freeze a worker (STALE only, if short) |
 | `make corrupt W=worker3 C=<chunk_id>` | overwrite 4 bytes inside a stored chunk file |
 | `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
-| `make test` | 145 unit and in-process system tests (local Maven, or a Maven container) |
+| `make test` | 233 unit and in-process system tests (local Maven, or a Maven container) |
+| `make test-scale` | the scale test: 500,000 chunks, 8 workers, no HTTP (about a minute) |
 | `make scenarios` | the acceptance-criteria scripts against Docker (about 15 minutes; wipes data) |
 | `make chaos` | the chaos test: 5 minutes of load and disruption with network faults, then convergence checks |
 
@@ -90,8 +91,11 @@ flowchart LR
         subgraph ctrl["controller :8000 (NameNode) - the only published port"]
             API["public REST API"]
             NS[("namespace: SQLite<br/>objects, metadata, chunks,<br/>cluster id, idempotency keys")]
-            MEM["in memory, under one lock:<br/>workers, block map, pending copies,<br/>command queues, safe mode"]
-            LOOPS["health loop (1 s)<br/>replication monitor (3 s)"]
+            RX["receipt step (brief write lock):<br/>accept, liveness, filter changes,<br/>queue work, take commands, acks"]
+            Q["apply queue (FIFO, bounded)"]
+            WR["writer thread: tasks in order,<br/>at most MAX_LOCK_HOLD_MS per hold"]
+            MEM["in memory, fair RW lock:<br/>workers, block map, (L,P) levels,<br/>pending copies, deletion ledger,<br/>command queues, safe mode"]
+            LOOPS["planner (3 s, budgets, slices)<br/>health loop (1 s)<br/>pending-timer (deadlines)"]
         end
         W1["worker1 :8001<br/>chunks + .meta, VERSION"]
         W2["worker2 :8002"]
@@ -100,11 +104,28 @@ flowchart LR
     end
 
     C1 -->|HTTP| API
+    RX --> Q --> WR --> MEM
+    LOOPS --> MEM
+    API -->|"commit / delete:<br/>namespace lock: SQLite + queue"| Q
     ctrl -->|"upload / download / fsck:<br/>PUT, GET, list chunks"| W1 & W2 & W3 & W4
-    W1 & W2 & W3 & W4 -.->|"register; heartbeat (2 s, or 250 ms after a change)<br/>carrying the numbered change stream<br/>and full-report segments (every 30 s)"| ctrl
+    W1 & W2 & W3 & W4 -.->|"register; heartbeat (2 s, or 250 ms after a change)<br/>carrying the numbered change stream<br/>and, rarely, full-report segments"| ctrl
     ctrl -.->|"commands in heartbeat replies:<br/>REPLICATE, DELETE"| W1 & W2 & W3 & W4
     W1 ==>|"REPLICATE: copy straight to another worker"| W3
 ```
+
+**Threads.**
+
+| Process | Thread | Job |
+|---|---|---|
+| controller | HTTP request threads (virtual) | The receipt step for heartbeats; the public API. Uploads and deletes take the namespace lock for "SQLite + queue"; readers take the read lock. |
+| controller | `writer` | The **only** thread that applies queued tasks to the block map |
+| controller | `planner-loop` (3 s) | Under-replication levels, cleanup and postponed sets, ledger retries, the rolling invariant check |
+| controller | `pending-timer` | Turns the deadlines of pending copies and delivered DELETEs into tasks |
+| controller | `health-loop` (1 s) | STALE transitions; queues `MarkDead` |
+| worker | `link` | Registration, heartbeats carrying the change stream, full-report segments |
+| worker | `block-scanner` | Rate-limited verification and disk ↔ index reconciliation |
+| worker | `disk-check` | Volume probe |
+| worker | command tasks (virtual) | `REPLICATE` (worker to worker) and `DELETE`; `CMD_FAILED` when a copy cannot be made |
 
 **The controller decides; workers act.** The controller keeps the namespace (which objects exist,
 their metadata, which chunks they consist of) durably in SQLite. Everything about *where* copies
@@ -141,12 +162,12 @@ until the controller acknowledges it. It knows nothing about objects.
 | Stale DataNode: avoided for reads and writes, replicas still count | `STALE` after 6 s of silence |
 | Stale ratio: if more than half are stale, stop avoiding them for writes | `STALE_RATIO = 0.5` |
 | Dead DataNode: its replicas leave the block map | `DEAD` after 12 s of silence |
-| Incremental block reports (`blockReceivedAndDeleted`) and full block reports | one numbered change stream per worker (`RECEIVED`, `DELETED`, `BAD`, `CMD_FAILED`), kept until acknowledged, on heartbeats and PUT answers; full reports after registering and every 30 s, in segments on heartbeats, with a baseline and hold-back |
+| Incremental block reports (`blockReceivedAndDeleted`) and full block reports | one numbered change stream per worker (`RECEIVED`, `DELETED`, `BAD`, `CMD_FAILED`), kept until acknowledged, on heartbeats and PUT answers; full reports after registering, when asked and every 300 s (a rare safety net), in segments on heartbeats, with a baseline and hold-back |
 | `.meta` checksum file per block; DataNode verifies on read and transfer | `<chunk_id>.meta`; the worker verifies on GET and before every REPLICATE |
 | DataNode block scanner (rate-limited, with disk/index reconciliation); `reportBadBlocks` | worker scanner: at most one pass per 10 s, reading at most 32 MiB/s; the controller also marks a copy corrupt when a read proves it bad |
 | Disk checker; the DataNode shuts down on volume failure | worker disk check every 30 s; on failure the process exits, goes DEAD and is repaired |
-| RedundancyMonitor with priority by replica count | replication monitor every 3 s, chunks with the fewest live copies first |
-| PendingReconstructionBlocks with a time-out | pending copies, 15 s time-out, then retried with another target |
+| RedundancyMonitor over `LowRedundancyBlocks` priority queues | the planner every 3 s over levels `(L, P)` (live, pending copies; any RF), kept up to date on every change, with weighted quotas and round-robin per level |
+| PendingReconstructionBlocks with a time-out | pending copies with a deadline on the `pending-timer` thread: 15 s, then planned again with another target |
 | `DNA_TRANSFER`: DataNode copies directly to DataNode | `REPLICATE` command in the heartbeat reply; the worker PUTs to the target worker |
 | `DNA_INVALIDATE` | `DELETE` command |
 | `max-streams` per DataNode | `MAX_STREAMS = 2` copies in flight per source |
@@ -338,7 +359,9 @@ changes_gap, apply_queue_full, writer_task_failures, namespace_reconciled, uploa
 `lock_max_hold_ms` (the longest continuous write-lock hold since the previous status read, also per
 holder in `lock_max_hold_by`; reading resets it), `apply_queue_depth`, `apply_oldest_task_age_ms`,
 `writer_busy_ratio` (share of the time since the previous read that the writer held the lock),
-`report_sessions_open` and `ledger{waiting, queued, delivered}`.
+`report_sessions_open`, `ledger{waiting, queued, delivered}`, `levels{"L,P": size}` (chunks needing
+copies by priority level), `cleanup_size` and `postponed_size`. Every number is a counter: the
+status costs O(workers + levels), however many chunks there are.
 
 ### fsck — `GET /api/v1/fsck`
 
@@ -542,7 +565,7 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `ORPHAN_GC_DELAY` | 60 | controller | no orphan deletion during the first N s after a controller start |
 | `ORPHAN_GC_MAX_FRACTION` | 0.5 | controller | refuse orphan GC if one report would delete more than this fraction of a worker's chunks (when > 10) |
 | `MIN_FREE_BYTES` | 16777216 | controller | minimum free space for a write or repair target |
-| `FULL_REPORT_INTERVAL` | 30 | both | full report period (the controller uses it to spot overdue reports) |
+| `FULL_REPORT_INTERVAL` | 300 | both | full report period: rare, a safety net only (the controller asks for an overdue one at 2×) |
 | `HEARTBEAT_MIN_GAP_MS` | 250 | worker | earliest next heartbeat when changes or report segments are waiting |
 | `CHANGE_LOG_MAX` | 10000 | worker | unacknowledged changes kept; on overflow all are dropped and a full report starts |
 | `MAX_CHANGES_PER_MESSAGE` | 2000 | worker | changes per heartbeat |
@@ -554,7 +577,10 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `HEARTBEAT_HTTP_TIMEOUT` | 3 | worker | heartbeat request time-out (below `STALE_AFTER`) |
 | `CONNECT_TIMEOUT` | 2 | both | HTTP connect time-out |
 | `READ_TIMEOUT` | 10 | both | HTTP read time-out for chunk transfers |
-| `INVARIANT_CHECKS` | 1 | controller | run the invariant checks every monitor tick |
+| `INVARIANT_CHECKS` | 1 | controller | run the rolling invariant check every planner tick (the full check runs in fsck) |
+| `PLANNER_VISIT_BUDGET` | 2000 | controller | chunks visited in the under-replication levels per planner tick |
+| `POSTPONED_BUDGET` | 1000 | controller | postponed chunks re-checked per tick |
+| `ROLLING_CHECK_CHUNKS` | 1000 | controller | chunks checked by the rolling invariant check per tick |
 | `MAX_LOCK_HOLD_MS` | 5 | controller | longest continuous write-lock hold by the writer before it yields (≥ 1) |
 | `APPLY_QUEUE_CAPACITY` | 10000 | controller | tasks; when full, the receipt step acknowledges nothing (the worker resends) |
 | `UPLOAD_COMMIT_WAIT` | 10 | controller | how long an upload or delete waits for its task before answering anyway |
@@ -738,6 +764,8 @@ same copy twice.
 | I6 | no excess or corrupt DELETE is queued for a chunk with fewer than 2 live copies |
 | I7 | the in-memory chunk table equals the database's (fsck only) |
 | I8 | a chunk never has two pending copies to the same worker |
+| I9 | a chunk is in exactly one level iff it is known and `L + P < RF`, and that level is its `(L, P)`; the cleanup and postponed sets hold only known chunks and are disjoint |
+| I10 | every counter (copies by state, `safeCount`, missing, `pendingFrom`, `pendingTo`, level sizes) equals its recomputation |
 | I11 | for every worker, `applied ≤ received` |
 | I12 | at most one ledger entry per (chunk, worker); every DELETE in a command queue has a QUEUED ledger entry with its `cmd_id`; an `excess`/`corrupt` entry points to an `EXCESS`/`CORRUPT` copy or to none |
 | I13 | no upload receipt belongs to an old epoch or to an object that is not being uploaded |
@@ -759,8 +787,8 @@ on every database connection enforces the SQLite part (`SqliteGuard`).
   worker's newer changes). The state satisfies every invariant at every step. A task that throws is
   logged and counted (`writer_task_failures`) and the writer carries on.
 - **Brief writers** that only queue work: the heartbeat's receipt step (O(message)), the health
-  loop's STALE marking, `beginUpload`; the monitor still plans under the write lock (until the
-  priority index replaces its sort).
+  loop's STALE marking, `beginUpload`; the planner works under the write lock in slices of at most
+  `MAX_LOCK_HOLD_MS`.
 - **Epochs.** Each worker's epoch grows on every accepted registration and on DEAD; every task about
   a worker carries the epoch it was created in and is dropped if that epoch has ended.
 - **The namespace lock** is held across "SQLite transaction + putting the matching task on the
@@ -773,7 +801,7 @@ on every database connection enforces the SQLite part (`SqliteGuard`).
 | Task | Queued by | Applies |
 |---|---|---|
 | `ApplyChanges`, `ApplySegment`, `CompleteReport` | the receipt step, PUT answers | the change stream and full reports |
-| `Register` | registration (the HTTP thread waits) | §registration rules, a new epoch |
+| `Register` | registration (the HTTP thread waits) | the registration checks, a new epoch |
 | `MarkDead` | the health loop | re-checks (a heartbeat meanwhile, or a new epoch, cancels it), then DEAD and a stepped purge |
 | `CommitObject` / `EndUpload` | an upload (waits up to `UPLOAD_COMMIT_WAIT`) | the mirror and the copies / garbage and DELETEs |
 | `DeleteObject` | a delete (waits up to `UPLOAD_COMMIT_WAIT`) | DELETEs to every holder and pending target; the chunks are forgotten |
@@ -833,24 +861,59 @@ after safe mode and `ORPHAN_GC_DELAY` (60 s) after a controller start, and are s
   chunks (`ORPHAN_GC_MAX_FRACTION`), nothing is deleted and `[report] orphan GC refused` is logged:
   that pattern points to a bug or a restored old database, not to garbage.
 
-### The replication monitor
+### The priority index
 
-Every 3 s, as one block under the lock: expire pending copies that were not confirmed in time
-(and avoid that target for `TARGET_BACKOFF`), evaluate safe mode (and stop there while it is on),
-then for every chunk, fewest live copies first:
+Every chunk that needs copies is in exactly one **level** `(L, P)` with `L + P < RF`, where `L` is
+its OK copies on non-DEAD workers and `P` its pending copies (repair and upload): `RF·(RF+1)/2`
+levels, in priority order `L` ascending, then `P` (HDFS `LowRedundancyBlocks`, for any RF). Levels
+with `L = 0` have no source and are never scheduled (`unrecoverable` is logged once, `recoverable`
+when a copy returns). Chunks with more than RF live copies and nothing pending, or a corrupt or
+surplus copy without a deletion while RF live copies exist, are in the **cleanup** set; those whose
+holders are not all current are **postponed**.
 
-1. **Under-replicated** (`live + pending < RF`, where pending includes UPLOAD copies awaiting
-   their `RECEIVED`): keep a surplus copy whose DELETE was not delivered yet; if no OK copy exists,
-   record `unrecoverable` once and wait; otherwise pick a source (an ALIVE, reported holder with
-   fewer than `MAX_STREAMS` copies in flight) and a target (a write-eligible worker with no copy of
-   the chunk in any state, the least loaded), queue `REPLICATE` on the source, record the copy as
-   pending.
-2. **Over-replicated** (and nothing pending, no holder STALE or without a completed full report): mark the copies on the
-   busiest workers `EXCESS` and queue their DELETE.
-3. **Clean-up** on ALIVE workers: a surplus copy, and a `CORRUPT` copy once 2 live copies exist,
-   gets a deletion in the ledger (which re-sends it until confirmed).
+There is one way to change it: every method that changes a copy, a pending copy, a ledger entry or
+the chunk mirror marks the chunk **dirty**, and before every write-lock release (and at every writer
+yield) each dirty chunk is recomputed from scratch, O(copies of the chunk), moving it between levels
+and sets and moving the counters by the difference: copies by state, under-/over-replicated and
+missing chunks, `safeCount` (safe mode in O(1)), `pendingFrom` / `pendingTo` per worker. The status
+endpoint reads only counters: O(workers + levels).
 
-Then it asks workers whose full report is overdue for one, and checks the invariants.
+### The planner
+
+Every `MONITOR_INTERVAL` (thread `planner-loop`), under the write lock in slices of at most
+`MAX_LOCK_HOLD_MS`:
+
+1. **Safe mode** from `safeCount` (O(1)); while it is on, nothing else runs.
+2. **Free streams:** `MAX_STREAMS − pendingFrom` for every ALIVE, reported worker whose command
+   queue is not full; none free: no repair this tick.
+3. **Under-replication:** the schedulable levels (`L ≥ 1`) in priority order; level *k* of *K*
+   non-empty ones gets the weight `2^(K−1−k)` and that share of `PLANNER_VISIT_BUDGET` (unused quota
+   passes on). Chunks are visited from the head of each level: an undelivered surplus deletion is
+   cancelled first (the copy counts again); otherwise up to `RF − L − P` copies are ordered, each
+   from a source with a free stream (an ALIVE, reported holder that did not recently fail with this
+   chunk) to a target (a write-eligible worker with no copy in any state, the least loaded). A
+   visited chunk still in its level goes to the tail (round-robin), so blocked chunks never starve
+   the others; with no stream left, the step stops.
+4. **Cleanup** (at most `CLEANUP_BUDGET`): a postponed chunk (a holder STALE or not reported) waits;
+   otherwise surplus copies are marked `EXCESS` on the busiest workers and deleted through the
+   ledger, and a `CORRUPT` copy is deleted once RF good copies exist.
+5. **Postponed** (at most `POSTPONED_BUDGET`, rotating): chunks whose holders are current again
+   return to cleanup (at once when a worker becomes ALIVE or completes a report).
+6. The ledger queues waiting deletions (at most `CLEANUP_BUDGET`); every 10th tick, overdue workers
+   are asked for a full report; once orphan GC is allowed, every worker is asked for one, once.
+7. **Rolling invariant check** on `ROLLING_CHECK_CHUNKS` chunks of a ring of all chunks: I2, I3,
+   I5, and the chunk's index entry (I9, I10). A mismatch is logged, counted (`index_mismatches`)
+   and repaired by recomputing the chunk. The full check (every invariant, every counter) runs in
+   fsck and in the tests.
+
+When RF is larger than the eligible workers, the chunks are `blocked`: one warning per minute, no
+spinning.
+
+**Pending copies** end by the target's `RECEIVED` (or a report listing the copy), by `CMD_FAILED`, by
+their source or target becoming DEAD or re-registering, by the chunk being deleted, or by their
+deadline: the `pending-timer` thread holds the deadlines of pending copies and of delivered ledger
+DELETEs and queues `ExpirePending` / `LedgerDeadline` for the writer. A repair that times out avoids
+that (chunk, target) pair for `TARGET_BACKOFF`.
 
 ### Placement
 
@@ -955,6 +1018,53 @@ the controller is down (clients retry until it is back).
 ---
 
 ## Edge-case catalogue
+
+**Edge cases of the event-driven design** (each has a test named after its row)
+
+| # | Case | Behaviour | Test |
+|---|---|---|---|
+| 1 | Full report sent while newer changes travel on PUT answers | Baseline `M` + hold-back on the worker + `received = max(received, M)` on the last segment | `ReceiptTest.edge1_theLastSegmentMovesReceivedToTheBaseline` |
+| 2 | Gap in change numbers | Never acknowledge past it, queue nothing from that message, request a full report | `ReceiptTest.edge2_aGapRequestsAReportAndNeverAcknowledgesPastIt` |
+| 3 | Delayed old registration | Age check + attempt number | `RegistrationTest.edge3_aDelayedOlderAttemptIsRefusedAsStale` |
+| 4 | Heartbeat arrives between queuing `MarkDead` and applying it | Re-check at apply; nothing happens | `MarkDeadTest.edge4_aHeartbeatBetweenQueuingAndApplyingMarkDeadCancelsIt` |
+| 5 | Tasks queued for an epoch that has ended | Dropped at apply | `RegistrationTest.edge5_workQueuedForAnEndedEpochIsDropped`<br/>`WriterTest.edge5_aTaskForAnEndedEpochIsDropped` |
+| 6 | A long task (purge, report completion, big commit or delete) interleaved with the same worker's next task | Continuation keeps its queue position | `WriterTest.edge6_aContinuationRunsBeforeTheNextTaskAndReleasesTheLockBetweenSteps` |
+| 7 | Commit and delete of the same object racing between SQLite and the queue | `NamespaceLock` across "transaction + queue" | `NamespaceSystemTest.edge7_aDeleteRacingTheCommitOfTheSameObjectNeverLeavesItsChunksInMemory` |
+| 8 | Upload receipts surviving a worker restart or DEAD | Receipts carry the epoch and are purged on re-registration and DEAD | `NamespaceSystemTest.edge8_anUploadWhoseTargetRestartsBeforeTheCommitIsRepaired`<br/>`RegistrationTest.edge8_acceptingStartsANewEpochAndForgetsWhatWasInFlight` |
+| 9 | An upload copy whose change is held back, filtered, or lost | UPLOAD pending copy: no needless repair; reads may use it; it expires into normal repair | `ChangeStreamSystemTest.edge9_anUploadDuringAFullReportIsRecordedWhenTheReportCompletesWithoutAnExtraCopy`<br/>`ReceiptTest.edge9_aCommitRecordsACopyWhosePutAnswerWasLostFromItsReceipt` |
+| 10 | A duplicate PUT (`EXISTS`) never re-announced, or rotten data accepted as existing | Verify, rewrite if rotten, always `RECEIVED` | `ChunkStoreTest.edge10_writingAnExistingChunkWhoseDataIsRottenRewritesItReannouncesItAndCreatesIt`<br/>`ChunkStoreTest.edge10_writingAnExistingChunkWithGoodDataReannouncesIt` |
+| 11 | PUT answers growing with the backlog | `X-Change-Ack` on every controller PUT + `MAX_CHANGES_PER_PUT_ANSWER` | `WorkerApiTest.edge11_aPutAnswerIsBoundedAndRespectsTheHold` |
+| 12 | PUT answer from a restarted worker process | Boot mismatch → changes ignored | `ReceiptTest.edge12_aPutAnswerFromAnotherBootIsIgnored`<br/>`WorkerApiTest.edge12_aPutAnswerForAnotherBootCarriesNoChanges` |
+| 13 | A copy landing for a deleted or failed object | Immediate ledger DELETE | `DeletionLedgerTest.edge13_aCopyLandingForADeletedObjectGetsALedgerDeleteAtOnce` |
+| 14 | A lost DELETE for a deleted object, now that full reports are rare | The ledger re-sends until `DELETED` | `DeletionLedgerTest.edge14_aDeliveredDeleteThatIsNotConfirmedInTimeIsSentAgain`<br/>`LedgerSystemTest.edge14_deletionsCompleteEvenWhenHalfTheHeartbeatRepliesAreLost` |
+| 15 | Command-queue cap dropping DELETEs (today's behaviour) | Never drop; the ledger waits | `DeletionLedgerTest.edge15_deletingAnObjectWith50000ChunksNeverOverfillsAQueueAndDropsNothing`<br/>`DeletionLedgerTest.edge15_waitingAndQueuedEntriesCanBeCancelledButADeliveredOneCannot` |
+| 16 | Upload rollback relying on best-effort HTTP DELETEs | Ledger DELETEs | `DeletionLedgerTest.edge16_aFailedUploadIsRolledBackWithLedgerDeletesNotBestEffortCalls` |
+| 17 | Orphans seen before GC is allowed, with rare full reports | Request a report from every worker once when GC becomes allowed | `LedgerSystemTest.edge17_aControllerKilledDuringAnUploadHasItsLeftoversCollectedAfterTheGcDelay` |
+| 18 | A file deleted or added by hand, with rare full reports | Scanner reconciliation | `BlockScannerTest.edge18_aFileAddedByHandIsIndexedAndReportedReceivedWithItsSidecarRebuilt`<br/>`BlockScannerTest.edge18_aFileRemovedByHandIsReportedDeletedWithinOnePass` |
+| 19 | `BAD` changes `≤ M` dropped when the report sets `received = M` | Report entries carry `bad` | `ProtocolTest.edge19_aReportEntryMarkedBadMakesTheCopyCorrupt` |
+| 20 | `CMD_FAILED ≤ M` dropped the same way | The pending time-out covers it (documented) | `PendingTimerTest.edge20_aCmdFailedDroppedByTheReportBaselineIsCoveredByThePendingTimeOut` |
+| 21 | Changes `≤ M` interleaved with segments | Marks set only by segments, removal at completion; property test | `ReportInterleavingTest.edge21_afterAnyInterleavingTheBlockMapEqualsTheDisk` |
+| 22 | Commit converting a receipt during an open report session | The replica takes the receipt's `seenInSession` mark | `ReceiptTest.edge22_aCommitDuringAnOpenSessionKeepsTheReceiptsMark` |
+| 23 | Blocked chunks starving others | Weighted quotas across levels, rotation within a level, early stop | `PlannerTest.edge23_tenThousandBlockedChunksDoNotStarveALowerPriorityLevelAndTheyRotate` |
+| 24 | Chunks with no live copy | Levels with `L = 0` are never scheduled; log `unrecoverable` once | `PlannerTest.edge24_chunksWithoutALiveCopyAreNeverScheduled` |
+| 25 | RF larger than the eligible workers | `insufficient_workers` / `blocked`; no spin | `PlannerTest.edge25_rfLargerThanTheWorkersBlocksWithOneWarningPerMinuteAndNoSpin` |
+| 26 | Index drift | Single `markDirty`/`flushDirty` path; rolling check that repairs and counts; full check in fsck | `ClusterStateTest.edge26_theRollingCheckFindsCountsAndRepairsADriftedIndexEntry`<br/>`NeededReplicationPropertyTest.edge26_theIndexAndEveryCounterEqualARecomputationAfterEveryOperation` |
+| 27 | A postponed trim after its holder recovers | Re-checked on ALIVE / report-complete and by budget | `ReplicationPlannerTest.edge27_surplusCopiesAreTrimmedOnlyWhenEveryHolderIsCurrent` |
+| 28 | Extra copy when an UPLOAD pending copy and a repair both land | Normal trimming | `PlannerTest.edge28_anUploadCopyAndARepairThatBothLandAreTrimmedBackToRf` |
+| 29 | A heartbeat waiting behind the writer | Writer holds ≤ `MAX_LOCK_HOLD_MS`; fair lock; the receipt step is O(message) | `LockFairnessTest.edge29_heartbeatsAndReadersAreNotStarvedByTheWriter` |
+| 30 | Apply queue full | No acknowledgement, liveness still updated; PUT-answer changes not queued → the UPLOAD pending copy covers it | `ReceiptTest.edge30_aFullQueueAcknowledgesNothingButLivenessIsStillUpdated` |
+| 31 | Writer task throws | Caught; counted; namespace tasks reconcile via the helper | `WriterTest.edge31_aFailingTaskDoesNotStopTheWriterAndAFailedNamespaceTaskIsReconciled` |
+| 32 | Reads during partially applied tasks | Read lock; bounded download settle wait; fsck barrier | `MarkDeadTest.edge32_theInvariantsHoldBetweenThePurgeSteps` |
+| 33 | A report request arriving while a report is in progress | Ignored by the worker | `ControllerLinkTest.edge33_aReportRequestArrivingDuringAReportIsIgnored`<br/>`ReceiptTest.edge33_aReportRequestIsHeldBackWhileTheWorkerIsReporting` |
+| 34 | Change-log overflow during a report | Abandon it, start a new report (new `report_id`, new baseline) | `ControllerLinkTest.edge34_aChangeLogOverflowDuringAReportStartsANewReportAndNothingNewerLeaves` |
+| 35 | Controller restart during a report | The worker gets 404, re-registers, starts a new report | `RegistrationTest.edge35_aControllerRestartDuringAReportMeansANewRegistrationAndANewReport` |
+| 36 | A duplicate or reordered heartbeat carrying changes or a segment | hb-seq duplicate → only acknowledgements echoed; change numbers and segment indexes make every other order harmless | `ReceiptTest.edge36_aReorderedOlderHeartbeatOnlyEchoesTheAcknowledgement` |
+| 37 | `too_old` on a heartbeat carrying changes | Not queued; resent fresh | `ReceiptTest.edge37_aHeartbeatThatArrivesTooLateQueuesNothing` |
+| 38 | A worker restarting between a REPLICATE's PUT and its `RECEIVED` | The new process's report lists the file → OK replica completes nothing (the pending copy was dropped at re-registration) → possibly an extra copy → trimmed | `PlannerTest.edge38_aTargetRestartingBetweenItsPutAndItsReceivedOnlyCausesASurplusThatIsTrimmed` |
+| 39 | `CMD_FAILED` after a time-out where the PUT actually landed | Repair re-planned elsewhere; extra copy trimmed | `PendingTimerTest.edge39_aCopyThatLandedAfterItsCmdFailedOnlyCausesASurplusThatIsTrimmed`<br/>`PendingTimerTest.edge39_cmdFailedEndsAPendingCopyAtOnce` |
+| 40 | `UPLOAD_COMMIT_WAIT` exceeded | Answer `201` anyway (durable); counted; the download settle wait covers it | `NamespaceSystemTest.edge40_aDownloadRightAfter201WhileTheWriterIsSlowSucceedsWithinTheSettleWait` |
+| 41 | RF = 1 | Only level `(0,0)`; nothing scheduled; trimming still works | `PlannerTest.edge41_withRfOneNothingIsEverScheduledButSurplusCopiesAreTrimmed` |
+| 42 | Duplicate `WORKER_ID` | Unchanged detection; registration is now a task | `ProtocolTest.edge42_threeBootIdsInAMinuteLookLikeADuplicateWorkerId` |
 
 **Liveness and network**
 
@@ -1080,10 +1190,11 @@ the controller is down (clients retry until it is back).
 
 | Layer | How to run | What it covers |
 |---|---|---|
-| Unit tests | `make test` | chunk store, its index and sidecars, scanner reconciliation and rate limit; the change log (numbering, acknowledgement, hold-back, overflow, `beginHold` atomicity), PUT-answer piggyback, `CMD_FAILED`; cluster state and invariants; the protocol's acceptance rules, the receipt step (duplicates, overlaps, gaps, a full queue, segment dedupe, the baseline), registration attempts and epochs, and a property test of 10⁴ random interleavings of changes and report segments; liveness and stall detection; the replication planner (repair, trim, invalidate, postpone, protect); placement; download classification (including corruption in transit); metadata rules; the CLI (retries, idempotency keys, exit codes) |
+| Unit tests | `make test` | chunk store, its index and sidecars, scanner reconciliation and rate limit; the change log (numbering, acknowledgement, hold-back, overflow, `beginHold` atomicity), PUT-answer piggyback, `CMD_FAILED`; cluster state and invariants; the protocol's acceptance rules, the receipt step (duplicates, overlaps, gaps, a full queue, segment dedupe, the baseline), registration attempts and epochs, and a property test of 10⁴ random interleavings of changes and report segments; liveness and stall detection; the single writer (FIFO, epochs, continuations, a failed namespace task reconciled without the writer touching SQLite), lock fairness while the writer applies 10⁶ changes, DEAD as a re-checked stepped task; the deletion ledger (every transition, cancellation, deadlines, DEAD and re-registration, a 50,000-chunk delete without overfilling a queue); the priority index (10⁴ random operation sequences for RF 1-4, each followed by a full recomputation), the planner (level order, no starvation with 10,000 blocked chunks, rotation, early stop, several copies per tick, `L = 0`, RF above the workers, RF 1), pending-copy deadlines and `CMD_FAILED`, safe mode's O(1) counter; the worker link against a stub controller (report requests during a report, overflow during a report, hold-back); the replication planner (repair, trim, invalidate, postpone, protect); placement; download classification (including corruption in transit); metadata rules; the CLI (retries, idempotency keys, exit codes) |
 | In-process system tests | `make test` | [`system-tests`](system-tests): the real controller and four real workers in one JVM, real HTTP, timers scaled down tenfold. Cluster formation, STALE/DEAD/return, quick restarts, replay protection over raw HTTP, read-your-writes (100 uploads each downloaded right after its 201), an upload during a slow full report, scanner, orphan GC, safe mode after a controller restart, wiped controller database; worker-to-worker repair and trimming with a watchdog that no chunk ever drops below one OK copy, `MAX_STREAMS`, corrupt-copy replacement order, missing chunks, a copy target dying; pipeline recovery, `upload_failed`, idempotency (including 4 concurrent uploads with one key), a controller crash after a 201, deletes via commands; fsck |
+| Scale test | `make test-scale` | [`ScaleTest`](controller/src/test/java/com/objectstore/controller/cluster/ScaleTest.java) (`@Tag("scale")`, `mvn -Pscale test`): 500,000 chunks, RF 2, 8 fake workers, no HTTP. A planner tick visits at most `PLANNER_VISIT_BUDGET` chunks and holds the lock at most `MAX_LOCK_HOLD_MS` + 5 ms; the DEAD purge of a worker holding 125,000 copies keeps every hold that short and heartbeat receipt p99 under 50 ms; 60 s of 5,000 changes/s keep the apply queue under 1,000 and the writer busy less than half the time; the full invariant check passes after each phase. |
 | Scenario scripts | `make scenarios` | [`tests/scenarios/`](tests/scenarios): every acceptance criterion of blocks 6–9 against the real Docker stack: `docker stop/start/restart/pause/kill`, `docker network disconnect`, a wiped controller volume, network faults |
-| Chaos test | `make chaos` | [`tests/chaos.py`](tests/chaos.py), below |
+| Chaos test | `make chaos` | [`tests/chaos.py`](tests/chaos.py), below; with `FULL_REPORT_INTERVAL = 300`, so deletions and orphans must converge through the ledger, and it also requires `index_mismatches`, `writer_task_failures`, `namespace_reconciled` = 0, an empty apply queue and ledger, and no open report session |
 
 **The chaos test** starts the stack with fault injection on every internal call (up to 300 ms
 delay, 5 % of calls lost, 5 % duplicated), runs four concurrent clients for `CHAOS_MINUTES`
@@ -1104,21 +1215,25 @@ make up && python3 tests/chaos.py              # or: CHAOS_MINUTES=10 make chaos
 
 | Run | Result |
 |---|---|
-| `make test` | 145 tests, 0 failures |
-| Scenario scripts | block 6: 34/34 · block 7: 32/32 · block 8: 24/24 · block 9: 7/7 |
-| `make demo` | 7/7 PASS, twice in a row on the same stack (~2 min each) |
-| Chaos, 3 runs in a row | each 6/6 checks passed (table below) |
+| `make test` | 233 tests, 0 failures (common 18, worker 49, controller 122, client 15, system tests 29) |
+| `make test-scale` | 500,000 chunks, 8 workers: longest planner hold 5.01 ms (visits ≤ 2,000 chunks per tick); DEAD purge of 125,000 copies in 0.1 s, writer's longest hold 5.54 ms, heartbeat receipt p99 3.03 ms; 60 s at 5,000 changes/s: apply queue depth ≤ 1, writer busy 5.6 % of the time |
+| Scenario scripts | block 6: 34/34 · block 7: 32/32 · block 8: 24/24 · block 9: 7/7 (with `FULL_REPORT_INTERVAL = 300`) |
+| `make demo` | 7/7 PASS, twice in a row on the same stack |
+| Chaos, 3 runs in a row | each 8/8 checks passed (table below), `FULL_REPORT_INTERVAL = 300` |
 
 | Chaos run | Uploads | Downloads | Deletes | Patches | Client retries | Disruptions | Problems | Converged | fsck HEALTHY |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 1359 | 1367 | 332 | 673 | 69 | 8: controller restart, kill and pause; worker stop, pause, 2 partitions; a corrupted chunk | 0 | 6 s | 41 s |
-| 2 | 1135 | 1051 | 290 | 553 | 114 | 9: 2 controller kills, 2 restarts, 1 pause; 2 worker stops, 2 pauses | 0 | 0 s | 33 s |
-| 3 | 1217 | 1148 | 306 | 621 | 79 | 9: controller kill, 2 restarts, 5 pauses; a corrupted chunk | 0 | 10 s | 42 s |
+| 1 | 1416 | 1421 | 341 | 745 | 37 | 8: controller restart; worker stop ×2, pause ×3, partition; a corrupted chunk | 0 | 8 s | 1 s |
+| 2 | 1353 | 1389 | 339 | 672 | 59 | 8: controller kill, restart, pause; worker stop ×2, partition; 2 corrupted chunks | 0 | 16 s | 137 s |
+| 3 | 1295 | 1276 | 312 | 616 | 103 | 8: controller kill ×2, restart ×2, pause; worker stop, partition; a corrupted chunk | 0 | 6 s | 14 s |
 
-"fsck HEALTHY" includes the orphan delay: leftovers of uploads cut short by a controller kill are
-collected only `ORPHAN_GC_DELAY` after the last controller start. After every run, all acknowledged
-objects (845–1027) downloaded with the right SHA-256, every deleted object (290–332) was gone from
-every disk, and `invariant_violations` was 0.
+"fsck HEALTHY" counts from the end of convergence and includes the orphan delay: leftovers of
+uploads cut short by a controller kill are collected `ORPHAN_GC_DELAY` after the last controller
+start, from the one report every worker is asked for then (there is no 30 s report any more).
+After every run, all acknowledged objects (983–1075) downloaded with the right SHA-256, every
+deleted object (312–341) was gone from every disk, `invariant_violations`, `index_mismatches`,
+`writer_task_failures` and `namespace_reconciled` were 0, and the apply queue, the deletion
+ledger and the report sessions were empty.
 
 ---
 
@@ -1156,6 +1271,17 @@ silent, contradicted each other, or did not fit the chosen stack:
 | `oscli` (Java) instead of `client.py`; the chaos test in Python | `oscli` is the project's existing client. The chaos test is an external harness and uses only the Python standard library, so it runs on any machine with Python 3. |
 | In-process system tests (`system-tests`) | They run the real protocol between real controller and worker code in seconds, in CI, without Docker. The Docker scenario scripts cover what needs real containers. |
 | Config files named `controller.yml` / `worker.yml` | Both applications share one classpath in the system tests; two `application.yml` files would collide. |
+
+**Where the event-driven design had to be resolved**
+
+| Topic | Decision | Reason |
+|---|---|---|
+| A report listing a verified copy that is `CORRUPT` in the map | The listing makes it `OK` again (unless its DELETE was already delivered) | The listing is newer than every change up to its baseline; a `RECEIVED` up to the baseline that would have cleared the mark can be skipped when `received` jumps to the baseline, and keeping the old mark would delete a good copy. The property test of report interleavings fails without it. |
+| A change up to the baseline that arrives after the segment that listed its chunk | Skipped | The listing already reflects it (same reason). |
+| An `excess` deletion dropped because its worker re-registered | The copy becomes `OK` again and is judged anew; an `EXCESS` copy without a tracked deletion is restored by `protect` too | Otherwise a chunk could keep a surplus mark while it falls below RF, and the cleanup step would order a deletion for a chunk with no other live copy (found by the index property test). |
+| A `DELETED` for a copy whose DELETE is still queued | The ledger entry completes and the queued command is removed | Otherwise the queue would hold a DELETE with no ledger entry (I12). |
+| A chunk file planted by hand that belongs to no object | Collected by the worker's next full report (rare), not on its `RECEIVED` | The orphan safety valve needs the whole listing to decide. |
+| Test hooks | `ControllerLink.delaySegmentsForTests` / `loseRepliesForTests`, `Writer.delayTasksForTests`, `UploadService.beforeCommitForTests` / `afterInsertForTests` | The system tests need to inject slow segments, lost replies, a slow writer and races at exact points. They are static fields, unset in production. |
 
 **Where the HDFS amendment had to be resolved**
 
@@ -1254,4 +1380,4 @@ Module names from the specification: `cluster.py` → `ClusterState` · `registr
 | `oscli: in docker mode, run this from inside …` | The client container only sees the project directory: copy the file into it, or use `OSCLI_MODE=local`. |
 | Upload answers `503 insufficient_workers` | Fewer than two workers can take writes. Check `make status`. |
 | Download answers `503 chunk_unavailable` | Every copy of some chunk is on a DEAD worker. It is back as soon as one returns. |
-| Orphan files stay on a worker | Deletion waits `ORPHAN_GC_DELAY` (60 s) after a controller start, then the next full report (30 s). `make fsck` shows `orphans_on_disk`. |
+| Orphan files stay on a worker | Deletion waits `ORPHAN_GC_DELAY` (60 s) after a controller start, then every worker is asked for one full report. A file planted by hand later that belongs to no object is collected by the next full report (`FULL_REPORT_INTERVAL`, 300 s). `make fsck` shows `orphans_on_disk`. |

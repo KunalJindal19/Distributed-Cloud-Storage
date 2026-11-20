@@ -227,4 +227,39 @@ class ReceiptTest {
         assertThat(cluster.locked(() -> cluster.replica(pendingChunk, "worker1"))).as("kept by the report").isNotNull();
         t.assertNoViolations();
     }
+
+    @Test
+    void edge9_aCommitRecordsACopyWhosePutAnswerWasLostFromItsReceipt() {
+        t.join("worker2");
+        String object = "abababab-7d0e-4c1b-9a54-1f2e3d4c5b6a";
+        String chunkId = object + "-00000";
+        cluster.write(() -> cluster.beginUpload(object));
+        // worker1's PUT answer was lost, so the upload used worker2 instead; worker1's RECEIVED arrives anyway.
+        t.send("worker1", List.of(received(1, chunkId)), null);
+        long epoch2 = cluster.read(() -> cluster.worker("worker2").epoch);
+
+        cluster.write(() -> t.queue.offer(t.namespaceTasks.commitObject(object, List.of(new NamespaceTasks.CommittedChunk(
+                new com.objectstore.controller.domain.Chunk(chunkId, object, 0, 10, TestSupport.SUM),
+                List.of(new NamespaceTasks.Target("worker2", epoch2)))))));
+        t.sync();
+
+        cluster.read(() -> {
+            assertThat(cluster.replica(chunkId, "worker1")).as("recorded from its receipt").isNotNull();
+            assertThat(cluster.pendingOf(chunkId)).extracting(ClusterState.PendingCopy::target).containsExactly("worker2");
+            assertThat(cluster.receipts()).doesNotContainKey(chunkId);
+        });
+        t.assertNoViolations();
+    }
+
+    @Test
+    void edge33_aReportRequestIsHeldBackWhileTheWorkerIsReporting() {
+        cluster.write(() -> worker().fullReportRequested = true);
+        HeartbeatResponse during = t.send("worker1", List.of(), new ReportSegment("r9", 0, false, 0, List.of()));
+        assertThat(during.requestFullReport()).as("not sent into a report in progress").isFalse();
+        HeartbeatResponse last = t.send("worker1", List.of(), new ReportSegment("r9", 1, true, 0, List.of()));
+        assertThat(last.requestFullReport()).as("nor with its last segment").isFalse();
+
+        assertThat(t.send("worker1", List.of(), null).requestFullReport()).as("sent once it is over").isTrue();
+        assertThat(t.send("worker1", List.of(), null).requestFullReport()).isFalse();
+    }
 }

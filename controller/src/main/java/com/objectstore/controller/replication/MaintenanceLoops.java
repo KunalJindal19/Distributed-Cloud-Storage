@@ -16,7 +16,8 @@ import org.springframework.stereotype.Component;
  *
  * <ul>
  *   <li><b>health</b>, every HEALTH_INTERVAL: STALE and DEAD detection, with stall protection;</li>
- *   <li><b>monitor</b>, every MONITOR_INTERVAL: safe mode, time-outs, replication, invariants.</li>
+ *   <li><b>planner</b>, every MONITOR_INTERVAL: safe mode, replication by priority level, cleanup,
+ *       the ledger, the rolling invariant check, in slices of at most MAX_LOCK_HOLD_MS.</li>
  * </ul>
  *
  * A loop never overlaps itself, and a failing pass is logged and the loop carries on.
@@ -45,8 +46,8 @@ public class MaintenanceLoops implements SmartLifecycle {
         }
         running = true;
         threads.add(loop("health-loop", properties.healthInterval(), registry::healthPass));
-        threads.add(loop("monitor-loop", properties.monitorInterval(), monitor::tick));
-        log.info("[api] background loops started: health every {}s, monitor every {}s",
+        threads.add(loop("planner-loop", properties.monitorInterval(), monitor::tick));
+        log.info("[api] background loops started: health every {}s, planner every {}s",
                 properties.healthIntervalSeconds(), properties.monitorIntervalSeconds());
     }
 

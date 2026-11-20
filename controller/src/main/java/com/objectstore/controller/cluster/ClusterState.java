@@ -14,6 +14,7 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -145,8 +146,8 @@ public class ClusterState {
      * or a report listing the copy, by {@code CMD_FAILED}, by time-out, by its source or target
      * becoming DEAD or re-registering, or by its chunk being deleted.
      */
-    public record PendingCopy(PendingKind kind, String source, String target, long deadline, String cmdId,
-                              long startedAt) {
+    public record PendingCopy(long id, String chunkId, PendingKind kind, String source, String target, long deadline,
+                              String cmdId, long startedAt) {
 
         public boolean involves(String workerId) {
             return workerId.equals(source) || workerId.equals(target);
@@ -210,6 +211,12 @@ public class ClusterState {
     private volatile String clusterId = "";
     private final Map<String, WorkerInfo> workers = new ConcurrentHashMap<>();
     private final DeletionLedger ledger = new DeletionLedger(this);
+    private final ReplicationIndex index;
+    private final Map<Long, PendingCopy> pendingById = new HashMap<>();
+    private final Map<String, Integer> pendingFromCount = new HashMap<>();
+    private final Map<String, Integer> pendingToCount = new HashMap<>();
+    private long pendingIds;
+    private volatile DeadlineScheduler deadlines = DeadlineScheduler.NONE;
     private final Map<String, ChunkInfo> chunks = new HashMap<>();
     private final Map<String, Map<String, Replica>> blocks = new HashMap<>();
     private final Map<String, Set<String>> workerBlocks = new HashMap<>();
@@ -230,7 +237,33 @@ public class ClusterState {
     public ClusterState(ControllerProperties properties, Clock clock) {
         this.properties = properties;
         this.clock = clock;
+        this.index = new ReplicationIndex(this, properties.replicationFactor());
         latestLock = lock;
+    }
+
+    /** Where deadlines go (the pending-timer); without one (unit tests) nothing expires by itself. */
+    public interface DeadlineScheduler {
+        void pendingCopy(long id, long atNanos);
+
+        void ledgerEntry(String chunkId, String workerId, long atNanos);
+
+        DeadlineScheduler NONE = new DeadlineScheduler() {
+            @Override
+            public void pendingCopy(long id, long atNanos) {
+            }
+
+            @Override
+            public void ledgerEntry(String chunkId, String workerId, long atNanos) {
+            }
+        };
+    }
+
+    public void setDeadlineScheduler(DeadlineScheduler scheduler) {
+        this.deadlines = scheduler;
+    }
+
+    DeadlineScheduler deadlines() {
+        return deadlines;
     }
 
     // ---- the lock -------------------------------------------------------------------------
@@ -299,8 +332,17 @@ public class ClusterState {
         }
     }
 
-    /** Hook for the priority index (Block 15): applied before every write unlock. */
+    /**
+     * Brings the priority index up to date: every chunk marked dirty since the last flush is
+     * recomputed. Runs before every write-lock release and at every writer yield.
+     */
     public void flushDirty() {
+        index.flush();
+    }
+
+    /** The one way to tell the index that something about a chunk changed (v4 §7.2). */
+    public void markDirty(String chunkId) {
+        index.markDirty(chunkId);
     }
 
     private static String holderName() {
@@ -445,11 +487,16 @@ public class ClusterState {
 
     public void putChunk(String chunkId, ChunkInfo info) {
         chunks.put(chunkId, info);
+        markDirty(chunkId);
     }
 
     /** Forgets a chunk entirely: its row mirror, every replica and every pending copy. */
     public void removeChunk(String chunkId) {
         chunks.remove(chunkId);
+        markDirty(chunkId);
+        for (PendingCopy copy : List.copyOf(pendingOf(chunkId))) {
+            removePendingCopy(copy);
+        }
         Map<String, Replica> holders = blocks.remove(chunkId);
         if (holders != null) {
             for (String workerId : holders.keySet()) {
@@ -459,7 +506,6 @@ public class ClusterState {
                 }
             }
         }
-        pending.remove(chunkId);
         uploadReceipts.remove(chunkId);
     }
 
@@ -616,7 +662,17 @@ public class ClusterState {
             workerBlocks.computeIfAbsent(workerId, id -> new HashSet<>()).add(chunkId);
         }
         replica.state = state;
+        markDirty(chunkId);
         return replica;
+    }
+
+    /** Changes a copy's state (OK, CORRUPT, EXCESS). */
+    public void setReplicaState(String chunkId, String workerId, ReplicaState state) {
+        Replica replica = replica(chunkId, workerId);
+        if (replica != null && replica.state != state) {
+            replica.state = state;
+            markDirty(chunkId);
+        }
     }
 
     public Replica removeReplica(String chunkId, String workerId) {
@@ -633,6 +689,7 @@ public class ClusterState {
             set.remove(chunkId);
         }
         if (removed != null) {
+            markDirty(chunkId);
             protect(chunkId);
         }
         return removed;
@@ -645,6 +702,7 @@ public class ClusterState {
             return false;
         }
         replica.state = ReplicaState.CORRUPT;
+        markDirty(chunkId);
         protect(chunkId);
         return true;
     }
@@ -662,6 +720,17 @@ public class ClusterState {
             return 0;
         }
         int restored = 0;
+        // An EXCESS copy whose deletion is not tracked (dropped when its worker re-registered) and
+        // was never delivered counts again too.
+        for (Map.Entry<String, Replica> holder : List.copyOf(replicasOf(chunkId).entrySet())) {
+            Replica replica = holder.getValue();
+            if (replica.state == ReplicaState.EXCESS && !replica.deleteDelivered
+                    && ledger.entry(chunkId, holder.getKey()) == null) {
+                setReplicaState(chunkId, holder.getKey(), ReplicaState.OK);
+                restored++;
+                record("restored", chunkId, holder.getKey(), null, "a live copy was lost; the surplus copy counts again");
+            }
+        }
         for (DeletionLedger.Entry entry : ledger.entriesFor(chunkId)) {
             if (!entry.linkedToReplica() || entry.state == DeletionLedger.State.DELIVERED) {
                 continue;
@@ -670,7 +739,7 @@ public class ClusterState {
             if (ledger.cancel(chunkId, workerId)) {
                 Replica replica = replica(chunkId, workerId);
                 if (replica != null && replica.state == ReplicaState.EXCESS) {
-                    replica.state = ReplicaState.OK;
+                    setReplicaState(chunkId, workerId, ReplicaState.OK);
                     restored++;
                     record("restored", chunkId, workerId, null,
                             "a live copy was lost; the surplus copy's undelivered DELETE was cancelled");
@@ -768,109 +837,221 @@ public class ClusterState {
         return pending.getOrDefault(chunkId, Collections.emptyList());
     }
 
-    /** A REPAIR: {@code source} was told (command {@code cmdId}) to copy the chunk to {@code target}. */
-    public void addPending(String chunkId, String source, String target, String cmdId) {
+    public PendingCopy pendingById(long id) {
+        return pendingById.get(id);
+    }
+
+    private PendingCopy addPendingCopy(String chunkId, PendingKind kind, String source, String target, String cmdId) {
         long now = now();
-        pending.computeIfAbsent(chunkId, id -> new ArrayList<>()).add(new PendingCopy(PendingKind.REPAIR, source, target,
-                now + properties.pendingTimeout().toNanos(), cmdId, now));
+        PendingCopy copy = new PendingCopy(++pendingIds, chunkId, kind, source, target,
+                now + properties.pendingTimeout().toNanos(), cmdId, now);
+        pending.computeIfAbsent(chunkId, id -> new ArrayList<>()).add(copy);
+        pendingById.put(copy.id(), copy);
+        if (source != null) {
+            pendingFromCount.merge(source, 1, Integer::sum);
+        }
+        pendingToCount.merge(target, 1, Integer::sum);
+        markDirty(chunkId);
+        deadlines.pendingCopy(copy.id(), copy.deadline());
+        return copy;
+    }
+
+    /** Ends a pending copy (success, failure, time-out, DEAD, re-registration, deletion). */
+    public boolean removePendingCopy(PendingCopy copy) {
+        List<PendingCopy> list = pending.get(copy.chunkId());
+        if (list == null || !list.remove(copy)) {
+            return false;
+        }
+        if (list.isEmpty()) {
+            pending.remove(copy.chunkId());
+        }
+        pendingById.remove(copy.id());
+        if (copy.source() != null) {
+            pendingFromCount.computeIfPresent(copy.source(), (w, n) -> n > 1 ? n - 1 : null);
+        }
+        pendingToCount.computeIfPresent(copy.target(), (w, n) -> n > 1 ? n - 1 : null);
+        markDirty(copy.chunkId());
+        return true;
+    }
+
+    /** A REPAIR: {@code source} was told (command {@code cmdId}) to copy the chunk to {@code target}. */
+    public PendingCopy addPending(String chunkId, String source, String target, String cmdId) {
+        return addPendingCopy(chunkId, PendingKind.REPAIR, source, target, cmdId);
     }
 
     /** An UPLOAD copy whose RECEIVED has not arrived: counted, readable, and expiring into normal repair. */
     public void addUploadPending(String chunkId, String target) {
-        long now = now();
         for (PendingCopy existing : pendingOf(chunkId)) {
             if (existing.target().equals(target)) {
                 return;
             }
         }
-        pending.computeIfAbsent(chunkId, id -> new ArrayList<>()).add(new PendingCopy(PendingKind.UPLOAD, null, target,
-                now + properties.pendingTimeout().toNanos(), null, now));
+        addPendingCopy(chunkId, PendingKind.UPLOAD, null, target, null);
     }
 
     /** Removes the REPAIR pending copy started by command {@code cmdId}, if it is still pending. */
     public PendingCopy removePendingByCommand(String chunkId, String cmdId) {
-        List<PendingCopy> list = pending.get(chunkId);
-        if (list == null || cmdId == null) {
+        if (cmdId == null) {
             return null;
         }
-        PendingCopy removed = null;
-        for (Iterator<PendingCopy> it = list.iterator(); it.hasNext(); ) {
-            PendingCopy copy = it.next();
+        for (PendingCopy copy : List.copyOf(pendingOf(chunkId))) {
             if (cmdId.equals(copy.cmdId())) {
-                it.remove();
-                removed = copy;
+                removePendingCopy(copy);
+                return copy;
             }
         }
-        if (list.isEmpty()) {
-            pending.remove(chunkId);
-        }
-        return removed;
+        return null;
     }
 
     public PendingCopy removePending(String chunkId, String target) {
-        List<PendingCopy> list = pending.get(chunkId);
-        if (list == null) {
-            return null;
-        }
         PendingCopy removed = null;
-        for (Iterator<PendingCopy> it = list.iterator(); it.hasNext(); ) {
-            PendingCopy copy = it.next();
+        for (PendingCopy copy : List.copyOf(pendingOf(chunkId))) {
             if (copy.target().equals(target)) {
-                it.remove();
+                removePendingCopy(copy);
                 removed = copy;
             }
-        }
-        if (list.isEmpty()) {
-            pending.remove(chunkId);
         }
         return removed;
     }
 
     public int dropPendingForWorker(String workerId, boolean asSource, boolean asTarget) {
         int dropped = 0;
-        for (Iterator<Map.Entry<String, List<PendingCopy>>> it = pending.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, List<PendingCopy>> entry = it.next();
-            List<PendingCopy> list = entry.getValue();
-            for (Iterator<PendingCopy> copies = list.iterator(); copies.hasNext(); ) {
-                PendingCopy copy = copies.next();
-                if ((asSource && workerId.equals(copy.source())) || (asTarget && copy.target().equals(workerId))) {
-                    copies.remove();
-                    dropped++;
-                }
-            }
-            if (list.isEmpty()) {
-                it.remove();
+        if (!pendingFromCount.containsKey(workerId) && !pendingToCount.containsKey(workerId)) {
+            return 0;
+        }
+        for (PendingCopy copy : List.copyOf(pendingById.values())) {
+            if ((asSource && workerId.equals(copy.source())) || (asTarget && copy.target().equals(workerId))) {
+                removePendingCopy(copy);
+                dropped++;
             }
         }
         return dropped;
     }
 
+    /** REPAIR copies in flight from this worker (an incremental counter). */
     public int pendingFrom(String workerId) {
-        int count = 0;
-        for (List<PendingCopy> list : pending.values()) {
-            for (PendingCopy copy : list) {
-                if (workerId.equals(copy.source())) {
-                    count++;
-                }
-            }
-        }
-        return count;
+        return pendingFromCount.getOrDefault(workerId, 0);
     }
 
+    /** Copies (repair and upload) on their way to this worker (an incremental counter). */
     public int pendingTo(String workerId) {
-        int count = 0;
-        for (List<PendingCopy> list : pending.values()) {
-            for (PendingCopy copy : list) {
-                if (copy.target().equals(workerId)) {
-                    count++;
-                }
-            }
-        }
-        return count;
+        return pendingToCount.getOrDefault(workerId, 0);
     }
 
     public int pendingTotal() {
-        return pending.values().stream().mapToInt(List::size).sum();
+        return pendingById.size();
+    }
+
+    /**
+     * {@code ExpirePending} (§7.4): if the pending copy has not ended yet, it does now. A REPAIR
+     * also avoids that (chunk, target) pair for TARGET_BACKOFF. Returns true if it expired.
+     */
+    public boolean expirePending(long id) {
+        return expirePending(id, now());
+    }
+
+    private boolean expirePending(long id, long now) {
+        PendingCopy copy = pendingById.get(id);
+        if (copy == null || copy.deadline() > now) {
+            return false;                                   // already ended (or a stale deadline)
+        }
+        removePendingCopy(copy);
+        if (copy.kind() == PendingKind.UPLOAD) {
+            record("timeout", copy.chunkId(), null, copy.target(), "upload copy not confirmed within "
+                    + properties.pendingTimeoutSeconds() + " s; normal repair takes over");
+        } else {
+            recordFailure(copy.chunkId(), copy.target());
+            record("timeout", copy.chunkId(), copy.source(), copy.target(), "copy not confirmed within "
+                    + properties.pendingTimeoutSeconds() + " s; avoiding this target for a while");
+        }
+        return true;
+    }
+
+    /** Expires every pending copy and ledger deadline due by {@code now} (tests; the timer does this). */
+    public int expireDue(long now) {
+        int expired = 0;
+        for (PendingCopy copy : List.copyOf(pendingById.values())) {
+            if (expirePending(copy.id(), now)) {
+                expired++;
+            }
+        }
+        return expired + ledger.expireDeadlines(now);
+    }
+
+    // ---- the priority index ------------------------------------------------------------------
+
+    public NeededReplication levels() {
+        return index.levels;
+    }
+
+    public LinkedHashSet<String> cleanupSet() {
+        return index.cleanup;
+    }
+
+    public LinkedHashSet<String> postponedSet() {
+        return index.postponed;
+    }
+
+    public int cleanupSize() {
+        return index.cleanup.size();
+    }
+
+    public int postponedSize() {
+        return index.postponed.size();
+    }
+
+    /** Moves up to {@code budget} postponed chunks back to cleanup (a worker became ALIVE or reported). */
+    public int releasePostponed(int budget) {
+        return index.releasePostponed(budget);
+    }
+
+    /** Chunks with at least one live copy (O(1); safe mode). */
+    public long safeCount() {
+        return index.safeCount();
+    }
+
+    /** {missing, under, over, ok, corrupt, excess}, all O(1). */
+    public long[] health() {
+        return new long[] {index.missing(), index.under(), index.over(), index.ok(), index.corrupt(), index.excess()};
+    }
+
+    /**
+     * The rolling check (v4 §8) on the next {@code count} chunks of the ring: I2, I3 and I5 for
+     * each, and its index entry (I9, I10), which is repaired by recomputing. Chunks touching a
+     * purging worker are skipped. Returns the problems found.
+     */
+    public List<String> rollingCheck(int count) {
+        List<String> problems = new ArrayList<>();
+        for (String chunkId : index.nextForRollingCheck(count)) {
+            Map<String, Replica> holders = replicasOf(chunkId);
+            boolean purging = false;
+            for (String workerId : holders.keySet()) {
+                WorkerInfo worker = workers.get(workerId);
+                purging |= worker != null && worker.purging;
+            }
+            if (purging) {
+                continue;
+            }
+            for (Map.Entry<String, Replica> holder : holders.entrySet()) {
+                if (!chunksOn(holder.getKey()).contains(chunkId)) {
+                    problems.add("I2: BLOCKS[" + chunkId + "] lists " + holder.getKey() + " which WORKER_BLOCKS does not");
+                    increment("invariant_violations");
+                }
+                if (holder.getValue().deleteDelivered && holder.getValue().state == ReplicaState.OK) {
+                    problems.add("I5: chunk " + chunkId + " on " + holder.getKey() + " is OK but its DELETE was delivered");
+                    increment("invariant_violations");
+                }
+            }
+            String indexProblem = index.checkChunk(chunkId);
+            if (indexProblem != null) {
+                problems.add(indexProblem);
+                increment("index_mismatches");
+            }
+        }
+        for (String problem : problems) {
+            log.error("[invariant] {}", problem);
+        }
+        return problems;
     }
 
     // ---- recent failures ------------------------------------------------------------------
@@ -1021,6 +1202,9 @@ public class ClusterState {
      * never thrown: the monitor must keep running.
      */
     public List<String> checkInvariants() {
+        if (lock.isWriteLockedByCurrentThread()) {
+            flushDirty();                 // (under the read lock nothing is dirty: every write unlock flushes)
+        }
         List<String> violations = new ArrayList<>();
         int rf = properties.replicationFactor();
         // I1: every holder in BLOCKS is a known, non-DEAD worker.
@@ -1118,6 +1302,34 @@ public class ClusterState {
         }
         // I12: the deletion ledger.
         violations.addAll(ledger.check());
+        // I9, I10: the priority index and every counter against a recomputation (skipping chunks of
+        // a worker that is being purged: its copies leave in steps).
+        Set<String> skip = new HashSet<>();
+        for (WorkerInfo worker : workers.values()) {
+            if (worker.purging) {
+                skip.addAll(chunksOn(worker.workerId));
+            }
+        }
+        violations.addAll(index.checkAll(skip));
+        Map<String, Integer> from = new HashMap<>();
+        Map<String, Integer> to = new HashMap<>();
+        int total = 0;
+        for (List<PendingCopy> list : pending.values()) {
+            for (PendingCopy copy : list) {
+                total++;
+                if (copy.source() != null) {
+                    from.merge(copy.source(), 1, Integer::sum);
+                }
+                to.merge(copy.target(), 1, Integer::sum);
+                if (pendingById.get(copy.id()) != copy) {
+                    violations.add("I10: pending copy " + copy.id() + " is missing from the id index");
+                }
+            }
+        }
+        if (!from.equals(pendingFromCount) || !to.equals(pendingToCount) || total != pendingById.size()) {
+            violations.add("I10: pendingFrom/pendingTo counters " + pendingFromCount + "/" + pendingToCount
+                    + " differ from a recount " + from + "/" + to);
+        }
         // I11: applied <= received for every worker.
         for (WorkerInfo worker : workers.values()) {
             if (worker.applied > worker.received) {

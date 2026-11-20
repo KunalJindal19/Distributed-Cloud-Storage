@@ -199,12 +199,18 @@ public class Registry {
             if (worker.state == WorkerState.STALE) {
                 worker.state = WorkerState.ALIVE;
                 log.info("[registry] {} ALIVE again (was STALE)", worker.workerId);
+                cluster.releasePostponed(properties.postponedBudget());
             }
+            boolean reportRunning = worker.reportInProgress() || request.segment() != null;
             receipts.acceptChanges(worker, request.changes());
             SegmentAck segmentAck = receipts.acceptSegment(worker, request.segment());
             List<Command> commands = cluster.takeCommands(worker);
-            boolean requestFull = worker.fullReportRequested;
-            worker.fullReportRequested = false;
+            // A worker ignores a report request that arrives during a report, so it is held back
+            // until the report is over instead of being lost.
+            boolean requestFull = worker.fullReportRequested && !reportRunning;
+            if (requestFull) {
+                worker.fullReportRequested = false;
+            }
             return new HeartbeatResponse(true, worker.state.name(), commands, requestFull, null, worker.received, segmentAck);
         });
     }
