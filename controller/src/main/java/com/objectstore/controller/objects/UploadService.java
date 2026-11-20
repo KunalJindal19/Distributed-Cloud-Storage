@@ -13,6 +13,7 @@ import com.objectstore.controller.cluster.NamespaceTasks;
 import com.objectstore.controller.cluster.Receipts;
 import com.objectstore.controller.cluster.Task;
 import com.objectstore.controller.cluster.Writer;
+import com.objectstore.controller.observability.MessageTrace;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.cluster.WorkerClient;
@@ -123,6 +124,13 @@ public class UploadService {
     private final NamespaceTasks namespaceTasks;
     private final ApplyQueue queue;
     private final Writer writer;
+    private MessageTrace trace = MessageTrace.OFF;
+
+    /** The message trace (TRACE_MESSAGES); off unless configured. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setTrace(MessageTrace trace) {
+        this.trace = trace;
+    }
 
     public UploadService(ControllerProperties properties, MetadataValidator metadataValidator, ClusterState cluster,
                          SafeMode safeMode, PlacementPolicy placement, WorkerClient workers, WorkerIo io,
@@ -387,12 +395,16 @@ public class UploadService {
         attempted.add(new WrittenCopy(target, chunkId));
         try {
             String changeAck = cluster.read(() -> receipts.changeAck(target.workerId()));
+            trace.putChunk(target.workerId(), chunkId, data.length);
             ChunkPutResponse answer = workers.putChunk(target.url(), chunkId, data, checksum, changeAck);
+            trace.putAnswer(target.workerId(), chunkId, answer == null || answer.changes() == null ? null
+                    : answer.changes().items(), null);
             if (answer != null && answer.changes() != null) {
                 receipts.acceptPiggyback(target.workerId(), answer.changes().bootId(), answer.changes().items());
             }
             return true;
         } catch (WorkerException e) {
+            trace.putAnswer(target.workerId(), chunkId, null, e.getMessage());
             log.warn("[upload] chunk={} worker={} write failed ({}); replacing it for this upload",
                     chunkId, target.workerId(), e.getMessage());
             WorkerInfo worker = cluster.worker(target.workerId());
