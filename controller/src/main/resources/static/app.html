@@ -1,0 +1,983 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object Store</title>
+<style>
+  :root {
+    --bg: #f4f6fa; --surface: #ffffff; --surface-2: #f8f9fc; --ink: #172033; --muted: #5d677a; --line: #e1e5ee;
+    --accent: #2456d6; --accent-ink: #ffffff; --accent-soft: #e6edff;
+    --ok: #15803d; --ok-bg: #dcfce7; --bad: #b91c1c; --bad-bg: #fee2e2; --warn: #a16207; --warn-bg: #fef3c7;
+    --idle: #4b5563; --idle-bg: #eceef2; --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 4px 16px rgba(16, 24, 40, .06);
+    --radius: 12px; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f141c; --surface: #171e29; --surface-2: #1d2532; --ink: #e6eaf2; --muted: #9aa4b6; --line: #2a3443;
+      --accent: #6b93ff; --accent-ink: #0b1220; --accent-soft: #1f2b47;
+      --ok: #4ade80; --ok-bg: #12301f; --bad: #f87171; --bad-bg: #3a1717; --warn: #fbbf24; --warn-bg: #3a2c0e;
+      --idle: #b4bccb; --idle-bg: #262f3d; --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 16px rgba(0, 0, 0, .25);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  button, input, select { font: inherit; color: inherit; }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .muted { color: var(--muted); }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* ---- top bar ---- */
+  .topbar { position: sticky; top: 0; z-index: 10; background: var(--surface); border-bottom: 1px solid var(--line); }
+  .topbar-inner { max-width: 1240px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: -.01em; }
+  .brand-mark { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; }
+  .brand-mark svg { width: 18px; height: 18px; }
+  .brand small { font-weight: 500; color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px; font-weight: 600;
+          font-size: 13px; background: var(--idle-bg); color: var(--idle); white-space: nowrap; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .chip.ok { background: var(--ok-bg); color: var(--ok); }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); }
+  .chip.bad { background: var(--bad-bg); color: var(--bad); }
+  .status-detail { font-size: 13px; color: var(--muted); }
+  .toplink { font-size: 14px; text-decoration: none; padding: 6px 10px; border-radius: 8px; }
+  .toplink:hover { background: var(--accent-soft); }
+
+  .banner { max-width: 1240px; margin: 12px auto 0; padding: 0 16px; }
+  .banner > div { padding: 10px 14px; border-radius: 10px; font-weight: 600; background: var(--warn-bg); color: var(--warn); }
+  .banner > div.bad { background: var(--bad-bg); color: var(--bad); }
+
+  /* ---- layout ---- */
+  .layout { max-width: 1240px; margin: 0 auto; padding: 16px 16px 48px; display: grid; gap: 16px;
+            grid-template-columns: minmax(300px, 380px) minmax(0, 1fr); align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .card-head { padding: 14px 16px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0; font-size: 16px; }
+  .card-body { padding: 14px 16px 16px; }
+
+  /* ---- buttons and inputs ---- */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line);
+         background: var(--surface); padding: 7px 12px; border-radius: 9px; cursor: pointer; font-size: 14px;
+         font-weight: 600; text-decoration: none; color: var(--ink); white-space: nowrap; }
+  .btn:hover { background: var(--surface-2); }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary:hover { filter: brightness(1.06); }
+  .btn.danger { color: var(--bad); }
+  .btn.danger:hover { background: var(--bad-bg); }
+  .btn.small { padding: 4px 9px; font-size: 13px; }
+  .btn.icon { padding: 6px; width: 32px; height: 32px; }
+  .btn svg { width: 16px; height: 16px; flex: none; }
+  input[type=text], input[type=search], select { border: 1px solid var(--line); background: var(--surface); border-radius: 9px;
+         padding: 7px 10px; min-width: 0; }
+  input:focus-visible, select:focus-visible, .btn:focus-visible, .dropzone:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input.invalid { border-color: var(--bad); background: var(--bad-bg); }
+
+  /* ---- upload ---- */
+  .dropzone { display: block; border: 2px dashed var(--line); border-radius: var(--radius); padding: 26px 16px; text-align: center;
+              cursor: pointer; background: var(--surface-2); transition: border-color .15s, background .15s; }
+  .dropzone.drag { border-color: var(--accent); background: var(--accent-soft); }
+  .dropzone svg { width: 34px; height: 34px; color: var(--accent); }
+  .dropzone strong { display: block; margin-top: 6px; font-size: 15px; }
+  .dropzone input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .section-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+                   margin: 16px 0 8px; display: flex; align-items: center; gap: 8px; }
+  .kv { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 6px; align-items: center; }
+  .kv + .kv { margin-top: 6px; }
+  .kv input { width: 100%; }
+  .hint { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  .error-text { font-size: 12.5px; color: var(--bad); margin-top: 6px; }
+  .queue { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+  .qitem { border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; background: var(--surface); }
+  .qrow { display: flex; align-items: center; gap: 8px; }
+  .qname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+  .qmeta { font-size: 12.5px; color: var(--muted); margin-top: 2px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .qmeta .ok { color: var(--ok); font-weight: 600; }
+  .qmeta .bad { color: var(--bad); font-weight: 600; }
+  .qmeta .warn { color: var(--warn); font-weight: 600; }
+  .bar { height: 6px; background: var(--idle-bg); border-radius: 99px; overflow: hidden; margin-top: 7px; }
+  .bar > span { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .2s; }
+  .bar.indeterminate > span { width: 35%; animation: slide 1.1s ease-in-out infinite; }
+  .bar.done > span { background: var(--ok); }
+  .bar.failed > span { background: var(--bad); }
+  @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+  .upload-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .upload-actions .btn.primary { flex: 1; }
+
+  /* ---- objects ---- */
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; width: 100%; }
+  .toolbar input[type=search] { flex: 1; min-width: 180px; }
+  .count { font-size: 13px; color: var(--muted); margin-left: auto; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12.5px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--surface-2); }
+  .file-cell { display: flex; align-items: center; gap: 10px; min-width: 220px; max-width: 420px; }
+  .file-icon { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; font-size: 10px; font-weight: 800;
+               letter-spacing: .02em; flex: none; background: var(--accent-soft); color: var(--accent); text-transform: uppercase; }
+  .file-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .file-sub { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  .row-actions { display: flex; gap: 4px; justify-content: flex-end; }
+  .empty-state { text-align: center; padding: 42px 16px; color: var(--muted); }
+  .empty-state svg { width: 40px; height: 40px; opacity: .6; }
+  .pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; padding: 12px 16px; flex-wrap: wrap; }
+  .skeleton td { color: transparent; }
+  .skeleton td span { display: inline-block; height: 12px; width: 70%; background: var(--idle-bg); border-radius: 6px; }
+
+  /* ---- dialogs ---- */
+  dialog { border: 1px solid var(--line); border-radius: 16px; padding: 0; background: var(--surface); color: var(--ink);
+           box-shadow: 0 24px 64px rgba(0, 0, 0, .25); width: min(920px, calc(100vw - 24px)); max-height: calc(100vh - 32px); }
+  dialog::backdrop { background: rgba(10, 14, 22, .45); }
+  dialog.narrow { width: min(460px, calc(100vw - 24px)); }
+  .dlg-head { position: sticky; top: 0; background: var(--surface); padding: 16px 18px; border-bottom: 1px solid var(--line);
+              display: flex; align-items: flex-start; gap: 12px; z-index: 1; }
+  .dlg-title { flex: 1; min-width: 0; }
+  .dlg-title h3 { margin: 0; font-size: 18px; overflow-wrap: anywhere; }
+  .dlg-title .mono { color: var(--muted); }
+  .dlg-body { padding: 16px 18px 20px; }
+  .dlg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+  .fact { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  .fact .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+  .fact .value { font-weight: 600; overflow-wrap: anywhere; }
+  .fact .value.mono { font-weight: 500; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 700; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.idle { background: var(--idle-bg); color: var(--idle); }
+  .copy-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .copy-line .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .locs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .loc { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
+         background: var(--ok-bg); color: var(--ok); }
+  .loc.CORRUPT { background: var(--bad-bg); color: var(--bad); }
+  .loc.EXCESS { background: var(--idle-bg); color: var(--idle); }
+  .loc.stale { outline: 1px dashed var(--warn); }
+  .preview { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--surface-2); }
+  .preview img, .preview video { display: block; max-width: 100%; max-height: 420px; margin: 0 auto; }
+  .preview audio { display: block; width: 100%; }
+  .preview iframe { display: block; width: 100%; height: 480px; border: 0; background: #fff; }
+  .preview pre { margin: 0; padding: 12px; max-height: 360px; overflow: auto; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; }
+  .verify { margin-top: 8px; font-size: 13.5px; }
+  .confirm-body { padding: 18px; }
+  .confirm-body h3 { margin: 0 0 6px; }
+  .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+  /* ---- toasts ---- */
+  .toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 50; max-width: min(420px, calc(100vw - 32px)); }
+  /* As a popover the toasts live in the top layer, above an open dialog and its backdrop. */
+  .toasts[popover] { inset: auto 16px 16px auto; margin: 0; border: 0; padding: 0; background: transparent; overflow: visible; color: inherit; }
+  .toast { background: var(--ink); color: var(--bg); padding: 10px 14px; border-radius: 10px; box-shadow: var(--shadow); font-size: 14px;
+           animation: pop .18s ease-out; }
+  .toast.bad { background: var(--bad); color: #fff; }
+  .toast.ok { background: var(--ok); color: #fff; }
+  @keyframes pop { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .spin { width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+          animation: spin .7s linear infinite; display: inline-block; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>
+        </svg>
+      </div>
+      <div>Object Store <small>distributed, 2 copies of every chunk</small></div>
+    </div>
+    <div class="spacer"></div>
+    <span id="status-chip" class="chip" title="cluster status">connecting…</span>
+    <span id="status-detail" class="status-detail"></span>
+    <a class="toplink" href="/dashboard" target="_blank" rel="noopener">Cluster dashboard ↗</a>
+  </div>
+</header>
+
+<div class="banner" id="banner" hidden><div id="banner-text"></div></div>
+
+<main class="layout">
+  <!-- ======================= upload ======================= -->
+  <section class="card" aria-labelledby="upload-title">
+    <div class="card-head"><h2 id="upload-title">Upload</h2></div>
+    <div class="card-body">
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" multiple>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+        </svg>
+        <strong>Drop files here or click to choose</strong>
+        <span class="muted">Any type, up to 10 GB each. Files are split into 1 MB chunks, each stored on two workers.</span>
+      </label>
+
+      <div class="section-title">Custom metadata <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">(optional, applied to every file below)</span></div>
+      <div id="upload-meta"></div>
+      <button class="btn small" type="button" id="add-upload-meta" style="margin-top:8px">+ Add field</button>
+      <div class="hint">Keys: 1–64 characters from A–Z a–z 0–9 _ . - · values up to 1024 characters · at most 64 fields.</div>
+      <div class="error-text" id="upload-meta-error" hidden></div>
+
+      <ul class="queue" id="queue" aria-live="polite"></ul>
+      <div class="upload-actions">
+        <button class="btn primary" type="button" id="upload-btn" disabled>Upload</button>
+        <button class="btn" type="button" id="clear-btn" disabled>Clear</button>
+      </div>
+      <div class="hint">Each upload carries its own Idempotency-Key, so retries after a dropped connection or a busy cluster never create a duplicate.</div>
+    </div>
+  </section>
+
+  <!-- ======================= objects ======================= -->
+  <section class="card" aria-labelledby="objects-title">
+    <div class="card-head">
+      <h2 id="objects-title">Objects</h2>
+      <div class="toolbar">
+        <label class="sr-only" for="search">Filter this page</label>
+        <input type="search" id="search" placeholder="Filter this page by name, type or id">
+        <label class="sr-only" for="page-size">Objects per page</label>
+        <select id="page-size" title="Objects per page">
+          <option value="25">25 per page</option><option value="50" selected>50 per page</option>
+          <option value="100">100 per page</option><option value="250">250 per page</option>
+        </select>
+        <button class="btn" type="button" id="refresh-btn" title="Refresh the list">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+          Refresh
+        </button>
+        <span class="count" id="count"></span>
+      </div>
+    </div>
+    <div class="card-body" style="padding:8px 0 0">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Chunks</th><th>Created</th><th class="num"><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty-state" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>
+        <div id="empty-text">No objects stored yet. Upload a file to get started.</div>
+      </div>
+      <div class="pager">
+        <button class="btn small" type="button" id="prev-btn" disabled>← Newer</button>
+        <span class="muted" id="page-info"></span>
+        <button class="btn small" type="button" id="next-btn" disabled>Older →</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ======================= object details ======================= -->
+<dialog id="details" aria-labelledby="d-name">
+  <div class="dlg-head">
+    <div class="file-icon" id="d-icon" aria-hidden="true"></div>
+    <div class="dlg-title">
+      <h3 id="d-name">…</h3>
+      <div class="copy-line"><span class="mono" id="d-id"></span><button class="btn icon small" type="button" data-copy="d-id" title="Copy object id">⧉</button></div>
+    </div>
+    <button class="btn icon" type="button" id="d-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <div class="dlg-body" id="d-body">
+    <div class="dlg-actions">
+      <a class="btn primary" id="d-download" href="#" download>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12"/><path d="M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>
+        Download</a>
+      <button class="btn" type="button" id="d-preview">Preview</button>
+      <button class="btn" type="button" id="d-verify">Verify integrity</button>
+      <span class="spacer"></span>
+      <button class="btn danger" type="button" id="d-delete">Delete</button>
+    </div>
+    <div class="verify" id="d-verify-result" hidden></div>
+    <div class="preview" id="d-preview-box" hidden></div>
+
+    <div class="section-title">System metadata</div>
+    <div class="facts" id="d-facts"></div>
+
+    <div class="section-title">Custom metadata</div>
+    <div id="d-meta"></div>
+    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+      <button class="btn small" type="button" id="d-add-meta">+ Add field</button>
+      <span class="spacer"></span>
+      <button class="btn small" type="button" id="d-reset-meta" disabled>Discard changes</button>
+      <button class="btn small primary" type="button" id="d-save-meta" disabled>Save metadata</button>
+    </div>
+    <div class="error-text" id="d-meta-error" hidden></div>
+
+    <div class="section-title">Chunks and where their copies are <span id="d-repl"></span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th class="num">#</th><th class="num">Size</th><th>SHA-256</th><th>Copies</th></tr></thead>
+        <tbody id="d-chunks"></tbody>
+      </table>
+    </div>
+  </div>
+</dialog>
+
+<!-- ======================= confirm ======================= -->
+<dialog id="confirm" class="narrow">
+  <form method="dialog" class="confirm-body">
+    <h3 id="c-title">Delete object?</h3>
+    <div class="muted" id="c-text"></div>
+    <div class="confirm-actions">
+      <button class="btn" value="cancel">Cancel</button>
+      <button class="btn primary" value="ok" id="c-ok" style="background:var(--bad);border-color:var(--bad);color:#fff">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="assertive" popover="manual"></div>
+
+<script>
+"use strict";
+const API = "/api/v1";
+const RETRY_STEPS_MS = [500, 1000, 2000, 4000, 5000];
+const RETRY_FOR_MS = 120_000;
+const VERIFY_LIMIT = 256 * 1024 * 1024;     // hashing happens in memory: keep it to files of reasonable size
+const PREVIEW_LIMIT = 50 * 1024 * 1024;
+const KEY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- helpers
+/** Builds an element; strings become text nodes, so names and metadata can never inject HTML. */
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) {
+    if (c == null || c === false) continue;
+    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return el;
+}
+
+function bytes(n) {
+  if (n == null) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v < 10 ? 2 : 1)) + " " + units[i];
+}
+
+function when(iso) {
+  if (!iso) return "–";
+  const t = new Date(iso), s = (Date.now() - t.getTime()) / 1000;
+  if (s < 45) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  if (s < 86400 * 7) return Math.round(s / 86400) + " d ago";
+  return t.toLocaleDateString();
+}
+
+function fullDate(iso) {
+  return iso ? new Date(iso).toLocaleString() : "–";
+}
+
+function extension(name, type) {
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec(name || "");
+  if (m) return m[1].toLowerCase();
+  if (type) return type.split("/")[1]?.split(/[+;.-]/)[0]?.slice(0, 4) || "file";
+  return "file";
+}
+
+function randomKey() {
+  if (window.crypto?.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));           // works outside secure contexts too
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/** The server's JSON error ({error, detail}) as a readable sentence. */
+function describe(err) {
+  if (!err) return "unknown error";
+  if (err.detail) return err.detail + (err.code ? " (" + err.code + ")" : "");
+  return err.message || String(err);
+}
+
+class ApiError extends Error {
+  constructor(status, code, detail) { super(detail || code || ("HTTP " + status)); this.status = status; this.code = code; this.detail = detail; }
+}
+
+async function api(path, options = {}) {
+  let response;
+  try {
+    response = await fetch(API + path, options);
+  } catch (e) {
+    throw new ApiError(0, "unreachable", "the controller cannot be reached");
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  if (!response.ok) {
+    throw new ApiError(response.status, body?.error, body?.detail || text.slice(0, 200) || response.statusText);
+  }
+  return body;
+}
+
+function toast(message, kind = "") {
+  const box = $("toasts");
+  const t = h("div", {class: "toast " + kind, role: "status"}, message);
+  box.append(t);
+  if (box.showPopover) {
+    try { box.hidePopover(); } catch {}
+    try { box.showPopover(); } catch {}         // re-shown: on top of any dialog opened since
+  }
+  setTimeout(() => { t.remove(); if (!box.children.length && box.hidePopover) try { box.hidePopover(); } catch {} },
+      kind === "bad" ? 7000 : 3500);
+}
+
+async function copy(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+    else {
+      const ta = h("textarea", {style: "position:fixed;opacity:0"}, text);
+      document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+    }
+    toast("Copied to the clipboard");
+  } catch { toast("Could not copy", "bad"); }
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-copy]");
+  if (b) copy($(b.dataset.copy).dataset.full || $(b.dataset.copy).textContent);
+});
+
+function confirmDialog(title, text, okLabel = "Delete") {
+  $("c-title").textContent = title;
+  $("c-text").textContent = text;
+  $("c-ok").textContent = okLabel;
+  const dlg = $("confirm");
+  return new Promise((resolve) => {
+    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), {once: true});
+    dlg.returnValue = "";
+    dlg.showModal();
+  });
+}
+
+// ---------------------------------------------------------------- cluster status
+let cluster = {reachable: false, writable: false, safeMode: false, rf: 2};
+
+async function refreshStatus() {
+  const chip = $("status-chip"), detail = $("status-detail");
+  try {
+    const s = await api("/cluster/status");
+    const rf = s.config?.replication_factor ?? 2;
+    const ready = s.workers.filter((w) => w.state === "ALIVE" && w.has_reported).length;
+    const total = s.workers.length;
+    cluster = {reachable: true, safeMode: s.safe_mode, rf, writable: !s.safe_mode && ready >= rf};
+    let cls = "ok", label = "Healthy";
+    if (s.safe_mode) { cls = "warn"; label = "Starting up (safe mode)"; }
+    else if (ready < rf) { cls = "bad"; label = "Too few workers"; }
+    else if (s.missing_chunks > 0) { cls = "bad"; label = "Data unavailable"; }
+    else if (s.under_replicated > 0 || ready < total) { cls = "warn"; label = "Repairing"; }
+    chip.className = "chip " + cls;
+    chip.textContent = label;
+    detail.textContent = `${ready}/${total} workers · ${s.objects.toLocaleString()} objects · ${rf} copies per chunk`;
+    if (s.safe_mode) showBanner("The controller is starting up and waiting for its workers. Downloads work; uploads, changes and deletes are briefly refused, and uploads are retried automatically.", "");
+    else if (ready < rf) showBanner(`Only ${ready} worker(s) can take writes; ${rf} are needed for every chunk. Uploads will wait and retry.`, "bad");
+    else if (s.missing_chunks > 0) showBanner(`${s.missing_chunks} chunk(s) have no live copy right now: some objects cannot be downloaded until a worker returns.`, "bad");
+    else hideBanner();
+  } catch (e) {
+    cluster = {reachable: false, writable: false, safeMode: false, rf: cluster.rf};
+    chip.className = "chip bad";
+    chip.textContent = "Unreachable";
+    detail.textContent = "retrying…";
+    showBanner("The object store cannot be reached. Retrying every few seconds.", "bad");
+  }
+}
+
+function showBanner(text, cls) {
+  $("banner-text").textContent = text;
+  $("banner-text").className = cls;
+  $("banner").hidden = false;
+}
+
+function hideBanner() { $("banner").hidden = true; }
+
+// ---------------------------------------------------------------- metadata editors
+/** A key/value editor bound to a container; returns helpers to read, validate and reset it. */
+function metadataEditor(container, onChange) {
+  function addRow(key = "", value = "") {
+    const k = h("input", {type: "text", placeholder: "key", value: key, maxlength: 64, "aria-label": "metadata key"});
+    const v = h("input", {type: "text", placeholder: "value", value: value, maxlength: 1024, "aria-label": "metadata value"});
+    const row = h("div", {class: "kv"}, k, v,
+        h("button", {class: "btn icon small", type: "button", title: "Remove field", "aria-label": "Remove field",
+                     onclick: () => { row.remove(); onChange?.(); }}, "✕"));
+    k.addEventListener("input", () => { k.classList.toggle("invalid", k.value !== "" && !KEY_RE.test(k.value)); onChange?.(); });
+    v.addEventListener("input", () => onChange?.());
+    container.append(row);
+    return k;
+  }
+  function read() {
+    const out = {}, problems = [];
+    for (const row of container.querySelectorAll(".kv")) {
+      const [k, v] = row.querySelectorAll("input");
+      const key = k.value.trim(), value = v.value;
+      if (key === "" && value === "") continue;
+      if (!KEY_RE.test(key)) problems.push(`"${key || "(empty)"}" is not a valid key`);
+      else if (key in out) problems.push(`"${key}" appears twice`);
+      if (value.length > 1024) problems.push(`the value of "${key}" is longer than 1024 characters`);
+      out[key] = value;
+    }
+    if (Object.keys(out).length > 64) problems.push("at most 64 fields");
+    return {values: out, problems};
+  }
+  function set(values) {
+    container.replaceChildren();
+    for (const [k, v] of Object.entries(values || {})) addRow(k, v);
+  }
+  return {addRow, read, set};
+}
+
+// ---------------------------------------------------------------- uploads
+const queue = [];
+let uploading = false;
+const uploadMeta = metadataEditor($("upload-meta"), validateUploadMeta);
+
+function validateUploadMeta() {
+  const {problems} = uploadMeta.read();
+  $("upload-meta-error").hidden = problems.length === 0;
+  $("upload-meta-error").textContent = problems.join("; ");
+  return problems.length === 0;
+}
+
+$("add-upload-meta").addEventListener("click", () => uploadMeta.addRow().focus());
+
+function addFiles(files) {
+  for (const file of files) {
+    queue.push({file, key: randomKey(), state: "ready", progress: 0, note: "", result: null, xhr: null});
+  }
+  renderQueue();
+}
+
+const dz = $("dropzone"), fileInput = $("file-input");
+fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
+["dragenter", "dragover"].forEach((t) => dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+["dragleave", "drop"].forEach((t) => dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+dz.addEventListener("drop", (e) => { if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files); });
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+
+function renderQueue() {
+  const list = $("queue");
+  list.replaceChildren(...queue.map((item, i) => {
+    const bar = h("div", {class: "bar"}, h("span", {style: `width:${Math.round(item.progress * 100)}%`}));
+    if (item.state === "storing" || item.state === "waiting") bar.classList.add("indeterminate");
+    if (item.state === "done") { bar.classList.add("done"); bar.firstChild.style.width = "100%"; }
+    if (item.state === "failed") { bar.classList.add("failed"); bar.firstChild.style.width = "100%"; }
+    let status;
+    switch (item.state) {
+      case "ready": status = h("span", {}, "ready"); break;
+      case "uploading": status = h("span", {}, `sending ${Math.round(item.progress * 100)}%`); break;
+      case "storing": status = h("span", {}, "storing two copies of every chunk…"); break;
+      case "waiting": status = h("span", {class: "warn"}, item.note); break;
+      case "done": status = h("span", {class: "ok"}, item.note); break;
+      case "failed": status = h("span", {class: "bad"}, item.note); break;
+      case "cancelled": status = h("span", {}, "cancelled"); break;
+    }
+    const actions = [];
+    if (item.state === "ready" || item.state === "failed" || item.state === "cancelled" || item.state === "done") {
+      actions.push(h("button", {class: "btn icon small", type: "button", title: "Remove from the list", "aria-label": "Remove",
+                                onclick: () => { queue.splice(i, 1); renderQueue(); }}, "✕"));
+    }
+    if (item.state === "uploading" || item.state === "storing" || item.state === "waiting") {
+      actions.push(h("button", {class: "btn small", type: "button", onclick: () => cancelUpload(item)}, "Cancel"));
+    }
+    if (item.state === "done" && item.result) {
+      actions.unshift(h("button", {class: "btn small", type: "button", onclick: () => openDetails(item.result.object_id)}, "Open"));
+    }
+    return h("li", {class: "qitem"},
+        h("div", {class: "qrow"}, h("div", {class: "qname", title: item.file.name}, item.file.name), ...actions),
+        h("div", {class: "qmeta"}, h("span", {}, bytes(item.file.size)), status),
+        item.state !== "ready" && item.state !== "cancelled" ? bar : null);
+  }));
+  const pending = queue.filter((q) => q.state === "ready" || q.state === "failed").length;
+  $("upload-btn").disabled = uploading || pending === 0;
+  $("upload-btn").textContent = uploading ? "Uploading…" : pending > 1 ? `Upload ${pending} files` : "Upload";
+  $("clear-btn").disabled = uploading || queue.length === 0;
+}
+
+$("clear-btn").addEventListener("click", () => {
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (!["uploading", "storing", "waiting"].includes(queue[i].state)) queue.splice(i, 1);
+  }
+  renderQueue();
+});
+
+$("upload-btn").addEventListener("click", async () => {
+  if (!validateUploadMeta()) { toast("Fix the metadata first", "bad"); return; }
+  const metadata = uploadMeta.read().values;
+  uploading = true;
+  renderQueue();
+  const todo = queue.filter((q) => q.state === "ready" || q.state === "failed");
+  // Two at a time: enough to keep the cluster busy without starving the browser.
+  let next = 0, completed = 0;
+  async function worker() {
+    while (next < todo.length) {
+      const item = todo[next++];
+      await uploadWithRetry(item, metadata);
+      if (item.state === "done") completed++;
+    }
+  }
+  await Promise.all([worker(), worker()]);
+  uploading = false;
+  renderQueue();
+  if (completed) { toast(`${completed} object${completed > 1 ? "s" : ""} stored`, "ok"); loadObjects(); refreshStatus(); }
+});
+
+function cancelUpload(item) {
+  item.cancelled = true;
+  item.xhr?.abort();
+  item.state = "cancelled";
+  renderQueue();
+}
+
+/** One upload, retried on connection loss and 503 with the same Idempotency-Key (never a duplicate). */
+async function uploadWithRetry(item, metadata) {
+  item.cancelled = false;
+  const started = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    if (item.cancelled) return;
+    const outcome = await uploadOnce(item, metadata);
+    if (item.cancelled) return;
+    if (outcome.ok) {
+      const o = outcome.body;
+      item.result = o;
+      item.state = "done";
+      item.note = outcome.replay ? "already stored (same upload)" : `stored · ${o.chunk_count} chunk${o.chunk_count === 1 ? "" : "s"}` + (o.replication_ok ? " · 2 copies each" : "");
+      renderQueue();
+      return;
+    }
+    const retryable = outcome.status === 0 || outcome.status === 503;
+    if (!retryable || Date.now() - started > RETRY_FOR_MS) {
+      item.state = "failed";
+      item.note = outcome.message;
+      renderQueue();
+      return;
+    }
+    const wait = outcome.retryAfter ?? RETRY_STEPS_MS[Math.min(attempt, RETRY_STEPS_MS.length - 1)];
+    item.state = "waiting";
+    item.progress = 0;
+    item.note = (outcome.code === "safe_mode" ? "cluster starting up" : outcome.code === "insufficient_workers"
+        ? "not enough workers" : outcome.status === 0 ? "connection lost" : "cluster busy") + ` — retrying in ${Math.ceil(wait / 1000)} s`;
+    renderQueue();
+    await sleep(wait);
+  }
+}
+
+function uploadOnce(item, metadata) {
+  return new Promise((resolve) => {
+    const form = new FormData();
+    if (Object.keys(metadata).length) form.append("metadata", JSON.stringify(metadata));
+    form.append("file", item.file, item.file.name);
+    const xhr = new XMLHttpRequest();
+    item.xhr = xhr;
+    xhr.open("POST", API + "/objects");
+    xhr.setRequestHeader("Idempotency-Key", item.key);
+    item.state = "uploading";
+    item.progress = 0;
+    renderQueue();
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) { item.progress = e.loaded / e.total; renderQueue(); }
+    };
+    xhr.upload.onload = () => { item.state = "storing"; renderQueue(); };
+    xhr.onload = () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { body = null; }
+      if (xhr.status === 200 || xhr.status === 201) {
+        resolve({ok: true, body, replay: xhr.getResponseHeader("Idempotent-Replay") === "true"});
+      } else {
+        const ra = parseInt(xhr.getResponseHeader("Retry-After") || "", 10);
+        resolve({ok: false, status: xhr.status, code: body?.error, retryAfter: Number.isFinite(ra) ? ra * 1000 : null,
+                 message: (body?.detail || `HTTP ${xhr.status}`) + (body?.error ? ` (${body.error})` : "")});
+      }
+    };
+    xhr.onerror = () => resolve({ok: false, status: 0, message: "connection lost"});
+    xhr.onabort = () => resolve({ok: false, status: -1, message: "cancelled"});
+    xhr.send(form);
+  });
+}
+
+// ---------------------------------------------------------------- object list
+const listState = {limit: 50, offset: 0, total: 0, items: []};
+
+function skeleton() {
+  $("rows").replaceChildren(...Array.from({length: 5}, () =>
+      h("tr", {class: "skeleton"}, ...Array.from({length: 5}, () => h("td", {}, h("span"))))));
+}
+
+async function loadObjects() {
+  if (!listState.items.length) skeleton();
+  try {
+    const page = await api(`/objects?limit=${listState.limit}&offset=${listState.offset}`);
+    listState.items = page.items;
+    listState.total = page.total;
+    if (page.items.length === 0 && listState.offset > 0 && page.total > 0) {
+      listState.offset = Math.max(0, Math.floor((page.total - 1) / listState.limit) * listState.limit);
+      return loadObjects();
+    }
+    renderObjects();
+  } catch (e) {
+    $("rows").replaceChildren();
+    $("empty").hidden = false;
+    $("empty-text").textContent = "Could not load the objects: " + describe(e);
+  }
+}
+
+function renderObjects() {
+  const filter = $("search").value.trim().toLowerCase();
+  const items = listState.items.filter((o) => !filter || o.name.toLowerCase().includes(filter)
+      || (o.content_type || "").toLowerCase().includes(filter) || o.object_id.includes(filter));
+  $("rows").replaceChildren(...items.map((o) => {
+    const ext = extension(o.name, o.content_type);
+    const tr = h("tr", {tabindex: 0, onclick: () => openDetails(o.object_id),
+                        onkeydown: (e) => { if (e.key === "Enter") openDetails(o.object_id); }},
+        h("td", {}, h("div", {class: "file-cell"},
+            h("div", {class: "file-icon", "aria-hidden": "true"}, ext.slice(0, 4)),
+            h("div", {style: "min-width:0"},
+                h("div", {class: "file-name", title: o.name}, o.name),
+                h("div", {class: "file-sub"}, o.content_type || "application/octet-stream")))),
+        h("td", {class: "num"}, bytes(o.size)),
+        h("td", {class: "num"}, String(o.chunk_count)),
+        h("td", {title: fullDate(o.created_at)}, when(o.created_at)),
+        h("td", {class: "num"}, h("div", {class: "row-actions"},
+            h("a", {class: "btn small", href: `${API}/objects/${o.object_id}`, download: o.name, title: "Download",
+                    onclick: (e) => e.stopPropagation()}, "Download"),
+            h("button", {class: "btn small danger", type: "button", title: "Delete",
+                         onclick: (e) => { e.stopPropagation(); deleteObject(o); }}, "Delete"))));
+    return tr;
+  }));
+  const none = listState.total === 0;
+  $("empty").hidden = !(none || items.length === 0);
+  $("empty-text").textContent = none ? "No objects stored yet. Upload a file to get started." : "Nothing on this page matches the filter.";
+  const from = listState.total ? listState.offset + 1 : 0;
+  const to = Math.min(listState.offset + listState.items.length, listState.total);
+  $("count").textContent = `${listState.total.toLocaleString()} object${listState.total === 1 ? "" : "s"}`;
+  $("page-info").textContent = listState.total ? `${from}–${to} of ${listState.total.toLocaleString()}` : "";
+  $("prev-btn").disabled = listState.offset === 0;
+  $("next-btn").disabled = listState.offset + listState.items.length >= listState.total;
+}
+
+$("search").addEventListener("input", renderObjects);
+$("refresh-btn").addEventListener("click", () => { loadObjects(); refreshStatus(); });
+$("page-size").addEventListener("change", () => { listState.limit = +$("page-size").value; listState.offset = 0; loadObjects(); });
+$("prev-btn").addEventListener("click", () => { listState.offset = Math.max(0, listState.offset - listState.limit); loadObjects(); });
+$("next-btn").addEventListener("click", () => { listState.offset += listState.limit; loadObjects(); });
+
+async function deleteObject(o) {
+  const ok = await confirmDialog(`Delete “${o.name}”?`,
+      `The object and all ${o.chunk_count} chunk${o.chunk_count === 1 ? "" : "s"} (${bytes(o.size)}) are removed from every worker. This cannot be undone.`);
+  if (!ok) return;
+  try {
+    await api(`/objects/${o.object_id}`, {method: "DELETE"});
+    toast(`Deleted “${o.name}”`, "ok");
+    if (current?.object_id === o.object_id) $("details").close();
+    loadObjects();
+    refreshStatus();
+  } catch (e) {
+    toast("Delete failed: " + describe(e), "bad");
+  }
+}
+
+// ---------------------------------------------------------------- details
+let current = null;
+let savedMeta = {};
+const detailMeta = metadataEditor($("d-meta"), metaChanged);
+
+function metaChanged() {
+  const {values, problems} = detailMeta.read();
+  const changed = JSON.stringify(sorted(values)) !== JSON.stringify(sorted(savedMeta));
+  $("d-save-meta").disabled = !changed || problems.length > 0;
+  $("d-reset-meta").disabled = !changed;
+  $("d-meta-error").hidden = problems.length === 0;
+  $("d-meta-error").textContent = problems.join("; ");
+}
+
+function sorted(obj) {
+  return Object.fromEntries(Object.entries(obj).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+$("d-add-meta").addEventListener("click", () => {
+  $("d-meta").querySelector(".placeholder")?.remove();
+  detailMeta.addRow().focus();
+  metaChanged();
+});
+$("d-reset-meta").addEventListener("click", () => { detailMeta.set(savedMeta); metaChanged(); });
+$("d-close").addEventListener("click", () => $("details").close());
+$("details").addEventListener("click", (e) => { if (e.target === $("details")) $("details").close(); });   // backdrop
+$("details").addEventListener("close", () => { $("d-preview-box").replaceChildren(); current = null; });
+
+async function openDetails(id) {
+  const dlg = $("details");
+  if (!dlg.open) dlg.showModal();
+  $("d-name").textContent = "Loading…";
+  $("d-id").textContent = id;
+  $("d-facts").replaceChildren(h("div", {class: "muted"}, h("span", {class: "spin"}), " loading"));
+  $("d-chunks").replaceChildren();
+  $("d-preview-box").hidden = true;
+  $("d-preview-box").replaceChildren();
+  $("d-verify-result").hidden = true;
+  try {
+    renderDetails(await api(`/objects/${id}/metadata`));
+  } catch (e) {
+    $("d-name").textContent = "Could not load this object";
+    $("d-facts").replaceChildren(h("div", {class: "error-text"}, describe(e)));
+  }
+}
+
+function renderDetails(o) {
+  current = o;
+  savedMeta = o.custom_metadata || {};
+  $("d-name").textContent = o.name;
+  $("d-id").textContent = o.object_id;
+  $("d-icon").textContent = extension(o.name, o.content_type).slice(0, 4);
+  $("d-download").href = `${API}/objects/${o.object_id}`;
+  $("d-download").setAttribute("download", o.name);
+  const canVerify = !!window.crypto?.subtle && o.size <= VERIFY_LIMIT;
+  $("d-verify").disabled = !canVerify;
+  $("d-verify").title = canVerify ? "Download in the browser and compare the SHA-256 with the stored checksum"
+      : !window.crypto?.subtle ? "needs a secure context (open the page via localhost or https)" : "too large to hash in the browser; use oscli download";
+  $("d-preview").disabled = !previewKind(o);
+  $("d-preview").title = previewKind(o) ? "Show the content here" : "no preview for this type or size";
+
+  const checksum = h("span", {class: "mono", id: "d-sum", "data-full": o.checksum, title: o.checksum}, o.checksum);
+  const fact = (label, value, extra) => h("div", {class: "fact"}, h("div", {class: "label"}, label), h("div", {class: "value"}, value), extra);
+  $("d-facts").replaceChildren(
+      fact("Size", `${bytes(o.size)}`, h("div", {class: "muted", style: "font-size:12.5px"}, `${o.size.toLocaleString()} bytes`)),
+      fact("Content type", o.content_type),
+      fact("Chunks", `${o.chunk_count} × up to 1 MB`),
+      fact("Replication", h("span", {class: "badge " + (o.replication_ok ? "ok" : "warn")}, o.replication_ok ? "every chunk has 2 copies" : "repairing")),
+      fact("Created", fullDate(o.created_at)),
+      fact("Metadata updated", fullDate(o.updated_at)),
+      h("div", {class: "fact", style: "grid-column:1/-1"}, h("div", {class: "label"}, "SHA-256 of the whole object"),
+          h("div", {class: "copy-line"}, checksum, h("button", {class: "btn icon small", type: "button", "data-copy": "d-sum", title: "Copy checksum"}, "⧉"))));
+
+  detailMeta.set(savedMeta);
+  metaChanged();
+  if (Object.keys(savedMeta).length === 0) {
+    $("d-meta").append(h("div", {class: "muted placeholder", style: "font-size:13.5px"}, "No custom metadata yet."));
+  }
+
+  const unhealthy = o.chunks.filter((c) => c.locations.filter((l) => l.status === "OK").length < 2).length;
+  $("d-repl").replaceChildren(h("span", {class: "badge " + (unhealthy ? "warn" : "ok"), style: "text-transform:none;letter-spacing:0"},
+      unhealthy ? `${unhealthy} chunk(s) being repaired` : "all chunks fully replicated"));
+  $("d-chunks").replaceChildren(...(o.chunks.length ? o.chunks.map((c) => h("tr", {style: "cursor:default"},
+      h("td", {class: "num"}, String(c.index)),
+      h("td", {class: "num"}, bytes(c.size)),
+      h("td", {class: "mono", title: c.checksum}, c.checksum.slice(0, 16) + "…"),
+      h("td", {}, h("div", {class: "locs"}, ...(c.locations.length ? c.locations.map((l) =>
+          h("span", {class: `loc ${l.status} ${l.worker_status !== "ALIVE" ? "stale" : ""}`,
+                     title: `copy ${l.status}, worker ${l.worker_status}`},
+              l.worker_id, l.status !== "OK" ? " · " + l.status.toLowerCase() : "", l.worker_status !== "ALIVE" ? " · " + l.worker_status.toLowerCase() : ""))
+          : [h("span", {class: "badge bad"}, "no copy available right now")]))))) :
+      [h("tr", {}, h("td", {colspan: 4, class: "muted"}, "An empty object has no chunks."))]));
+}
+
+$("d-save-meta").addEventListener("click", async () => {
+  if (!current) return;
+  const {values, problems} = detailMeta.read();
+  if (problems.length) return;
+  const patch = {};
+  for (const [k, v] of Object.entries(values)) if (savedMeta[k] !== v) patch[k] = v;
+  for (const k of Object.keys(savedMeta)) if (!(k in values)) patch[k] = null;    // null removes a key
+  $("d-save-meta").disabled = true;
+  try {
+    const updated = await api(`/objects/${current.object_id}/metadata`, {
+      method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
+    renderDetails(updated);
+    toast("Metadata saved", "ok");
+  } catch (e) {
+    toast("Could not save: " + describe(e), "bad");
+    metaChanged();
+  }
+});
+
+$("d-delete").addEventListener("click", () => current && deleteObject(current));
+
+function previewKind(o) {
+  const t = (o.content_type || "").toLowerCase();
+  if (o.size === 0 || o.size > PREVIEW_LIMIT) return null;
+  if (t.startsWith("image/")) return "image";
+  if (t.startsWith("video/")) return "video";
+  if (t.startsWith("audio/")) return "audio";
+  if (t === "application/pdf") return "pdf";
+  if (t.startsWith("text/") || /json|xml|yaml|csv|javascript/.test(t)) return o.size <= 2 * 1024 * 1024 ? "text" : null;
+  return null;
+}
+
+$("d-preview").addEventListener("click", async () => {
+  if (!current) return;
+  const box = $("d-preview-box"), kind = previewKind(current), url = `${API}/objects/${current.object_id}`;
+  box.hidden = false;
+  box.replaceChildren(h("div", {class: "muted", style: "padding:12px"}, h("span", {class: "spin"}), " loading preview"));
+  try {
+    if (kind === "text") {
+      const r = await fetch(url);
+      if (!r.ok) throw new ApiError(r.status, null, "HTTP " + r.status);
+      box.replaceChildren(h("pre", {}, await r.text()));
+    } else {
+      const r = await fetch(url);
+      if (!r.ok) {
+        let body = null; try { body = await r.json(); } catch {}
+        throw new ApiError(r.status, body?.error, body?.detail);
+      }
+      const src = URL.createObjectURL(await r.blob());
+      const el = kind === "image" ? h("img", {src, alt: current.name}) : kind === "video" ? h("video", {src, controls: true})
+          : kind === "audio" ? h("audio", {src, controls: true}) : h("iframe", {src, title: current.name});
+      box.replaceChildren(el);
+      $("details").addEventListener("close", () => URL.revokeObjectURL(src), {once: true});
+    }
+  } catch (e) {
+    box.replaceChildren(h("div", {class: "error-text", style: "padding:12px"}, "Preview failed: " + describe(e)));
+  }
+});
+
+$("d-verify").addEventListener("click", async () => {
+  if (!current) return;
+  const out = $("d-verify-result"), o = current;
+  out.hidden = false;
+  out.replaceChildren(h("span", {class: "spin"}), ` downloading ${bytes(o.size)} and computing SHA-256…`);
+  try {
+    const r = await fetch(`${API}/objects/${o.object_id}`);
+    if (!r.ok) {
+      let body = null; try { body = await r.json(); } catch {}
+      throw new ApiError(r.status, body?.error, body?.detail || "HTTP " + r.status);
+    }
+    const buffer = await r.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+    if (current !== o) return;
+    const good = hex === o.checksum && buffer.byteLength === o.size;
+    out.replaceChildren(h("span", {class: "badge " + (good ? "ok" : "bad")}, good ? "✓ intact" : "✗ mismatch"), " ",
+        good ? `all ${o.size.toLocaleString()} bytes match the checksum recorded at upload.`
+             : `got ${buffer.byteLength.toLocaleString()} bytes with SHA-256 ${hex.slice(0, 16)}…`);
+  } catch (e) {
+    out.replaceChildren(h("span", {class: "badge bad"}, "failed"), " " + describe(e));
+  }
+});
+
+// ---------------------------------------------------------------- start
+uploadMeta.addRow();
+renderQueue();
+refreshStatus();
+loadObjects();
+setInterval(refreshStatus, 10_000);
+const deepLink = new URLSearchParams(location.search).get("object");
+if (deepLink) openDetails(deepLink);
+</script>
+</body>
+</html>

@@ -11,6 +11,7 @@ import com.objectstore.controller.cluster.WorkerClient;
 import com.objectstore.controller.cluster.WorkerClient.FetchedChunk;
 import com.objectstore.controller.cluster.WorkerException;
 import com.objectstore.controller.config.ControllerProperties;
+import com.objectstore.controller.observability.MessageTrace;
 import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.domain.StoredObject;
 import com.objectstore.controller.repository.ChunkRepository;
@@ -62,6 +63,13 @@ public class DownloadService {
     public enum Outcome { GOOD, TRANSIENT, CORRUPT, IN_TRANSIT }
 
     private static final Duration SETTLE_POLL = Duration.ofMillis(100);
+    private MessageTrace trace = MessageTrace.OFF;
+
+    /** The message trace (TRACE_MESSAGES); off unless configured. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setTrace(MessageTrace trace) {
+        this.trace = trace;
+    }
 
     private final ObjectRepository objects;
     private final ChunkRepository chunks;
@@ -156,16 +164,22 @@ public class DownloadService {
     }
 
     private Fetch fetch(Candidate candidate, Chunk chunk) {
+        trace.getChunk(candidate.workerId(), chunk.chunkId());
         FetchedChunk fetched;
         try {
             fetched = workers.getChunk(candidate.url(), chunk.chunkId());
         } catch (WorkerException e) {
             if (e.status() != null && e.status() == 409 && e.getMessage().contains(ErrorCodes.CHUNK_CORRUPT)) {
+                trace.getAnswer(candidate.workerId(), chunk.chunkId(), "refused: its copy is corrupt");
                 return new Fetch(Outcome.CORRUPT, null, "the worker found its copy corrupt");
             }
+            trace.getAnswer(candidate.workerId(), chunk.chunkId(), "failed: " + e.getMessage());
             return new Fetch(Outcome.TRANSIENT, null, e.getMessage());
         }
-        return new Fetch(classify(chunk, fetched), fetched.data(), "checksum on worker differs from the recorded one");
+        Outcome outcome = classify(chunk, fetched);
+        trace.getAnswer(candidate.workerId(), chunk.chunkId(), outcome == Outcome.GOOD
+                ? MessageTrace.bytes(fetched.data().length) + ", checksum verified" : outcome.name().toLowerCase(java.util.Locale.ROOT));
+        return new Fetch(outcome, fetched.data(), "checksum on worker differs from the recorded one");
     }
 
     /** The decision table for a 200 answer. */

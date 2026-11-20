@@ -68,6 +68,10 @@ objectstore:
   planner-visit-budget: ${PLANNER_VISIT_BUDGET:2000}
   postponed-budget: ${POSTPONED_BUDGET:1000}
   rolling-check-chunks: ${ROLLING_CHECK_CHUNKS:1000}
+  # Showcase output (docker-compose.showcase.yml): every message to and from the workers, and the
+  # cluster state every N seconds. Off by default.
+  trace-messages: ${TRACE_MESSAGES:off}
+  state-print-interval-seconds: ${STATE_PRINT_INTERVAL:0}
 
 logging:
   level:

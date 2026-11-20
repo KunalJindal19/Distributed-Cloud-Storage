@@ -1,0 +1,30 @@
+# Showcase settings: the inner state of the store, printed to the console.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.showcase.yml up -d --wait   (or: make showcase)
+#
+# The controller prints every message it receives from and sends to the workers (registrations,
+# heartbeats with the changes and report segments they carry, replies with acknowledgements and
+# REPLICATE / DELETE commands, chunk PUTs and GETs) and, every 10 s, the cluster: the workers and
+# a chunk-by-worker placement grid. Each worker prints its own state every 10 s: the chunks it
+# holds, its link to the controller, its change log, its full report. Watch with
+#
+#   docker logs -f controller        docker logs -f worker2        (or: make showcase-logs)
+#
+# TRACE_MESSAGES=changes leaves out the plain "I am alive" heartbeats.
+services:
+  controller:
+    environment:
+      TRACE_MESSAGES: "all"
+      STATE_PRINT_INTERVAL: "10"
+  worker1:
+    environment:
+      STATE_PRINT_INTERVAL: "10"
+  worker2:
+    environment:
+      STATE_PRINT_INTERVAL: "10"
+  worker3:
+    environment:
+      STATE_PRINT_INTERVAL: "10"
+  worker4:
+    environment:
+      STATE_PRINT_INTERVAL: "10"
