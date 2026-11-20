@@ -243,7 +243,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void writingAnExistingChunkWithGoodDataReannouncesIt() {
+    void edge10_writingAnExistingChunkWithGoodDataReannouncesIt() {
         byte[] data = bytes(800, 4);
         String sha = Checksums.sha256Hex(data);
         store.write(CHUNK_A, data, sha);
@@ -255,7 +255,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void writingAnExistingChunkWhoseDataIsRottenRewritesItReannouncesItAndCreatesIt() throws IOException {
+    void edge10_writingAnExistingChunkWhoseDataIsRottenRewritesItReannouncesItAndCreatesIt() throws IOException {
         byte[] data = bytes(800, 5);
         String sha = Checksums.sha256Hex(data);
         store.write(CHUNK_A, data, sha);

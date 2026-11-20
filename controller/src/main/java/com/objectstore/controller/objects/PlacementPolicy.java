@@ -101,6 +101,11 @@ public class PlacementPolicy {
      * this chunk. Prefer the least busy source, then one without a recent data error, then by id.
      */
     public Optional<String> chooseSource(String chunkId) {
+        return chooseSource(chunkId, worker -> true);
+    }
+
+    /** {@link #chooseSource(String)} among the workers {@code allowed} accepts (the planner's free streams). */
+    public Optional<String> chooseSource(String chunkId, java.util.function.Predicate<String> allowed) {
         long recent = properties.targetBackoff().toNanos();
         long now = cluster.now();
         List<String> candidates = new ArrayList<>();
@@ -109,7 +114,7 @@ public class PlacementPolicy {
             if (entry.getValue().state == ReplicaState.OK && worker != null && worker.state == WorkerState.ALIVE
                     && worker.hasReported && cluster.pendingFrom(worker.workerId) < properties.maxStreams()
                     && worker.commands.size() < properties.maxCommandsPerWorker()     // never drop a command
-                    && !cluster.recentlyFailed(chunkId, worker.workerId)) {
+                    && !cluster.recentlyFailed(chunkId, worker.workerId) && allowed.test(worker.workerId)) {
                 candidates.add(worker.workerId);
             }
         }

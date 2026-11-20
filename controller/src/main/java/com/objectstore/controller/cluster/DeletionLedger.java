@@ -156,6 +156,7 @@ public final class DeletionLedger {
         byWorker.computeIfAbsent(workerId, id -> new LinkedHashSet<>()).add(key);
         byChunk.computeIfAbsent(chunkId, id -> new LinkedHashSet<>()).add(workerId);
         waiting.add(key);
+        cluster.markDirty(chunkId);
         tryQueue(entry);
         return entry;
     }
@@ -189,11 +190,13 @@ public final class DeletionLedger {
     /** Re-checks waiting entries, oldest first, at most {@code budget}; returns how many were queued. */
     public int retryWaiting(int budget) {
         int queuedNow = 0;
-        int visited = 0;
-        for (Key key : new ArrayList<>(waiting)) {
-            if (visited++ >= budget) {
-                break;
-            }
+        List<Key> batch = new ArrayList<>(Math.min(budget, waiting.size()));
+        for (Iterator<Key> it = waiting.iterator(); it.hasNext() && batch.size() < budget; ) {
+            batch.add(it.next());
+        }
+        for (Key key : batch) {
+            waiting.remove(key);
+            waiting.add(key);                            // rotation: the next tick starts further on
             Entry entry = entries.get(key);
             if (entry != null && tryQueue(entry)) {
                 queuedNow++;
@@ -225,6 +228,7 @@ public final class DeletionLedger {
         entry.deadline = cluster.now() + cluster.pendingTimeoutNanos();
         queued--;
         delivered++;
+        cluster.deadlines().ledgerEntry(entry.chunkId, entry.workerId, entry.deadline);
         if (entry.linkedToReplica()) {
             Replica replica = cluster.replica(entry.chunkId, entry.workerId);
             if (replica != null && command.cmdId().equals(replica.deleteCmdId)) {
@@ -244,9 +248,16 @@ public final class DeletionLedger {
     /** The worker confirmed the deletion ({@code DELETED} applied): the entry is done. */
     public void completed(String chunkId, String workerId) {
         Entry entry = entries.get(new Key(chunkId, workerId));
-        if (entry != null) {
-            remove(entry);
+        if (entry == null) {
+            return;
         }
+        if (entry.state == State.QUEUED) {                 // gone before the command was even handed out
+            WorkerInfo worker = cluster.worker(workerId);
+            if (worker != null) {
+                worker.commands.remove(entry.cmdId);
+            }
+        }
+        remove(entry);
     }
 
     /** Delivered entries past their deadline go back to WAITING ({@code attempts++}); returns how many. */
@@ -311,6 +322,14 @@ public final class DeletionLedger {
         for (Entry entry : entriesOf(workerId)) {
             if (entry.linkedToReplica()) {
                 remove(entry);
+                Replica replica = cluster.replica(entry.chunkId, workerId);
+                if (replica != null && !replica.deleteDelivered) {
+                    replica.deleteCmdId = null;
+                    replica.deleteQueuedAt = 0;
+                    if (replica.state == ReplicaState.EXCESS) {
+                        cluster.setReplicaState(entry.chunkId, workerId, ReplicaState.OK);   // judged again
+                    }
+                }
             } else if (entry.state != State.WAITING) {
                 backToWaiting(entry);
             }
@@ -343,6 +362,7 @@ public final class DeletionLedger {
     private void remove(Entry entry) {
         Key key = new Key(entry.chunkId, entry.workerId);
         entries.remove(key);
+        cluster.markDirty(entry.chunkId);
         waiting.remove(key);
         if (entry.state == State.QUEUED) {
             queued--;

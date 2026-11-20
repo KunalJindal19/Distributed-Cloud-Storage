@@ -73,7 +73,7 @@ class MarkDeadTest {
     }
 
     @Test
-    void theInvariantsHoldBetweenThePurgeSteps() {
+    void edge32_theInvariantsHoldBetweenThePurgeSteps() {
         int copies = 3 * NamespaceTasks.STEP_ITEMS;
         List<ReportEntry> entries = new ArrayList<>();
         for (int i = 0; i < copies; i++) {

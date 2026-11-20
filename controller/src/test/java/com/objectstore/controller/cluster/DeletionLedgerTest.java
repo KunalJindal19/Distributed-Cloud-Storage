@@ -77,7 +77,7 @@ class DeletionLedgerTest {
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         cluster.write(() -> {
-            cluster.replica(chunk(0), "worker1").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker1", ReplicaState.EXCESS);
             cluster.sendDelete("worker1", chunk(0), "excess");
             Entry first = ledger.entry(chunk(0), "worker1");
             assertThat(ledger.request(chunk(0), "worker1", "excess")).isSameAs(first);
@@ -96,13 +96,13 @@ class DeletionLedgerTest {
         t.join("worker2", chunk(0), chunk(1));
         t.join("worker3", chunk(0), chunk(1));
         cluster.write(() -> {
-            cluster.replica(chunk(0), "worker3").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker3", ReplicaState.EXCESS);
             cluster.sendDelete("worker3", chunk(0), "excess");             // QUEUED
             assertThat(ledger.cancel(chunk(0), "worker3")).isTrue();
             assertThat(cluster.worker("worker3").commands).as("its command is removed").isEmpty();
             assertThat(cluster.replica(chunk(0), "worker3").deleteCmdId).isNull();
 
-            cluster.replica(chunk(1), "worker3").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(1), "worker3", ReplicaState.EXCESS);
             cluster.sendDelete("worker3", chunk(1), "excess");
             cluster.takeCommands(cluster.worker("worker3"));                 // DELIVERED
             assertThat(ledger.cancel(chunk(1), "worker3")).isFalse();
@@ -120,7 +120,7 @@ class DeletionLedgerTest {
         t.join("worker2", chunk(0));
         t.join("worker3", chunk(0));
         cluster.write(() -> {
-            cluster.replica(chunk(0), "worker3").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker3", ReplicaState.EXCESS);
             cluster.sendDelete("worker3", chunk(0), "excess");
             cluster.removeReplica(chunk(0), "worker1");                      // a live copy is lost
             assertThat(ledger.entry(chunk(0), "worker3")).isNull();
@@ -213,6 +213,48 @@ class DeletionLedgerTest {
         assertThat(deletes).hasSize(chunks);
         assertThat(cluster.counter("commands_dropped")).isZero();
         assertThat(cluster.counter("commands_expired")).isZero();
+        t.assertNoViolations();
+    }
+
+    @Test
+    void edge13_aCopyLandingForADeletedObjectGetsALedgerDeleteAtOnce() {
+        t.join("worker1");
+        String deletedObject = "dddddddd-7d0e-4c1b-9a54-1f2e3d4c5b6a";
+        String late = deletedObject + "-00003";
+        cluster.write(() -> cluster.addGarbage(deletedObject));        // deleted (or a failed upload)
+
+        // A repair copy (or an upload PUT that timed out) lands afterwards: its RECEIVED.
+        t.send("worker1", List.of(t.next("worker1", ChangeType.RECEIVED, late, 10L, TestSupport.SUM, null)), null);
+
+        Entry entry = entry(late, "worker1");
+        assertThat(entry).isNotNull();
+        assertThat(entry.reason).isEqualTo(DeletionLedger.ORPHAN);
+        assertThat(entry.state).isEqualTo(State.QUEUED);
+        assertThat(cluster.events()).anyMatch(e -> e.event().equals("orphan") && late.equals(e.chunkId()));
+        t.assertNoViolations();
+    }
+
+    @Test
+    void edge16_aFailedUploadIsRolledBackWithLedgerDeletesNotBestEffortCalls() {
+        t.join("worker1");
+        t.join("worker2");
+        String failed = "eeeeeeee-7d0e-4c1b-9a54-1f2e3d4c5b6a";
+        cluster.write(() -> cluster.beginUpload(failed));
+        List<NamespaceTasks.Attempt> attempts = List.of(new NamespaceTasks.Attempt(failed + "-00000", "worker1"),
+                new NamespaceTasks.Attempt(failed + "-00000", "worker2"), new NamespaceTasks.Attempt(failed + "-00001", "worker1"));
+
+        cluster.write(() -> t.queue.offer(t.namespaceTasks.endUpload(failed, attempts)));
+        t.sync();
+
+        cluster.read(() -> {
+            assertThat(cluster.isGarbage(failed)).isTrue();
+            assertThat(cluster.pendingUploads()).doesNotContain(failed);
+            for (NamespaceTasks.Attempt attempt : attempts) {
+                Entry entry = ledger.entry(attempt.chunkId(), attempt.workerId());
+                assertThat(entry.reason).isEqualTo(DeletionLedger.UPLOAD_FAILED);
+                assertThat(entry.state).isEqualTo(State.QUEUED);
+            }
+        });
         t.assertNoViolations();
     }
 }

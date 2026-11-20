@@ -121,7 +121,10 @@ docker start "$H2" > /dev/null; wait_for 90 healthy
 
 section "AC-7.8 the target of an in-flight copy dies: another target is used"
 random_file "$WORK/t.bin" $((2 * MIB))
-T=$(upload "$WORK/t.bin"); LOST=$(meta "$T" | jq -r '.chunks[0].locations[0].worker_id')
+T=$(upload "$WORK/t.bin")
+# A holder of chunk 0 that does not hold chunk 1: stopping it (and then the repair target) never
+# leaves a chunk without any copy.
+LOST=$(meta "$T" | jq -r '([.chunks[1].locations[].worker_id]) as $c1 | [.chunks[0].locations[].worker_id | select(. as $w | ($c1 | map(select(. == $w)) | length) == 0)][0]')
 before=$(event_count replicate "$T")
 docker stop "$LOST" > /dev/null
 wait_for 90 sh -c "[ \$(curl -fsS $API/cluster/status | jq --arg p $T '[.repair_log[] | select(.event==\"replicate\" and (.chunk_id|startswith(\$p)))] | length') -gt $before ]"

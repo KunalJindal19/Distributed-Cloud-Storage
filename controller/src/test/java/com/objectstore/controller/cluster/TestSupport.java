@@ -75,9 +75,20 @@ public final class TestSupport {
     }
 
     public static ControllerProperties properties(double staleAfter, double deadAfter, double orphanGcDelay) {
-        return new ControllerProperties(1_048_576, 2, Path.of("/tmp/unused.db"), staleAfter, deadAfter, 0.5,
-                0.1, 0.3, 2, 3, 2, 30, 1000, 10, 0.999, 0.1, 5, orphanGcDelay, 0.5, 16 * 1024 * 1024, 30, 2, 10, true,
-                5, 10_000, 5, 2, 2000);
+        return properties(2, 2, 2, staleAfter, deadAfter, orphanGcDelay, 2000);
+    }
+
+    /** Properties with a given replication factor, streams per source, pending time-out and visit budget. */
+    public static ControllerProperties properties(int rf, int maxStreams, double pendingTimeout, double staleAfter,
+                                                  double deadAfter, double orphanGcDelay, int visitBudget) {
+        return new ControllerProperties(1_048_576, rf, Path.of("/tmp/unused.db"), staleAfter, deadAfter, 0.5,
+                0.1, 0.3, pendingTimeout, 3, maxStreams, 30, 1000, 10, 0.999, 0.1, 5, orphanGcDelay, 0.5,
+                16 * 1024 * 1024, 30, 2, 10, true, 5, 10_000, 5, 2, 2000, visitBudget, 1000, 1000);
+    }
+
+    /** A cluster with this replication factor and streams per source (other settings as usual). */
+    public static TestSupport withRf(int rf, int maxStreams) {
+        return new TestSupport(properties(rf, maxStreams, 2, 0.2, 0.4, 0, 2000));
     }
 
     public static String chunk(int index) {

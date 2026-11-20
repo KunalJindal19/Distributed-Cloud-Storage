@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,24 +75,28 @@ public class NamespaceTasks {
                 Chunk chunk = entry.chunk();
                 cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(chunk.objectId(), chunk.index(), chunk.size(),
                         chunk.checksum()));
+                // The targets first, in placement order: a receipt becomes the replica, otherwise
+                // an UPLOAD pending copy (if the target is still in the epoch it was written in).
                 for (Target target : entry.targets()) {
                     items++;
                     WorkerInfo worker = cluster.worker(target.workerId());
+                    if (recordReceipt(chunk, target.workerId())) {
+                        continue;
+                    }
                     if (worker == null || worker.isDead() || worker.epoch != target.epoch()) {
                         refused[0]++;
                         continue;
                     }
-                    Receipt receipt = cluster.removeReceipt(chunk.chunkId(), target.workerId());
-                    if (receipt != null && receipt.epoch == worker.epoch) {
-                        boolean intact = chunk.checksum().equals(receipt.checksum) && chunk.size() == receipt.size;
-                        Replica replica = cluster.addReplica(chunk.chunkId(), target.workerId(),
-                                intact ? ReplicaState.OK : ReplicaState.CORRUPT);
-                        replica.mark = receipt.seenInSession;
-                        cluster.removePending(chunk.chunkId(), target.workerId());
-                    } else if (cluster.replica(chunk.chunkId(), target.workerId()) == null) {
-                        cluster.addUploadPending(chunk.chunkId(), target.workerId());
-                        awaited[0]++;
-                    }
+                    cluster.addUploadPending(chunk.chunkId(), target.workerId());
+                    awaited[0]++;
+                }
+                // Then every other receipt of a worker's current epoch: proof that it holds the bytes
+                // too (a target whose PUT answer was lost and that the upload replaced). A surplus is
+                // trimmed later.
+                Map<String, Receipt> others = cluster.receipts().get(chunk.chunkId());
+                for (String workerId : others == null ? List.<String>of() : List.copyOf(others.keySet())) {
+                    items++;
+                    recordReceipt(chunk, workerId);
                 }
                 items++;
                 if (stepDone(items, deadline) && cursor[0] < chunks.size()) {
@@ -108,6 +113,23 @@ public class NamespaceTasks {
             }
             return Step.DONE;
         });
+    }
+
+    /**
+     * Turns the worker's receipt for a committed chunk into its replica (OK, or CORRUPT if the
+     * checksum differs, with the receipt's report mark). A receipt of an earlier epoch is dropped.
+     */
+    private boolean recordReceipt(Chunk chunk, String workerId) {
+        Receipt receipt = cluster.removeReceipt(chunk.chunkId(), workerId);
+        WorkerInfo worker = cluster.worker(workerId);
+        if (receipt == null || worker == null || worker.isDead() || receipt.epoch != worker.epoch) {
+            return false;
+        }
+        boolean intact = chunk.checksum().equals(receipt.checksum) && chunk.size() == receipt.size;
+        Replica replica = cluster.addReplica(chunk.chunkId(), workerId, intact ? ReplicaState.OK : ReplicaState.CORRUPT);
+        replica.mark = receipt.seenInSession;
+        cluster.removePending(chunk.chunkId(), workerId);
+        return true;
     }
 
     /**

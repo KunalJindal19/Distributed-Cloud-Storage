@@ -31,7 +31,19 @@
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- The scale test (@Tag("scale")) only runs with -Pscale (make test-scale). -->
+        <excludedGroups>scale</excludedGroups>
     </properties>
+
+    <profiles>
+        <profile>
+            <id>scale</id>
+            <properties>
+                <groups>scale</groups>
+                <excludedGroups>nothing-excluded</excludedGroups>
+            </properties>
+        </profile>
+    </profiles>
 
     <dependencyManagement>
         <dependencies>

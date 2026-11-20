@@ -30,7 +30,11 @@ public record ClusterStatusResponse(
         double writerBusyRatio,
         long reportSessionsOpen,
         /** The deletion ledger: {waiting, queued, delivered}. */
-        Map<String, Integer> ledger) {
+        Map<String, Integer> ledger,
+        /** Chunks needing copies by priority level {"L,P": size} (L live, P pending). */
+        Map<String, Integer> levels,
+        int cleanupSize,
+        int postponedSize) {
 
     public record Config(
             int chunkSize,
