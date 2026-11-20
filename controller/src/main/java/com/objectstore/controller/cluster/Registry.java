@@ -42,6 +42,8 @@ public class Registry {
     private final ApplyQueue queue;
     private final Writer writer;
     private long lastHealthRun;
+    private com.objectstore.controller.observability.MessageTrace trace =
+            com.objectstore.controller.observability.MessageTrace.OFF;
     private final java.util.Map<String, Long> duplicateRefusedUntil = new java.util.HashMap<>();
 
     public Registry(ClusterState cluster, ControllerProperties properties, Receipts receipts, ApplyQueue queue,
@@ -51,6 +53,12 @@ public class Registry {
         this.receipts = receipts;
         this.queue = queue;
         this.writer = writer;
+    }
+
+    /** The message trace (TRACE_MESSAGES); off in unit tests. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setTrace(com.objectstore.controller.observability.MessageTrace trace) {
+        this.trace = trace;
     }
 
     // ---- registration ---------------------------------------------------------------------
@@ -64,6 +72,17 @@ public class Registry {
      * <p>The registration is a {@code Register} task; the HTTP thread waits for its result.
      */
     public RegisterResponse register(RegisterRequest request) {
+        try {
+            RegisterResponse response = doRegister(request);
+            trace.register(request, response, null);
+            return response;
+        } catch (RuntimeException refused) {
+            trace.register(request, null, refused);
+            throw refused;
+        }
+    }
+
+    private RegisterResponse doRegister(RegisterRequest request) {
         Task task = Task.call("Register", () -> {
             try {
                 return applyRegister(request);
@@ -187,6 +206,17 @@ public class Registry {
      * run and the report segment ({@link Receipts}); up to 50 commands; the acknowledgements.
      */
     public HeartbeatResponse heartbeat(HeartbeatRequest request) {
+        try {
+            HeartbeatResponse response = doHeartbeat(request);
+            trace.heartbeat(request, response, null);           // printed after the lock was released
+            return response;
+        } catch (RuntimeException refused) {
+            trace.heartbeat(request, null, refused);
+            throw refused;
+        }
+    }
+
+    private HeartbeatResponse doHeartbeat(HeartbeatRequest request) {
         return cluster.write(() -> {
             WorkerInfo worker = accept(request.workerId(), request.bootId(), request.sentAt());
             if (request.seq() <= worker.lastHbSeq) {
