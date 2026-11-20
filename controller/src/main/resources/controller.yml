@@ -56,7 +56,7 @@ objectstore:
   orphan-gc-delay-seconds: ${ORPHAN_GC_DELAY:60}
   orphan-gc-max-fraction: ${ORPHAN_GC_MAX_FRACTION:0.5}
   min-free-bytes: ${MIN_FREE_BYTES:16777216}
-  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:30}
+  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:300}
   connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
   read-timeout-seconds: ${READ_TIMEOUT:10}
   invariant-checks: ${INVARIANT_CHECKS:true}
@@ -65,6 +65,9 @@ objectstore:
   upload-commit-wait-seconds: ${UPLOAD_COMMIT_WAIT:10}
   download-settle-wait-seconds: ${DOWNLOAD_SETTLE_WAIT:5}
   cleanup-budget: ${CLEANUP_BUDGET:2000}
+  planner-visit-budget: ${PLANNER_VISIT_BUDGET:2000}
+  postponed-budget: ${POSTPONED_BUDGET:1000}
+  rolling-check-chunks: ${ROLLING_CHECK_CHUNKS:1000}
 
 logging:
   level:

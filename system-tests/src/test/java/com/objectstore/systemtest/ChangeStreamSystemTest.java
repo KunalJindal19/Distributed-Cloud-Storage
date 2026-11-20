@@ -19,6 +19,7 @@ class ChangeStreamSystemTest extends ClusterTest {
     @Override
     void configure(InProcessCluster cluster) {
         cluster.workerSetting("worker.report-segment-size", "1");          // one chunk per segment: slow reports
+        cluster.workerSetting("worker.full-report-interval-seconds", "1.5"); // a periodic report to land in
         cluster.controllerSetting("objectstore.pending-timeout-seconds", "15");
     }
 

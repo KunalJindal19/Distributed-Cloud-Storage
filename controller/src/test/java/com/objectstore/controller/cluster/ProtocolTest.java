@@ -89,7 +89,7 @@ class ProtocolTest {
     }
 
     @Test
-    void threeBootIdsInAMinuteLookLikeADuplicateWorkerId() {
+    void edge42_threeBootIdsInAMinuteLookLikeADuplicateWorkerId() {
         t.register("worker1");
         t.register("worker1");
         t.register("worker1");
