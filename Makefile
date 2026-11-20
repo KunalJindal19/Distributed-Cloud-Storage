@@ -2,10 +2,10 @@ SHELL := /bin/bash
 BASE  ?= http://localhost:8000
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down down-v restart ps logs status fsck dashboard stop start pause unpause corrupt test test-scale scenarios chaos demo
+.PHONY: help build up down down-v restart ps logs status fsck app dashboard stop start pause unpause corrupt test test-scale scenarios chaos demo showcase showcase-up showcase-logs
 
 help:            ## show this help
-	@grep -E '^[a-z-]+: .*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+: .*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-14s %s\n", $$1, $$2}'
 
 build:           ## build the three images (controller, worker, client)
 	docker compose build
@@ -15,6 +15,7 @@ up:              ## build and start everything; returns when all containers are 
 	@docker compose ps
 	@echo
 	@echo "API:        $(BASE)/api/v1/objects"
+	@echo "Web client: $(BASE)/app"
 	@echo "Dashboard:  $(BASE)/dashboard"
 
 down:            ## stop and remove the containers (volumes, i.e. all data, are kept)
@@ -37,6 +38,9 @@ status:          ## cluster status as JSON
 
 fsck:            ## end-to-end consistency check (disks vs. the controller's block map)
 	@curl -fsS $(BASE)/api/v1/fsck | ( jq . 2>/dev/null || cat )
+
+app:             ## open the web client in a browser
+	@( open $(BASE)/app || xdg-open $(BASE)/app ) 2>/dev/null || echo "open $(BASE)/app"
 
 dashboard:       ## open the dashboard in a browser
 	@( open $(BASE)/dashboard || xdg-open $(BASE)/dashboard ) 2>/dev/null || echo "open $(BASE)/dashboard"
@@ -76,3 +80,12 @@ chaos:           ## chaos test: faults on, disruptions, then convergence checks 
 
 demo:            ## run the seven demonstrations against the running stack
 	BASE_URL=$(BASE) ./demo.sh
+
+showcase:        ## guided tour: inner state, worker2 stopped and started again (--no-pause: ARGS=--no-pause)
+	BASE_URL=$(BASE) ./showcase.sh $(ARGS)
+
+showcase-up:     ## start the stack printing its inner state (every message, state every 10 s)
+	docker compose -f docker-compose.yml -f docker-compose.showcase.yml up --build -d --wait
+
+showcase-logs:   ## follow the controller and the four workers, with the showcase output
+	docker compose -f docker-compose.yml -f docker-compose.showcase.yml logs -f --tail 40 controller worker1 worker2 worker3 worker4

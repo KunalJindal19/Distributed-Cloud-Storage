@@ -87,11 +87,12 @@ public class ControllerLink implements Runnable {
     private final Environment environment;
     private final ObjectMapper json;
 
-    private long acked;                       // the controller's "received" for this process
-    private Report report;                    // the full report in progress, or null
+    // Written only by the link thread; volatile so the state printer can read them.
+    private volatile long acked;              // the controller's "received" for this process
+    private volatile Report report;           // the full report in progress, or null
     private boolean reportRequested;          // by the controller, and not yet started
-    private long lastReportCompletedNanos;
-    private long lastSentNanos;
+    private volatile long lastReportCompletedNanos;
+    private volatile long lastSentNanos;
     private long controllerDownSince;
     private long lastDownLog;
     private volatile long reportsCompleted;
@@ -132,6 +133,31 @@ public class ControllerLink implements Runnable {
     /** Full reports completed by this process (for tests). */
     public long reportsCompleted() {
         return reportsCompleted;
+    }
+
+    /** The highest change number the controller has acknowledged (for the state print). */
+    public long acknowledgedUpTo() {
+        return acked;
+    }
+
+    /** Nanoseconds since the last heartbeat was sent, or -1 if none yet. */
+    public long sinceLastHeartbeatNanos() {
+        long sent = lastSentNanos;
+        return sent == 0 ? -1 : System.nanoTime() - sent;
+    }
+
+    /** Nanoseconds since the last full report completed, or -1 if none yet. */
+    public long sinceLastReportNanos() {
+        long done = lastReportCompletedNanos;
+        return done == 0 ? -1 : System.nanoTime() - done;
+    }
+
+    /** "segment 2 of 5, baseline #14" for the report in progress, or null. */
+    public String reportProgress() {
+        Report current = report;
+        return current == null ? null
+                : "report " + current.shortId() + " segment " + (current.index + 1) + " of " + current.segmentCount
+                        + ", baseline #" + current.baseline;
     }
 
     /** The id of the full report in progress, or null (for tests). */
