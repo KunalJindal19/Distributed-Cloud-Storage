@@ -14,7 +14,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-/** Operational endpoints: health, the cluster overview, and the dashboard page that draws it. */
+/**
+ * Operational endpoints and pages: health, the cluster overview, the dashboard that draws it, and
+ * the web client ({@code /app}) for uploading, browsing, downloading, editing and deleting objects.
+ */
 @RestController
 public class ClusterController {
 
@@ -55,8 +58,17 @@ public class ClusterController {
                 .body(new ClassPathResource("static/dashboard.html"));
     }
 
+    /** The web client: a single page on top of the public REST API (same origin, no extra server). */
+    @GetMapping("/app")
+    public ResponseEntity<Resource> app() {
+        return ResponseEntity.ok()
+                .contentType(MediaType.TEXT_HTML)
+                .cacheControl(CacheControl.noCache())
+                .body(new ClassPathResource("static/app.html"));
+    }
+
     @GetMapping("/")
     public ResponseEntity<Void> root() {
-        return ResponseEntity.status(HttpStatus.FOUND).location(URI.create("/dashboard")).build();
+        return ResponseEntity.status(HttpStatus.FOUND).location(URI.create("/app")).build();
     }
 }
