@@ -3,11 +3,15 @@ package com.objectstore.worker.api;
 import com.objectstore.common.Checksums;
 import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.ApiError;
+import com.objectstore.common.dto.ChangeBatch;
 import com.objectstore.common.dto.ChunkInfo;
+import com.objectstore.common.dto.ChunkPutResponse;
 import com.objectstore.common.dto.ChunkListResponse;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.worker.config.WorkerProperties;
+import com.objectstore.worker.reporting.ChangeLog;
+import com.objectstore.worker.reporting.WorkerIdentity;
 import com.objectstore.worker.storage.ChunkStore;
 import com.objectstore.worker.storage.ChunkStore.StoredChunk;
 import com.objectstore.worker.storage.ChunkStore.WriteResult;
@@ -35,21 +39,33 @@ public class ChunkController {
 
     private final ChunkStore store;
     private final WorkerProperties properties;
+    private final ChangeLog changes;
+    private final WorkerIdentity identity;
 
-    public ChunkController(ChunkStore store, WorkerProperties properties) {
+    public ChunkController(ChunkStore store, WorkerProperties properties, ChangeLog changes, WorkerIdentity identity) {
         this.store = store;
         this.properties = properties;
+        this.changes = changes;
+        this.identity = identity;
     }
 
     /**
      * Stores a chunk. 201 when written, 200 when identical content was already there (so the
      * controller can safely retry), 400 on a bad id / missing or wrong checksum, 409 when the id
      * exists with different content, 413 when the body is larger than one chunk.
+     *
+     * <p>A PUT from the controller carries {@code X-Change-Ack: <boot_id>:<n>}, the controller's
+     * "received" for this process. If the boot id is this process's, the change log forgets
+     * everything up to {@code n} and the answer carries the next changes (at most
+     * MAX_CHANGES_PER_PUT_ANSWER, within the hold-back limit), so the controller learns about the
+     * copy it just stored without waiting for a heartbeat. Another boot id, or no header (a repair
+     * PUT from another worker), gets no changes.
      */
     @PutMapping(InternalApi.CHUNK_PATH)
-    public ResponseEntity<ChunkInfo> putChunk(
+    public ResponseEntity<ChunkPutResponse> putChunk(
             @PathVariable String chunkId,
             @RequestHeader(value = InternalApi.CHECKSUM_HEADER, required = false) String checksumHeader,
+            @RequestHeader(value = InternalApi.CHANGE_ACK_HEADER, required = false) String changeAck,
             HttpServletRequest request) throws IOException {
         if (checksumHeader == null || checksumHeader.isBlank()) {
             throw ApiException.badRequest(InternalApi.CHECKSUM_HEADER + " header is required");
@@ -71,7 +87,26 @@ public class ChunkController {
         WriteResult result = store.write(chunkId, body, checksum);
         log.info("[store] put chunk={} size={} ({})", chunkId, body.length, result.name().toLowerCase(Locale.ROOT));
         HttpStatus status = result == WriteResult.CREATED ? HttpStatus.CREATED : HttpStatus.OK;
-        return ResponseEntity.status(status).body(new ChunkInfo(chunkId, body.length, checksum));
+        return ResponseEntity.status(status).body(new ChunkPutResponse(chunkId, body.length, checksum, piggyback(changeAck)));
+    }
+
+    /** The changes for a PUT answer, or null if the header is absent, malformed or from another boot. */
+    private ChangeBatch piggyback(String changeAck) {
+        if (changeAck == null) {
+            return null;
+        }
+        int colon = changeAck.lastIndexOf(':');
+        if (colon <= 0 || !changeAck.substring(0, colon).trim().equals(identity.bootId())) {
+            return null;
+        }
+        long received;
+        try {
+            received = Long.parseLong(changeAck.substring(colon + 1).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        changes.ack(received);
+        return new ChangeBatch(identity.bootId(), changes.suffix(received, properties.maxChangesPerPutAnswer()));
     }
 
     /**

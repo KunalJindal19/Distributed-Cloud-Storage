@@ -102,19 +102,25 @@ class ReplicationSystemTest extends ClusterTest {
         Files.write(cluster.chunkFile(bad, chunkId), "XXXX".getBytes(), StandardOpenOption.WRITE);
 
         await().atMost(PATIENCE).until(() -> !cluster.chunkFilesOn(bad).contains(chunkId));
+        // The worker's DELETED change reaches the controller with its next heartbeat.
+        await().atMost(PATIENCE).until(() -> repairOrder(chunkId).contains("invalidated@" + bad));
         watchdog.stop();
 
+        assertThat(repairOrder(chunkId)).as("copy confirmed before the corrupt copy is invalidated")
+                .containsSubsequence("copied@" + newHolder(id, holders), "invalidated@" + bad);
+        assertThat(watchdog.fewestOkCopies.get()).isPositive();
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(api.metadata(id).get("replication_ok").asBoolean()).isTrue());
+        assertThat(api.download(id).body()).isEqualTo(data);
+    }
+
+    private List<String> repairOrder(String chunkId) {
         List<String> order = new ArrayList<>();
         for (JsonNode event : api.status().get("repair_log")) {
             if (event.get("chunk_id").asString().equals(chunkId)) {
                 order.add(event.get("event").asString() + "@" + event.path("target").asString(event.path("source").asString()));
             }
         }
-        assertThat(order).as("copy confirmed before the corrupt copy is invalidated")
-                .containsSubsequence("copied@" + newHolder(id, holders), "invalidated@" + bad);
-        assertThat(watchdog.fewestOkCopies.get()).isPositive();
-        await().atMost(PATIENCE).untilAsserted(() -> assertThat(api.metadata(id).get("replication_ok").asBoolean()).isTrue());
-        assertThat(api.download(id).body()).isEqualTo(data);
+        return order;
     }
 
     @Test

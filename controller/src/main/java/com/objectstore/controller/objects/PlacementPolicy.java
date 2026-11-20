@@ -101,6 +101,11 @@ public class PlacementPolicy {
      * this chunk. Prefer the least busy source, then one without a recent data error, then by id.
      */
     public Optional<String> chooseSource(String chunkId) {
+        return chooseSource(chunkId, worker -> true);
+    }
+
+    /** {@link #chooseSource(String)} among the workers {@code allowed} accepts (the planner's free streams). */
+    public Optional<String> chooseSource(String chunkId, java.util.function.Predicate<String> allowed) {
         long recent = properties.targetBackoff().toNanos();
         long now = cluster.now();
         List<String> candidates = new ArrayList<>();
@@ -108,7 +113,8 @@ public class PlacementPolicy {
             WorkerInfo worker = cluster.worker(entry.getKey());
             if (entry.getValue().state == ReplicaState.OK && worker != null && worker.state == WorkerState.ALIVE
                     && worker.hasReported && cluster.pendingFrom(worker.workerId) < properties.maxStreams()
-                    && !cluster.recentlyFailed(chunkId, worker.workerId)) {
+                    && worker.commands.size() < properties.maxCommandsPerWorker()     // never drop a command
+                    && !cluster.recentlyFailed(chunkId, worker.workerId) && allowed.test(worker.workerId)) {
                 candidates.add(worker.workerId);
             }
         }
@@ -145,7 +151,9 @@ public class PlacementPolicy {
     public List<String> chooseExcess(String chunkId, int count) {
         Set<String> sources = new java.util.HashSet<>();
         for (ClusterState.PendingCopy copy : cluster.pendingOf(chunkId)) {
-            sources.add(copy.source());
+            if (copy.source() != null) {
+                sources.add(copy.source());
+            }
         }
         List<String> live = new ArrayList<>(cluster.live(chunkId));
         live.removeIf(sources::contains);
