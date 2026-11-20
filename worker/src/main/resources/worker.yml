@@ -31,7 +31,7 @@ worker:
   max-chunk-size: ${CHUNK_SIZE:1048576}
   heartbeat-interval-seconds: ${HEARTBEAT_INTERVAL:2}
   heartbeat-http-timeout-seconds: ${HEARTBEAT_HTTP_TIMEOUT:3}
-  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:30}
+  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:300}
   heartbeat-min-gap-ms: ${HEARTBEAT_MIN_GAP_MS:250}
   change-log-max: ${CHANGE_LOG_MAX:10000}
   max-changes-per-message: ${MAX_CHANGES_PER_MESSAGE:2000}

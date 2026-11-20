@@ -45,35 +45,10 @@ public class ClusterStatusService {
     public record Health(int underReplicated, int overReplicated, int missing, long ok, long corrupt, long excess) {
     }
 
+    /** O(1): every number comes from the priority index's counters. */
     public Health health() {
-        int rf = properties.replicationFactor();
-        int under = 0;
-        int over = 0;
-        int missing = 0;
-        long ok = 0;
-        long corrupt = 0;
-        long excess = 0;
-        for (String chunkId : cluster.chunks().keySet()) {
-            // Counted on live copies only: a copy that is merely ordered (pending) does not protect
-            // anything yet. (The monitor schedules on live + pending, so it does not order twice.)
-            int live = cluster.live(chunkId).size();
-            if (live == 0) {
-                missing++;
-            }
-            if (live < rf) {
-                under++;
-            } else if (live > rf) {
-                over++;
-            }
-            for (Replica replica : cluster.replicasOf(chunkId).values()) {
-                switch (replica.state) {
-                    case OK -> ok++;
-                    case CORRUPT -> corrupt++;
-                    case EXCESS -> excess++;
-                }
-            }
-        }
-        return new Health(under, over, missing, ok, corrupt, excess);
+        long[] h = cluster.health();          // missing, under (1 <= live < RF), over, ok, corrupt, excess
+        return new Health((int) (h[1] + h[0]), (int) h[2], (int) h[0], h[3], h[4], h[5]);
     }
 
     public ClusterStatusResponse status() {
@@ -101,7 +76,7 @@ public class ClusterStatusService {
             Map<String, Long> counters = cluster.counters();
             for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked",
                     "changes_gap", "apply_queue_full", "writer_task_failures", "namespace_reconciled",
-                    "upload_commit_wait_timeouts")) {
+                    "index_mismatches", "upload_commit_wait_timeouts")) {
                 counters.putIfAbsent(name, 0L);
             }
             return new ClusterStatusResponse(
@@ -127,7 +102,10 @@ public class ClusterStatusService {
                     queue.oldestAgeMillis(),
                     writer.takeBusyRatio(),
                     cluster.openSessions(),
-                    cluster.ledger().counts());
+                    cluster.ledger().counts(),
+                    cluster.levels().sizes(),
+                    cluster.cleanupSize(),
+                    cluster.postponedSize());
         });
     }
 

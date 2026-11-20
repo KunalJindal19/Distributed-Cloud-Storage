@@ -38,13 +38,13 @@ public final class InProcessCluster implements AutoCloseable {
             Map.entry("objectstore.safe-mode-extension-seconds", "0.3"),
             Map.entry("objectstore.safe-mode-timeout-seconds", "4"),
             Map.entry("objectstore.orphan-gc-delay-seconds", "2"),
-            Map.entry("objectstore.full-report-interval-seconds", "1.5"),
+            Map.entry("objectstore.full-report-interval-seconds", "30"),
             Map.entry("objectstore.read-timeout-seconds", "3"));
 
     public static final Map<String, String> WORKER_TIMERS = Map.ofEntries(
             Map.entry("worker.heartbeat-interval-seconds", "0.2"),
             Map.entry("worker.heartbeat-http-timeout-seconds", "0.5"),
-            Map.entry("worker.full-report-interval-seconds", "1.5"),
+            Map.entry("worker.full-report-interval-seconds", "30"),
             Map.entry("worker.heartbeat-min-gap-ms", "25"),
             Map.entry("worker.scan-interval-seconds", "0.5"),
             Map.entry("worker.disk-check-interval-seconds", "1"),

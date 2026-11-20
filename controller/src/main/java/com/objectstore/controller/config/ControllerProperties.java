@@ -49,7 +49,13 @@ public record ControllerProperties(
         /** How long a download waits for a chunk that is in the database but not yet readable in memory. */
         @PositiveOrZero double downloadSettleWaitSeconds,
         /** Ledger entries (and, later, cleanup chunks) re-checked per monitor tick. */
-        @Min(1) int cleanupBudget) {
+        @Min(1) int cleanupBudget,
+        /** Chunks visited in the under-replication levels per planner tick. */
+        @Min(1) int plannerVisitBudget,
+        /** Postponed chunks re-checked per tick. */
+        @Min(1) int postponedBudget,
+        /** Chunks checked by the rolling invariant check per tick. */
+        @Min(0) int rollingCheckChunks) {
 
     public Duration staleAfter() {
         return seconds(staleAfterSeconds);

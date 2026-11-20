@@ -13,7 +13,13 @@ the cluster converges and that nothing acknowledged was lost:
   2. fsck HEALTHY and quiescent, no orphans on disk, no difference between disks and the block map;
   3. every acknowledged, not deleted object downloads with the right SHA-256;
   4. every deleted object answers 404 and none of its chunks is on any worker's disk;
-  5. invariant_violations == 0.
+  5. invariant_violations == 0;
+  6. the event-driven core is clean: index_mismatches, writer_task_failures and namespace_reconciled
+     are 0, the apply queue is empty, the deletion ledger is empty, no report session is open.
+
+It runs with FULL_REPORT_INTERVAL = 300 (the default): there is no frequent full report to fall
+back on, so deletions and orphans must converge through the deletion ledger and the one-time report
+request when orphan GC becomes allowed.
 
 Standard library only. Usage:
     python3 tests/chaos.py [--minutes 5] [--keep-stack] [--no-fresh]
@@ -366,8 +372,8 @@ def verify(results):
     ok = wait_until("convergence", converged, 180)
     checks.append(("status converged (no under/over/missing/pending/queued/corrupt)", ok, converged()[1]))
 
-    # Orphans are only collected ORPHAN_GC_DELAY (60 s) after a controller start, then by the next
-    # full block report (30 s): allow for both.
+    # Orphans are only collected ORPHAN_GC_DELAY (60 s) after a controller start, from the full
+    # report every worker is asked for once GC becomes allowed: allow for both.
     ok = wait_until("fsck HEALTHY, quiescent, no orphans, disks match the map", fsck_clean, 240)
     _, result = fsck_clean()
     checks.append(("fsck HEALTHY, quiescent, orphans 0, disk_vs_map empty", ok,
@@ -398,8 +404,18 @@ def verify(results):
                    not still_there, still_there[:5]))
     log("verified %d deletions in %.0f s" % (len(gone), time.monotonic() - started))
 
-    violations = status()["counters"].get("invariant_violations", 0)
+    final = status()
+    counters = final["counters"]
+    violations = counters.get("invariant_violations", 0)
     checks.append(("invariant_violations == 0", violations == 0, violations))
+    core = {name: counters.get(name, 0) for name in ("index_mismatches", "writer_task_failures", "namespace_reconciled")}
+    checks.append(("index_mismatches, writer_task_failures, namespace_reconciled == 0", not any(core.values()), core))
+    ledger = final.get("ledger", {})
+    idle = {"apply_queue_depth": final.get("apply_queue_depth"), "ledger": ledger,
+            "report_sessions_open": final.get("report_sessions_open")}
+    checks.append(("apply queue empty, deletion ledger empty, no report session open",
+                   final.get("apply_queue_depth") == 0 and sum(ledger.values()) == 0
+                   and final.get("report_sessions_open") == 0, idle))
     checks.append(("no data problems observed by the clients", not problems, problems[:5]))
     return checks
 

@@ -38,8 +38,8 @@ class ClusterStateTest {
         t.join("worker3", chunk(0));
         cluster.locked(() -> {
             cluster.worker("worker1").state = WorkerState.STALE;
-            cluster.replica(chunk(0), "worker2").state = ReplicaState.CORRUPT;
-            cluster.replica(chunk(0), "worker3").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker2", ReplicaState.CORRUPT);
+            cluster.setReplicaState(chunk(0), "worker3", ReplicaState.EXCESS);
             assertThat(cluster.live(chunk(0))).containsExactly("worker1");
         });
     }
@@ -67,7 +67,7 @@ class ClusterStateTest {
             assertThat(again.cmdId()).isEqualTo(first.cmdId());
             assertThat(cluster.worker("worker1").commands).hasSize(1);
             cluster.takeCommands(cluster.worker("worker1"));
-            cluster.replica(chunk(0), "worker1").state = ReplicaState.EXCESS;
+            cluster.setReplicaState(chunk(0), "worker1", ReplicaState.EXCESS);
             cluster.sendDelete("worker1", chunk(0), "excess");
             cluster.sendDelete("worker1", chunk(0), "excess");                  // one entry per pair
             assertThat(cluster.worker("worker1").commands).hasSize(1);
@@ -108,5 +108,21 @@ class ClusterStateTest {
             assertThat(cluster.pendingTotal()).isZero();
             assertThat(cluster.checkInvariants()).isEmpty();
         });
+    }
+
+    @Test
+    void edge26_theRollingCheckFindsCountsAndRepairsADriftedIndexEntry() {
+        t.knowChunk(chunk(0));
+        t.join("worker1", chunk(0));
+        t.join("worker2", chunk(0));
+        // Drift: a state change that bypasses markDirty (what a bug elsewhere would look like).
+        cluster.write(() -> cluster.replica(chunk(0), "worker2").state = ReplicaState.CORRUPT);
+
+        List<String> problems = cluster.write(() -> cluster.rollingCheck(100));
+
+        assertThat(problems).anyMatch(p -> p.startsWith("I10"));
+        assertThat(cluster.counter("index_mismatches")).isEqualTo(1);
+        assertThat(cluster.write(cluster::checkInvariants)).as("repaired").isEmpty();
+        assertThat(cluster.read(() -> cluster.levels().levelOf(chunk(0)))).isEqualTo(cluster.levels().levelFor(1, 0));
     }
 }
