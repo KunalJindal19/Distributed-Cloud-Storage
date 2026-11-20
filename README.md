@@ -45,7 +45,7 @@ replication factor, and survives its own crash at any instruction.
 
 **Prerequisites:** Docker Engine or Docker Desktop with Compose v2, plus `bash`, `curl`, `make` and
 `jq`. A JDK is **not** needed: everything is built inside Docker. (Python 3 is needed only for the
-chaos test.)
+chaos test and the showcase.)
 
 ```bash
 make up          # build the images, start 6 containers, wait until all are healthy
@@ -70,6 +70,8 @@ make fsck                                                # end-to-end consistenc
 | `make pause W=worker2` / `make unpause W=worker2` | freeze a worker (STALE only, if short) |
 | `make corrupt W=worker3 C=<chunk_id>` | overwrite 4 bytes inside a stored chunk file |
 | `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
+| `make showcase` | a guided tour of the inner state: messages, chunk placement, `worker2` stopped and started ([below](#showcase-the-inner-state-on-the-console)) |
+| `make app` | open the web client, <http://localhost:8000/app> |
 | `make test` | 233 unit and in-process system tests (local Maven, or a Maven container) |
 | `make test-scale` | the scale test: 500,000 chunks, 8 workers, no HTTP (about a minute) |
 | `make scenarios` | the acceptance-criteria scripts against Docker (about 15 minutes; wipes data) |
@@ -235,6 +237,31 @@ curl $API/cluster/status                                                    # 20
 curl $API/fsck                                                              # 200, consistency check
 ```
 
+### Web client
+
+<http://localhost:8000/app> (also `http://localhost:8000/`, or `make app`) is the object store for
+people: a single page served by the controller on top of the REST API below, so it needs nothing
+else.
+
+- **Upload** several files at once by dropping them or choosing them, with optional custom metadata
+  for the batch. Each file shows its progress, then "storing two copies of every chunk…" until the
+  `201`. Every upload carries its own `Idempotency-Key`, and a dropped connection or a `503`
+  (safe mode, too few workers) is retried automatically with that same key, so a retry never stores
+  a file twice. An upload can be cancelled.
+- **Browse** the objects, newest first, page by page, filtered by name, type or id.
+- **Open** an object: its system metadata (size, content type, SHA-256, chunk count, times,
+  replication), its **custom metadata** to edit in place (add, change, remove; validated with the
+  same rules as the server, saved as one `PATCH`), and every chunk with the workers that hold its
+  copies (`OK`, `CORRUPT`, `EXCESS`; a copy on a STALE worker is outlined).
+- **Download** (streamed by the browser), **preview** images, video, audio, PDF and text, and
+  **verify integrity**: the page downloads the object, computes its SHA-256 and compares it with the
+  checksum recorded at upload (up to 256 MB; on `localhost` or https).
+- **Delete**, after a confirmation.
+- A **status chip** (healthy, starting up, repairing, too few workers, unreachable) and banners say
+  when uploads will wait or some objects cannot be read; the page links to the dashboard.
+
+Names and metadata are always inserted as text, never as HTML.
+
 ### Dashboard
 
 <http://localhost:8000/dashboard> polls the status every 2 s: a safe-mode banner; KPIs (objects,
@@ -259,7 +286,7 @@ Base path `/api/v1`. Structured data is JSON with `snake_case` keys; object data
 | `GET` | `/api/v1/objects` | List stored objects | `200` |
 | `GET` | `/api/v1/cluster/status` | Cluster overview *(extra)* | `200` |
 | `GET` | `/api/v1/fsck` | Consistency check *(extra)* | `200` |
-| `GET` | `/health`, `/dashboard` | Liveness probe, dashboard page *(extra)* | `200` |
+| `GET` | `/health`, `/dashboard`, `/app` | Liveness probe, dashboard page, web client *(extra)*; `/` redirects to `/app` | `200` |
 
 ### Upload — `POST /api/v1/objects`
 
@@ -596,15 +623,19 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `CONTROLLER_URL` / `ADVERTISE_URL` | `http://controller:8000` / `http://<WORKER_ID>:<PORT>` | worker | where to register / how the controller and peers reach this worker |
 | `MAX_UPLOAD_SIZE` | `10GB` | controller | largest accepted object |
 | `PORT`, `LOG_LEVEL` | 8000 / 8001–8004, `INFO` | both | |
+| `TRACE_MESSAGES` | `off` | controller | log every message to and from the workers: `all`, `changes` (leaves out plain "I am alive" heartbeats) or `off` |
+| `STATE_PRINT_INTERVAL` | 0 (off) | both | print the cluster (controller) or the worker's own state every this many seconds |
 
 All services have `restart: unless-stopped` (a crashed process comes back by itself; `docker
 stop` still keeps it stopped) and `stop_grace_period: 5s`. [`docker-compose.chaos.yml`](docker-compose.chaos.yml)
-turns fault injection on (300 ms, 5 % drops, 5 % duplicates).
+turns fault injection on (300 ms, 5 % drops, 5 % duplicates); [`docker-compose.showcase.yml`](docker-compose.showcase.yml)
+sets `TRACE_MESSAGES=all` and `STATE_PRINT_INTERVAL=10` (see [Showcase](#showcase-the-inner-state-on-the-console)).
 
 Log tags: controller `[api]`, `[upload]`, `[download]`, `[registry]`, `[report]`,
-`[monitor]`, `[safemode]`, `[integrity]`, `[invariant]`, `[fsck]`; worker `[link]` (registration,
+`[monitor]`, `[safemode]`, `[integrity]`, `[invariant]`, `[fsck]`, `[msg]` (one line per message,
+with `TRACE_MESSAGES`), `[state]` (with `STATE_PRINT_INTERVAL`); worker `[link]` (registration,
 heartbeats, report segments, change-log overflow), `[cmd]`, `[store]`, `[scanner]`, `[diskcheck]`,
-`[version]`.
+`[version]`, `[state]`.
 
 ---
 
@@ -728,6 +759,122 @@ until the workers have re-registered and reported. The retried upload then succe
 one object** exists. The chunks the killed attempt had written are orphans: workers keep listing
 them, and once `ORPHAN_GC_DELAY` has passed since the controller start, the next full report gets
 them deleted. `fsck` is `HEALTHY`.
+
+---
+
+## Showcase: the inner state on the console
+
+```bash
+make showcase                     # guided: waits for Enter before each step
+make showcase ARGS=--no-pause     # straight through
+make showcase-logs                # in a second terminal: the five containers, live
+```
+
+[`showcase.sh`](showcase.sh) restarts the stack with [`docker-compose.showcase.yml`](docker-compose.showcase.yml),
+which sets `TRACE_MESSAGES=all` on the controller and `STATE_PRINT_INTERVAL=10` everywhere, then:
+
+0. waits until every worker is ALIVE and has reported its chunks;
+1. shows the latest messages and state blocks, and where to watch them live;
+2. uploads three files and draws where every copy of every chunk went;
+3. **`docker stop worker2`**: it goes STALE after 6 s and DEAD after 12 s; every chunk it held is
+   copied from the surviving copy to another worker; the grid shows two live copies again and every
+   file downloads with its original SHA-256;
+4. **`docker start worker2`**: it registers with a new process id and sends a full report; chunks
+   that were re-copied meanwhile now have a surplus copy, which the controller deletes; chunks not yet
+   re-copied count worker2's copy again; every chunk ends with exactly two copies;
+5. uploads one more file (worker2 takes copies again) and runs `fsck` (HEALTHY).
+
+Re-copying is paced by the planner (`MAX_STREAMS=2` copies in flight per source, a tick every 3 s,
+about 1.5 copies/s). On a store that already holds a lot (after `make chaos`, a worker holds ~850
+copies) step 3 moves on once the showcase files have two copies again and says the rest continues
+in the background; `make down-v` first gives a quick run. To go back to quiet logs: `make up`.
+
+The same output is available without the script: `make showcase-up`, or set the two variables
+yourself.
+
+**Every message** — `TRACE_MESSAGES=all` (or `changes`, which leaves out "I am alive" heartbeats
+and their empty replies). `←` is received by the controller, `→` sent by it. `3e28d6d6/2` is chunk 2
+of object `3e28d6d6-…`. `ack #N` tells the worker it may forget its changes up to `#N`.
+
+```text
+[msg] ← worker2   REGISTER    attempt 1 · boot 48a7303a · change_seq 0 · cluster c7d3acd6  ⇒ accepted, ALIVE
+[msg] ← worker2   HEARTBEAT   #0 · full report 00c1f300 segment 0 (last), 854 chunks, baseline #0
+[msg] → worker2   REPLY       #0 · ack #0 · segment 0 received
+[msg] ← worker4   HEARTBEAT   #3 · alive
+[msg] → worker4   REPLY       #3 · ack #0
+[msg] → worker4   PUT CHUNK   3e28d6d6/0 · 1.0 MB
+[msg] ← worker4   PUT ANSWER  3e28d6d6/0 stored · 1 change #2: RECEIVED 3e28d6d6/0
+[msg] → worker1   REPLY       #14 · ack #3 · REPLICATE ddb0d57e/2 → worker3 · REPLICATE cb2fa04c/0 → worker3
+[msg] → worker1   REPLY       #425 · ack #283 · DELETE 000687f2/2 (excess) · DELETE 00ad4c0e/2 (excess) · …
+[msg] ← worker1   HEARTBEAT   #426 · 50 changes #284–#333: DELETED 01100cc9/0, DELETED 00ad4c0e/2, …
+```
+
+Downloads add `GET CHUNK` / `GET ANSWER` lines (`… 1.0 MB, checksum verified`, or why a copy was refused).
+
+**The cluster every 10 s** — `STATE_PRINT_INTERVAL` on the controller: the workers (copies held,
+heartbeats since the last print, silence, queued commands, copies being sent), the placement of the
+newest objects, and the repair queues.
+
+```text
+[state] ═══ cluster at 04:54:41 ═══ 4/4 workers ALIVE · 961 objects · 1654 chunks · 3308 copies · every chunk has 2 copies
+[state]   worker    state  copies  heartbeats  last seen  queued cmds  copying out
+[state]   worker1   ALIVE     446           5      0.3 s            0            0
+[state]   worker2   ALIVE     856           5      0.3 s            0            0
+[state]   worker3   ALIVE    1052           5      0.6 s            0            0
+[state]   worker4   ALIVE     954           5      0.6 s            0            0
+[state]   placement of the 8 newest objects   ● copy   ✗ corrupt   ○ surplus, being deleted   ⇢ copy on its way
+[state]   object                  chunk  worker1  worker2  worker3  worker4
+[state]   after.bin                  #0     ●                          ●
+[state]                              #1     ●        ●
+[state]                              #2              ●        ●
+[state]   notes.bin                  #0                       ●        ●
+[state]                              #1     ●                          ●
+[state]   dataset.bin                #0                       ●        ●
+[state]                              #1     ●                          ●
+[state]                              #2              ●                 ●
+[state]                              #3              ●        ●
+[state]   …
+[state]   repairs: 0 chunks short of copies · 0 with no live copy · 0 copies on their way · surplus 0 · deletions 0 waiting, 0 queued, 0 sent
+```
+
+**Each worker every 10 s** — `STATE_PRINT_INTERVAL` on a worker: registration and process id, its
+chunks grouped by object, its link to the controller (last heartbeat, acknowledged changes, changes
+waiting), the full report in progress, known-bad copies and running transfers.
+
+```text
+[state] ═══ worker2 at 04:53:00 ═══ registered · process 48a7303a · 854 chunks · 573.5 MB · 411.1 GB free
+[state]   link: heartbeat #4 sent 1.9 s ago · changes acknowledged up to #0 (last change #0) · 0 waiting to be acknowledged
+[state]   full report: none in progress (last one 9.9 s ago)
+[state]   chunks by object: 000687f2 #2 · 00ad4c0e #2 #3 · 01100cc9 #0 · 01ad07d9 #0 #3 · 01eaae6d #0 #3
+[state]                     02a2b5f5 #0 #3 · 031aa523 #0 · 033df47c #0 #1 · 0383f763 #1 #2 · …
+[state]   known bad: none · copies being sent to other workers: 0
+```
+
+**What the script draws** from the REST API ([`tests/showcase_view.py`](tests/showcase_view.py)), here
+right after worker2 came back (its copies of `dataset.bin` #2 and #3 count again; the copies made
+on worker1 while it was away were the surplus and were deleted):
+
+```text
+  ▸ docker start worker2
+  +   0s  worker2 DEAD · showcase files: 0 of 7 chunks short, 0 with a surplus · whole store: 132 short, 0 on the way, 0 surplus, 0 deletions
+  +   2s  worker2 ALIVE · showcase files: 0 of 7 chunks short, 2 with a surplus · whole store: 0 short, 0 on the way, 724 surplus, 0 deletions
+  +   5s  worker2 ALIVE · showcase files: 0 of 7 chunks short, 0 with a surplus · whole store: 0 short, 0 on the way, 0 surplus, 417 deletions
+  ✓ reached after 8 s
+
+  object                   chunk  worker1  worker2  worker3  worker4
+                                   ALIVE    ALIVE    ALIVE    ALIVE
+  ───────────────────────────────────────────────────────────────────
+  photo.jpg                   #0     ●        ·        ·        ●
+  dataset.bin                 #0     ·        ·        ●        ●
+                              #1     ●        ·        ·        ●
+                              #2     ·        ●        ·        ●
+                              #3     ·        ●        ●        ·
+  notes.bin                   #0     ·        ·        ●        ●
+                              #1     ●        ·        ·        ●
+  ───────────────────────────────────────────────────────────────────
+  copies held, all objects          444      854      1051     953
+  ● copy   ○ surplus copy, being deleted   ✗ corrupt copy   · no copy      every chunk shown has exactly 2 live copies
+```
 
 ---
 
@@ -1332,9 +1479,11 @@ millisecond timestamps (an update in the same second must show a later `updated_
 .
 ├── docker-compose.yml          1 controller, 4 workers, 1 client; volumes, network, restart policy
 ├── docker-compose.chaos.yml    fault injection on (used by the chaos test)
+├── docker-compose.showcase.yml every message traced, state printed every 10 s (used by showcase.sh)
 ├── Dockerfile                  multi-stage build: controller, worker, client
-├── Makefile                    up / down / status / fsck / stop / start / pause / corrupt / test / scenarios / chaos / demo
+├── Makefile                    up / down / status / fsck / stop / start / pause / corrupt / test / scenarios / chaos / demo / showcase
 ├── demo.sh                     the seven demonstrations, self-checking
+├── showcase.sh                 guided tour of the inner state: placement, worker2 stopped and started
 ├── oscli                       runs the CLI (in the client container, or locally)
 ├── samples/sample.jpg          a real image for the demo
 ├── common/                     protocol messages, checksums, chunk ids, JSON errors, fault-injecting HTTP clients
@@ -1342,7 +1491,8 @@ millisecond timestamps (an update in the same second must show a later `updated_
 │   └── src/main/java/com/objectstore/worker/
 │       ├── api/                ChunkController (PUT/GET/DELETE/list), HealthController
 │       ├── storage/            ChunkStore (.meta sidecars, fsync, in-memory index), VersionFile, BlockScanner, TokenBucket, DiskCheck
-│       ├── reporting/          ChangeLog, ControllerLink (registration, heartbeats, report segments), ControllerClients, WorkerIdentity
+│       ├── reporting/          ChangeLog, ControllerLink (registration, heartbeats, report segments), ControllerClients, WorkerIdentity,
+│       │                       StatePrinter (STATE_PRINT_INTERVAL)
 │       └── commands/           CommandExecutor (REPLICATE, DELETE)
 ├── controller/                 the NameNode
 │   └── src/main/java/com/objectstore/controller/
@@ -1352,12 +1502,15 @@ millisecond timestamps (an update in the same second must show a later `updated_
 │       │                       SafeMode, Fsck, WorkerClient, ClusterBootstrap
 │       ├── replication/        Monitor, ReplicationPlanner, MaintenanceLoops
 │       ├── objects/            UploadService, DownloadService, ObjectService, PlacementPolicy, MetadataValidator
+│       ├── observability/      MessageTrace (TRACE_MESSAGES), ClusterStatePrinter (STATE_PRINT_INTERVAL)
 │       └── repository/         ObjectRepository, ChunkRepository, ClusterMetaRepository (+ db/migration)
+│   └── src/main/resources/static/  app.html (the web client, /app), dashboard.html (/dashboard)
 ├── client/                     oscli
 ├── system-tests/               InProcessCluster and the end-to-end tests
 └── tests/
     ├── scenarios/              block6_protocol.sh … block9_fsck.sh, lib.sh
-    └── chaos.py
+    ├── chaos.py
+    └── showcase_view.py        placement grid, repair events and checks for showcase.sh (from the REST API)
 ```
 
 Module names from the specification: `cluster.py` → `ClusterState` · `registry.py` → `Registry` ·
