@@ -1,11 +1,16 @@
 package com.objectstore.controller.objects;
 
-import com.objectstore.common.InternalApi;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectListResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.controller.cluster.ApplyQueue;
 import com.objectstore.controller.cluster.ClusterState;
+import com.objectstore.controller.cluster.NamespaceLock;
+import com.objectstore.controller.cluster.NamespaceTasks;
+import com.objectstore.controller.cluster.Task;
+import com.objectstore.controller.cluster.Writer;
+import com.objectstore.controller.config.ControllerProperties;
 import com.objectstore.controller.cluster.SafeMode;
 import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.domain.StoredObject;
@@ -13,7 +18,6 @@ import com.objectstore.controller.repository.ChunkRepository;
 import com.objectstore.controller.repository.ObjectRepository;
 import com.objectstore.controller.repository.ObjectRepository.PatchOutcome;
 import java.time.Clock;
-import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,9 +38,16 @@ public class ObjectService {
     private final ClusterState cluster;
     private final SafeMode safeMode;
     private final Clock clock;
+    private final NamespaceLock namespaceLock;
+    private final NamespaceTasks namespaceTasks;
+    private final ApplyQueue queue;
+    private final Writer writer;
+    private final ControllerProperties properties;
 
     public ObjectService(ObjectRepository objects, ChunkRepository chunks, ObjectViewAssembler views,
-                         MetadataValidator metadataValidator, ClusterState cluster, SafeMode safeMode, Clock clock) {
+                         MetadataValidator metadataValidator, ClusterState cluster, SafeMode safeMode, Clock clock,
+                         NamespaceLock namespaceLock, NamespaceTasks namespaceTasks, ApplyQueue queue, Writer writer,
+                         ControllerProperties properties) {
         this.objects = objects;
         this.chunks = chunks;
         this.views = views;
@@ -44,6 +55,11 @@ public class ObjectService {
         this.cluster = cluster;
         this.safeMode = safeMode;
         this.clock = clock;
+        this.namespaceLock = namespaceLock;
+        this.namespaceTasks = namespaceTasks;
+        this.queue = queue;
+        this.writer = writer;
+        this.properties = properties;
     }
 
     /** System and custom metadata, including chunk locations. No worker is contacted. */
@@ -84,33 +100,51 @@ public class ObjectService {
     }
 
     /**
-     * Deletes an object (HDFS {@code delete} followed by {@code DNA_INVALIDATE}).
+     * Deletes an object (HDFS {@code delete} followed by {@code DNA_INVALIDATE}), v4 §5.7.
      *
-     * <p>In one synchronous block: the namespace row is deleted durably (cascading to metadata,
-     * chunks and idempotency key), then every known copy gets a DELETE command and the chunks
-     * are forgotten. The workers delete the files when they pick the commands up with their next
-     * heartbeat. Copies the controller does not know about (on a DEAD worker, or a DELETE lost
-     * with a heartbeat reply) become orphans, which the workers' block reports clean up.
+     * <p>Under the namespace lock: the namespace row is deleted durably (cascading to metadata,
+     * chunks and idempotency key, leaving a tombstone) and {@code DeleteObject} is queued. Then,
+     * with no lock held, a wait of at most UPLOAD_COMMIT_WAIT for it, and {@code 204}. The task
+     * gives every holder of a copy (and every target of a copy on its way) a DELETE command and
+     * forgets the chunks; the workers delete the files when they pick the commands up with their
+     * next heartbeat. Copies the controller does not know about (on a DEAD worker) are garbage,
+     * collected from the worker's changes or its next full report.
      */
     public void delete(String objectId) {
         safeMode.requireWritable();
-        int queued = cluster.locked(() -> {
+        Task task;
+        namespaceLock.lock();
+        try {
             List<Chunk> chunkRows = chunks.findChunksByObject(objectId);
             if (!objects.delete(objectId, clock.instant())) {
                 throw notFound(objectId);
             }
-            cluster.addGarbage(objectId);
-            int commands = 0;
-            for (Chunk chunk : chunkRows) {
-                for (String workerId : new ArrayList<>(cluster.replicasOf(chunk.chunkId()).keySet())) {
-                    cluster.queueCommand(workerId, InternalApi.COMMAND_DELETE, chunk.chunkId(), null, null, "object_deleted");
-                    commands++;
+            task = namespaceTasks.deleteObject(objectId, chunkRows.stream().map(Chunk::chunkId).toList());
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    queue.put(task);
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
                 }
-                cluster.removeChunk(chunk.chunkId());
             }
-            return commands;
-        });
-        log.info("[api] deleted object={}; {} DELETE commands queued", objectId, queued);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            namespaceLock.unlock();
+        }
+        try {
+            writer.await(task, properties.uploadCommitWait());
+        } catch (java.util.concurrent.TimeoutException e) {
+            cluster.increment("upload_commit_wait_timeouts");
+            log.warn("[api] object={} is deleted but its DeleteObject task did not finish within {} s; answering anyway",
+                    objectId, properties.uploadCommitWaitSeconds());
+        } catch (RuntimeException e) {
+            log.warn("[api] object={} is deleted; applying it to memory failed ({}), so it is reconciled", objectId,
+                    e.toString());
+        }
     }
 
     private StoredObject find(String objectId) {

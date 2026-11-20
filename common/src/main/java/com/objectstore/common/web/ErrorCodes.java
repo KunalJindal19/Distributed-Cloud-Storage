@@ -30,6 +30,8 @@ public final class ErrorCodes {
     public static final String STALE_SEQ = "stale_seq";
     public static final String CLUSTER_ID_MISMATCH = "cluster_id_mismatch";
     public static final String DUPLICATE_WORKER = "duplicate_worker";
+    /** A registration attempt older than one already accepted from the same process. */
+    public static final String STALE_REGISTRATION = "stale_registration";
 
     private ErrorCodes() {
     }

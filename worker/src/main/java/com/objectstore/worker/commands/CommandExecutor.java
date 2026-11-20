@@ -4,7 +4,7 @@ import com.objectstore.common.Checksums;
 import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.Command;
 import com.objectstore.worker.reporting.ControllerClients;
-import com.objectstore.worker.reporting.IbrBuffer;
+import com.objectstore.worker.reporting.ChangeLog;
 import com.objectstore.worker.storage.ChunkStore;
 import jakarta.annotation.PreDestroy;
 import java.util.LinkedHashMap;
@@ -27,7 +27,9 @@ import org.springframework.web.client.RestClientException;
  *   <li>{@code REPLICATE}: read the local copy, verify it against the sidecar and the checksum in
  *       the command, and PUT it directly to the target worker (HDFS {@code DNA_TRANSFER}). Bad
  *       bytes are never sent; they are reported instead. Success is not reported here: the
- *       target's own report tells the controller, and a time-out on the controller covers failure.</li>
+ *       target's own {@code RECEIVED} tells the controller. A failure (no local copy, a corrupt
+ *       one, or a failed PUT) appends {@code CMD_FAILED}, which ends the pending copy at once; an
+ *       expired command is dropped silently (the controller's pending time-out is shorter).</li>
  *   <li>{@code DELETE}: remove the local copy (HDFS {@code DNA_INVALIDATE}).</li>
  * </ul>
  *
@@ -43,7 +45,7 @@ public class CommandExecutor {
     private static final int MAX_CONCURRENT = 4;
 
     private final ChunkStore store;
-    private final IbrBuffer ibr;
+    private final ChangeLog changes;
     private final ControllerClients clients;
     private final Semaphore permits = new Semaphore(MAX_CONCURRENT);
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -55,9 +57,9 @@ public class CommandExecutor {
         }
     };
 
-    public CommandExecutor(ChunkStore store, IbrBuffer ibr, ControllerClients clients) {
+    public CommandExecutor(ChunkStore store, ChangeLog changes, ControllerClients clients) {
         this.store = store;
-        this.ibr = ibr;
+        this.changes = changes;
         this.clients = clients;
     }
 
@@ -104,10 +106,17 @@ public class CommandExecutor {
 
     private void replicate(Command command) {
         String chunkId = command.chunkId();
-        Optional<ChunkStore.StoredChunk> local = store.read(chunkId);
+        Optional<ChunkStore.StoredChunk> local;
+        try {
+            local = store.read(chunkId);
+        } catch (RuntimeException unreadable) {
+            changes.cmdFailed(command.cmdId(), chunkId, command.targetUrl(), "local copy unreadable");
+            throw unreadable;
+        }
         if (local.isEmpty()) {
             log.warn("[cmd] replicate chunk={}: not on this worker; reporting it as deleted", chunkId);
-            ibr.deleted(chunkId);
+            changes.deleted(chunkId);
+            changes.cmdFailed(command.cmdId(), chunkId, command.targetUrl(), "no local copy");
             return;
         }
         ChunkStore.StoredChunk chunk = local.get();
@@ -115,7 +124,8 @@ public class CommandExecutor {
         if (chunk.corrupt() || !hash.equals(command.checksum())) {
             log.warn("[cmd] replicate chunk={}: local copy is corrupt (disk={} expected={}); reporting it, not sending it",
                     chunkId, hash, command.checksum());
-            ibr.bad(chunkId);
+            store.markBad(chunkId, "replicate"); // (read() already did, if the sidecar disagrees)
+            changes.cmdFailed(command.cmdId(), chunkId, command.targetUrl(), "local copy corrupt");
             return;
         }
         activeTransfers.incrementAndGet();
@@ -132,6 +142,7 @@ public class CommandExecutor {
                     chunk.data().length, (System.nanoTime() - started) / 1_000_000);
         } catch (RestClientException e) {
             log.warn("[cmd] replicate failed chunk={} -> {}: {}", chunkId, command.targetUrl(), rootMessage(e));
+            changes.cmdFailed(command.cmdId(), chunkId, command.targetUrl(), rootMessage(e));
         } finally {
             activeTransfers.decrementAndGet();
         }

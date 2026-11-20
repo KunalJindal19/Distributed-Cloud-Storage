@@ -26,10 +26,12 @@ public class InfrastructureConfig {
      * competing connections, the pool holds exactly one connection, so every statement and
      * transaction is serialised in-process. This is safe because no transaction ever spans a
      * network call: they all complete in well under a millisecond. {@code synchronous=FULL} makes
-     * a commit durable before it is acknowledged, so a 201 survives a crash.
+     * a commit durable before it is acknowledged, so a 201 survives a crash. Every connection is
+     * checked by {@link com.objectstore.controller.cluster.SqliteGuard}: never on the writer thread,
+     * never under the cluster lock.
      */
     @Bean(destroyMethod = "close")
-    public HikariDataSource dataSource(ControllerProperties properties) throws IOException {
+    public GuardedDataSource dataSource(ControllerProperties properties) throws IOException {
         Path dbFile = properties.dbPath().toAbsolutePath().normalize();
         Files.createDirectories(dbFile.getParent());
 
@@ -47,6 +49,6 @@ public class InfrastructureConfig {
         pool.setMaximumPoolSize(1);
         pool.setMinimumIdle(1);
         pool.setConnectionTimeout(10_000);
-        return new HikariDataSource(pool);
+        return new GuardedDataSource(new HikariDataSource(pool));
     }
 }
