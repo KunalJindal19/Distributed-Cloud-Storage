@@ -51,7 +51,7 @@ check "no object was recorded" [ "$(objects_named doomed.bin)" = 0 ]
 docker start worker2 worker3 worker4 > /dev/null
 wait_for 120 healthy
 t0=$(now)
-check "leftover chunks are garbage-collected (ORPHAN_GC_DELAY + one full report)" wait_for 150 sh -c "[ \$(curl -fsS -m 60 $API/fsck | jq .orphans_on_disk) = 0 ]"
+check "leftover chunks are garbage-collected (ORPHAN_GC_DELAY + one resync)" wait_for 150 sh -c "[ \$(curl -fsS -m 60 $API/fsck | jq .orphans_on_disk) = 0 ]"
 say "  orphans gone $(since "$t0") s after the workers were back"
 
 section "AC-8.3 Idempotency-Key: 201, then 200 replay with the same id, then 409 for another size"
@@ -105,7 +105,7 @@ random_file "$WORK/s.bin" 2000
 check "an upload issued during safe mode succeeds after retrying" sh -c "OSCLI_RETRY_SECONDS=60 ./oscli upload '$REL/s.bin' > '$WORK/s.json' 2> '$WORK/s.err' && grep -q 'answered 503' '$WORK/s.err'"
 check "the download is verified against the ETag" sh -c "./oscli download \$(jq -r .object_id '$WORK/s.json') '$REL/s.out' | jq -e .etag_match > /dev/null"
 
-section "AC-8.6 network faults never make a download mark a copy CORRUPT"
+section "AC-8.6 network faults never make a download report a copy for quarantine"
 docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d --wait > /dev/null 2>&1
 wait_for 120 healthy
 ids=(); for i in $(seq 1 8); do random_file "$WORK/f$i.bin" $((i * 300000)); ids+=("$(OSCLI_RETRY_SECONDS=60 ./oscli upload "$REL/f$i.bin" 2>/dev/null | jq -r .object_id)"); done
@@ -113,7 +113,7 @@ bad=0; for round in 1 2 3; do for i in $(seq 1 8); do
     OSCLI_RETRY_SECONDS=60 ./oscli download "${ids[$((i-1))]}" "$REL/f.out" > /dev/null 2>&1 && cmp -s "$WORK/f.out" "$WORK/f$i.bin" || bad=$((bad+1))
 done; done
 check "24 downloads under faults are all intact" [ "$bad" = 0 ]
-check "no copy was marked CORRUPT by the read path" sh -c "! docker logs controller 2>&1 | grep -q -- '-> CORRUPT'"
+check "no copy was reported for quarantine by the read path" sh -c "! docker logs controller 2>&1 | grep -q -- '-> quarantine'"
 check "replicas.corrupt is 0" sh -c "[ \$(curl -fsS $API/cluster/status | jq .replicas.corrupt) = 0 ]"
 docker compose up -d --wait > /dev/null 2>&1
 

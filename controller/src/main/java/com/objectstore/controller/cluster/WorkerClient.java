@@ -46,15 +46,19 @@ public class WorkerClient {
     }
 
     /**
-     * {@code PUT /internal/chunks/{chunk_id}}. 200 (already there) and 201 (written) both succeed.
-     * {@code changeAck} ({@code <boot_id>:<received>}, may be null) goes in {@code X-Change-Ack};
-     * the answer may carry the worker's next changes.
+     * {@code PUT /internal/chunks/{chunk_id}} at operation {@code version} ({@code X-Op-Version}).
+     * 200 (already there, or a repeat) and 201 (written) both succeed; anything else (409
+     * {@code stale_version} / {@code in_progress}, 503, 500, ...) is a failed target.
+     * {@code changeAck} ({@code <boot_id>:<received>}, may be null) goes in {@code X-Change-Ack}; the
+     * answer may carry the worker's next changes.
      */
-    public ChunkPutResponse putChunk(String workerUrl, String chunkId, byte[] data, String checksum, String changeAck) {
+    public ChunkPutResponse putChunk(String workerUrl, String chunkId, byte[] data, String checksum, long version,
+                                     String changeAck) {
         return call(workerUrl, () -> {
             RestClient.RequestBodySpec spec = chunks.put()
                     .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
                     .header(InternalApi.CHECKSUM_HEADER, checksum)
+                    .header(InternalApi.OP_VERSION_HEADER, Long.toString(version))
                     .contentType(MediaType.APPLICATION_OCTET_STREAM);
             if (changeAck != null) {
                 spec = spec.header(InternalApi.CHANGE_ACK_HEADER, changeAck);

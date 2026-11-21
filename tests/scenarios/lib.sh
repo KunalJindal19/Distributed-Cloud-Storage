@@ -11,6 +11,10 @@ WORK="$ROOT/.demo/scenarios"
 REL=".demo/scenarios"   # the same directory relative to the project: what ./oscli (in the client container) can see
 mkdir -p "$WORK"
 MIB=1048576
+# Docker names follow the Compose project (COMPOSE_PROJECT_NAME, default "objectstore", the name in
+# docker-compose.yml), so a run under another project never touches the default project's volumes.
+PROJECT="${COMPOSE_PROJECT_NAME:-objectstore}"
+NETWORK="${PROJECT}_objectstore-net"
 FAILED=0
 PASSED=0
 

@@ -3,14 +3,15 @@ package com.objectstore.controller.cluster;
 import com.objectstore.common.ChunkIds;
 import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.Change;
+import com.objectstore.common.dto.ChangeType;
 import com.objectstore.common.dto.ReportEntry;
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
-import com.objectstore.controller.cluster.ClusterState.PendingKind;
 import com.objectstore.controller.cluster.ClusterState.Receipt;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.ReportSession;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
+import com.objectstore.controller.cluster.PendingOps.Kind;
+import com.objectstore.controller.cluster.PendingOps.Op;
+import com.objectstore.controller.cluster.PendingOps.Reason;
 import com.objectstore.controller.config.ControllerProperties;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,25 +20,28 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * Applies a worker's changes and full-report segments to the block map (v4 §4.9). These are the
- * bodies of the writer's {@code ApplyChanges}, {@code ApplySegment} and {@code CompleteReport}
- * tasks: every method runs under the cluster write lock, and none does network or database I/O.
+ * Applies a worker's changes and resync segments (v5 §3.4, §5.5, §5.6). These are the bodies of the
+ * writer's {@code ApplyChanges}, {@code ApplySegment} and {@code Completion} tasks: every method runs
+ * under the cluster write lock and none does network or database I/O. Each carries the worker's
+ * epoch: work that belongs to an earlier life of the worker is dropped.
  *
- * <p>Each method carries the worker's epoch: work that belongs to an earlier life of the worker
- * (before a re-registration or DEAD) is dropped.
+ * <p><b>Each change does two separate things, in this order.</b>
+ * <ol>
+ *   <li><b>The physical part, always.</b> {@code RECEIVED} adds or updates the replica (a new
+ *       version gives it a new generation), unless its checksum differs from the namespace, in
+ *       which case {@code ensure(DELETE, CORRUPT)} is created instead; {@code DELETED} removes the
+ *       replica. Never skipped because of a version.</li>
+ *   <li><b>Completion, only if</b> the version is even, at least the op's version, and the kind
+ *       matches ({@code RECEIVED} ↔ INSERT, {@code DELETED} ↔ DELETE). Odd versions (the worker's own
+ *       observations), older versions and the wrong kind leave the op untouched. This is what fixes
+ *       the v4 double delete: an old DELETE's {@code DELETED} can no longer complete a newer op.</li>
+ * </ol>
+ * An even version above {@code versions.current()} is a bug: it is logged and treated as a
+ * physical observation only.
  *
- * <p><b>Why marks are only set by segments.</b> A report's listing is taken after every change up
- * to its baseline {@code M} happened, and hold-back guarantees that nothing numbered above
- * {@code M} arrives before the report completes. A replica created from a change {@code <= M} that
- * the listing did not see must have been deleted before the listing, so removing it at completion
- * (its mark is not the session's) is correct. A replica created at commit from a receipt keeps the
- * receipt's {@code seenInSession} as its mark.
- *
- * <p>For the same reason the listing is newer than any change {@code <= M}: once a segment has
- * listed a chunk (its replica or receipt carries this session's mark), a change {@code <= M} for
- * that chunk that arrives later is older news and does not change it. And a listed copy that is
- * neither bad nor mismatched is OK, also when it was CORRUPT from an older change, unless its
- * DELETE was already delivered (I5).
+ * <p><b>Why a listed chunk skips older changes.</b> A listing is taken after every change up to its
+ * baseline M; a change ≤ M for a chunk the open session already listed is older news, so its physical
+ * part is skipped (its completion part still runs: it only ends ops whose result the version proves).
  */
 @Component
 public class ChangeApplier {
@@ -83,7 +87,6 @@ public class ChangeApplier {
         applyChanges(workerId, epoch, run, 0, Long.MAX_VALUE);
     }
 
-    /** Applies {@code run} from index {@code from} until done or the deadline; returns where to resume. */
     private int applyChanges(String workerId, long epoch, List<Change> run, int from, long deadline) {
         WorkerInfo worker = current(workerId, epoch);
         if (worker == null) {
@@ -113,13 +116,9 @@ public class ChangeApplier {
         if (change.type() == null || chunkId == null || !ChunkIds.isValid(chunkId)) {
             return;
         }
-        if (change.type() != com.objectstore.common.dto.ChangeType.CMD_FAILED && listedInOpenSession(worker, chunkId, change.seq())) {
-            return; // the report's listing is newer than this change (see the class comment)
-        }
         switch (change.type()) {
-            case RECEIVED -> received(worker, chunkId, change.size() == null ? -1 : change.size(), change.checksum());
-            case DELETED -> deleted(worker, chunkId);
-            case BAD -> bad(worker, chunkId);
+            case RECEIVED -> received(worker, change);
+            case DELETED -> deleted(worker, change);
             case CMD_FAILED -> cmdFailed(worker, change);
         }
     }
@@ -138,104 +137,170 @@ public class ChangeApplier {
         return receipt != null && receipt.seenInSession == session.number;
     }
 
-    private void received(WorkerInfo worker, String chunkId, long size, String checksum) {
+    /** An even version above the highest one issued is a bug: only its physical part is applied. */
+    private boolean completable(WorkerInfo worker, Change change) {
+        long version = change.version();
+        if (!InternalApi.isControllerVersion(version)) {
+            return false;                                      // a worker observation (odd) or none
+        }
+        if (version > cluster.versions().current()) {
+            cluster.increment("future_versions");
+            log.error("[report] BUG {} reported {} {} at version {}, above the highest issued {}; physical only",
+                    worker.workerId, change.type(), change.chunkId(), version, cluster.versions().current());
+            return false;
+        }
+        return true;
+    }
+
+    private void received(WorkerInfo worker, Change change) {
         String workerId = worker.workerId;
+        String chunkId = change.chunkId();
+        long size = change.size() == null ? -1 : change.size();
+        boolean older = listedInOpenSession(worker, chunkId, change.seq());
         ClusterState.ChunkInfo known = cluster.chunk(chunkId);
         if (known == null) {
             String objectId = ChunkIds.objectIdOf(chunkId);
             if (cluster.pendingUploads().contains(objectId)) {
-                cluster.putReceipt(chunkId, workerId, worker.epoch, size, checksum, 0);
+                if (!older) {
+                    cluster.putReceipt(chunkId, workerId, worker.epoch, size, change.checksum(), change.version(), 0);
+                }
             } else if (cluster.isGarbage(objectId) && gcAllowed()) {
-                deleteUnknown(workerId, chunkId, "chunk of a failed upload or a deleted object landed; DELETE queued");
+                deleteUnknown(workerId, chunkId, cluster.garbageReason(objectId),
+                        "a copy of a failed upload or a deleted object landed");
             }
-            // otherwise: unknown here; the full report and its safety valve decide
+            // otherwise: unknown here; the next resync and its safety valve decide
             return;
         }
-        boolean matches = known.checksum().equals(checksum) && known.size() == size;
-        Replica replica = cluster.replica(chunkId, workerId);
-        if (!matches) {
-            if (replica == null || replica.state != ReplicaState.CORRUPT) {
-                log.warn("[report] chunk={} on {} CORRUPT (received {} expected {})", chunkId, workerId, checksum,
-                        known.checksum());
+        // 1. The physical part.
+        if (!older) {
+            boolean matches = known.checksum().equals(change.checksum()) && known.size() == size;
+            if (!matches) {
+                log.warn("[report] chunk={} on {} does not match the namespace (received {} expected {}); quarantine",
+                        chunkId, workerId, change.checksum(), known.checksum());
+                cluster.removeReplica(chunkId, workerId);
+                cluster.ops().ensure(chunkId, workerId, Reason.CORRUPT);
+                return;                                   // a mismatched copy completes nothing
             }
-            setCorrupt(chunkId, workerId);
-        } else if (replica == null) {
-            cluster.addReplica(chunkId, workerId, ReplicaState.OK);
-        } else if (replica.state == ReplicaState.CORRUPT) {
-            makeOk(chunkId, workerId, replica, "freshly verified bytes received");
+            cluster.addReplica(chunkId, workerId, change.version());
         }
-        // An EXCESS copy stays EXCESS.
-        completePending(chunkId, workerId);
+        if (change.cmdId() != null && cluster.verifyAnswered(chunkId, workerId, change.cmdId())) {
+            log.debug("[verify] chunk={} on {} verified", chunkId, workerId);
+        }
+        // 2. Completion.
+        if (completable(worker, change)) {
+            Op op = cluster.ops().get(chunkId, workerId);
+            if (op != null && op.kind() == Kind.INSERT && change.version() >= op.version()) {
+                String source = op.source();                  // completing the op releases its source
+                cluster.ops().complete(op);
+                if (op.reason() == Reason.REPAIR) {
+                    long ms = (cluster.now() - op.createdAt()) / 1_000_000;
+                    cluster.record("copied", chunkId, source, workerId, ms + " ms");
+                }
+            }
+        }
     }
 
-    private void deleted(WorkerInfo worker, String chunkId) {
+    private void deleted(WorkerInfo worker, Change change) {
         String workerId = worker.workerId;
-        Replica removed = cluster.removeReplica(chunkId, workerId);   // runs protect()
-        if (removed != null) {
-            String event = switch (removed.state) {
-                case EXCESS -> "trimmed";
-                case CORRUPT -> "invalidated";
-                case OK -> "deleted";
-            };
-            cluster.record(event, chunkId, workerId, null, "worker reported the copy deleted");
+        String chunkId = change.chunkId();
+        boolean older = listedInOpenSession(worker, chunkId, change.seq());
+        Op op = cluster.ops().get(chunkId, workerId);
+        // 1. The physical part.
+        if (!older) {
+            Replica removed = cluster.removeReplica(chunkId, workerId);
+            cluster.removeReceipt(chunkId, workerId);
+            if (InternalApi.DELETED_CORRUPT.equals(change.detail())) {
+                cluster.increment("quarantines");
+                cluster.record("quarantined", chunkId, workerId, null, "the worker quarantined its copy");
+            } else if (InternalApi.DELETED_MISSING.equals(change.detail())) {
+                cluster.record("missing", chunkId, workerId, null, "the file is gone from the worker's disk");
+            } else if (removed != null) {
+                boolean excess = op != null && op.reason() == Reason.EXCESS;
+                cluster.record(excess ? "trimmed" : "deleted", chunkId, workerId, null, "worker reported the copy deleted");
+            }
         }
-        cluster.ledger().completed(chunkId, workerId);
-        cluster.removeReceipt(chunkId, workerId);
+        // 2. Completion.
+        if (completable(worker, change) && op != null && op.kind() == Kind.DELETE && change.version() >= op.version()) {
+            cluster.ops().complete(op);
+        }
     }
 
-    private void bad(WorkerInfo worker, String chunkId) {
-        String workerId = worker.workerId;
-        cluster.removeReceipt(chunkId, workerId);
-        if (cluster.chunk(chunkId) == null) {
-            return;
-        }
-        Replica replica = cluster.replica(chunkId, workerId);
-        if (replica == null || replica.state != ReplicaState.CORRUPT) {
-            log.warn("[integrity] chunk={} on {} CORRUPT (reported by worker)", chunkId, workerId);
-        }
-        setCorrupt(chunkId, workerId);
-    }
-
+    /** The CMD_FAILED table (v5 §3.4): ignored unless an op on the chunk has exactly this version. */
     private void cmdFailed(WorkerInfo worker, Change change) {
-        PendingCopy failed = cluster.removePendingByCommand(change.chunkId(), change.cmdId());
-        if (failed == null) {
-            return; // already ended (time-out, success, DEAD, re-registration, deletion)
+        String chunkId = change.chunkId();
+        Op op = cluster.ops().find(chunkId, change.version());
+        String reason = change.reason() == null ? "" : change.reason();
+        if (op == null) {
+            cluster.increment("cmd_failed_ignored");
+            return;
         }
-        cluster.recordFailure(change.chunkId(), failed.target());
-        cluster.record("failed", change.chunkId(), failed.source(), failed.target(),
-                "the source could not complete the copy: " + change.reason());
+        String reporter = worker.workerId;
+        switch (reason) {
+            case InternalApi.FAILED_STALE -> {
+                cluster.increment("stale_rejections");
+                if (!reporter.equals(op.workerId)) {
+                    return;
+                }
+                cluster.record("stale", chunkId, null, reporter, op.reason() + " v" + op.version()
+                        + " rejected by the worker's version check; reissued");
+                cluster.ops().reissue(op);
+            }
+            case InternalApi.FAILED_BUSY, InternalApi.FAILED_IO_ERROR -> {
+                cluster.ops().toWaiting(op);
+                cluster.ops().tryQueue(op);
+            }
+            case InternalApi.FAILED_NO_LOCAL_COPY, InternalApi.FAILED_LOCAL_COPY_CORRUPT -> {
+                if (op.reason() != Reason.REPAIR || !reporter.equals(op.source())) {
+                    return;
+                }
+                cluster.record("source failed", chunkId, reporter, op.workerId, reason + "; choosing another source");
+                cluster.ops().resource(op);                   // same version; the target is not blamed
+            }
+            case InternalApi.FAILED_TRANSFER -> {
+                cluster.recordFailure(chunkId, op.workerId);
+                cluster.record("failed", chunkId, op.source(), op.workerId,
+                        "the source could not deliver the copy: " + (change.detail() == null ? reason : change.detail()));
+                cluster.ops().drop(op, "transfer failed");
+            }
+            case InternalApi.FAILED_BAD_COMMAND -> {
+                log.error("[report] BUG {} rejected {} as a bad command: {}", reporter, op, change.detail());
+                cluster.ops().drop(op, "bad command");
+            }
+            default -> log.warn("[report] {} CMD_FAILED with unknown reason {} for {}", reporter, reason, op);
+        }
     }
 
-    // ---- report segments ---------------------------------------------------------------------
+    // ---- resync segments -----------------------------------------------------------------------
 
-    /**
-     * Applies one segment of a full report to session {@code sessionNumber}. The first segment
-     * ({@code open}) opens the writer-side session, replacing any older one of this worker.
-     */
+    /** Applies one segment of a listing at once (tests). */
     public void applySegment(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
-                             List<ReportEntry> entries) {
-        applySegment(workerId, epoch, sessionNumber, baseline, open, entries, 0, Long.MAX_VALUE);
+                             long floor, int attempt, List<ReportEntry> entries) {
+        applySegment(workerId, epoch, sessionNumber, baseline, open, floor, attempt, entries, 0, Long.MAX_VALUE);
     }
 
     /** The {@code ApplySegment} task: yields at the deadline and resumes where it stopped. */
     public Task applySegmentTask(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
-                                 List<ReportEntry> entries) {
+                                 long floor, int attempt, List<ReportEntry> entries) {
         int[] cursor = {0};
         return Task.steps("ApplySegment", deadline -> {
-            cursor[0] = applySegment(workerId, epoch, sessionNumber, baseline, open && cursor[0] == 0, entries,
-                    cursor[0], deadline);
+            cursor[0] = applySegment(workerId, epoch, sessionNumber, baseline, open && cursor[0] == 0, floor, attempt,
+                    entries, cursor[0], deadline);
             return cursor[0] < entries.size() ? Task.Step.MORE : Task.Step.DONE;
         });
     }
 
-    private int applySegment(String workerId, long epoch, long sessionNumber, long baseline, boolean open,
-                             List<ReportEntry> entries, int from, long deadline) {
+    private int applySegment(String workerId, long epoch, long sessionNumber, long baseline, boolean open, long floor,
+                             int attempt, List<ReportEntry> entries, int from, long deadline) {
         WorkerInfo worker = current(workerId, epoch);
         if (worker == null) {
             return entries.size();
         }
         if (open) {
-            cluster.openSession(worker, sessionNumber, baseline);
+            if (!worker.resyncing || worker.fenceFloor != floor || worker.attempt != attempt) {
+                cluster.increment("stale_tasks_dropped");
+                return entries.size();
+            }
+            cluster.openSession(worker, sessionNumber, baseline, floor, attempt);
         }
         ReportSession session = worker.session;
         if (session == null || session.closed || session.number != sessionNumber) {
@@ -268,8 +333,8 @@ public class ChangeApplier {
         if (known == null) {
             String objectId = ChunkIds.objectIdOf(chunkId);
             if (cluster.pendingUploads().contains(objectId)) {
-                cluster.putReceipt(chunkId, workerId, worker.epoch, entry.size(),
-                        entry.bad() ? ClusterState.UNVERIFIED : entry.checksum(), session.number);
+                cluster.putReceipt(chunkId, workerId, worker.epoch, entry.size(), entry.checksum(), entry.version(),
+                        session.number);
             } else if (cluster.isGarbage(objectId)) {
                 session.garbage.add(chunkId);
             } else {
@@ -277,63 +342,66 @@ public class ChangeApplier {
             }
             return;
         }
-        boolean good = !entry.bad() && known.checksum().equals(entry.checksum()) && known.size() == entry.size();
-        Replica replica = cluster.replica(chunkId, workerId);
-        if (!good) {
-            if (replica == null || replica.state != ReplicaState.CORRUPT) {
-                log.warn("[report] chunk={} on {} CORRUPT (listed {}{}, expected {})", chunkId, workerId,
-                        entry.checksum(), entry.bad() ? " and known bad" : "", known.checksum());
-            }
-            replica = setCorrupt(chunkId, workerId);
-        } else if (replica == null) {
-            replica = cluster.addReplica(chunkId, workerId, ReplicaState.OK);
-            completePending(chunkId, workerId);
-        } else if (replica.state == ReplicaState.CORRUPT) {
-            makeOk(chunkId, workerId, replica, "the full report lists a verified copy");
-            completePending(chunkId, workerId);
+        if (!known.checksum().equals(entry.checksum()) || known.size() != entry.size()) {
+            log.warn("[report] chunk={} on {} does not match the namespace (listed {}, expected {}); quarantine",
+                    chunkId, workerId, entry.checksum(), known.checksum());
+            cluster.removeReplica(chunkId, workerId);
+            cluster.ops().ensure(chunkId, workerId, Reason.CORRUPT);
+            return;
         }
+        Replica replica = cluster.addReplica(chunkId, workerId, entry.version());
         if (replica != null) {
             replica.mark = session.number;
         }
     }
 
-    /** The {@code CompleteReport} task: {@link #completeReport} in steps of at most 1000 items. */
-    public Task completeReportTask(String workerId, long epoch, long sessionNumber, long baseline) {
-        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline);
-        return Task.steps("CompleteReport", completion::step);
+    // ---- completion (v5 §5.6) ------------------------------------------------------------------
+
+    /** The {@code Completion} task, in slices. */
+    public Task completeReportTask(String workerId, long epoch, long sessionNumber, long baseline, long floor,
+                                   int attempt) {
+        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline, floor, attempt);
+        return Task.steps("Completion", completion::step);
     }
 
-    /** Completes a report at once (tests). */
-    public void completeReport(String workerId, long epoch, long sessionNumber, long baseline) {
-        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline);
+    /** Completes a listing at once (tests). */
+    public void completeReport(String workerId, long epoch, long sessionNumber, long baseline, long floor, int attempt) {
+        Completion completion = new Completion(workerId, epoch, sessionNumber, baseline, floor, attempt);
         while (completion.step(Long.MAX_VALUE) == Task.Step.MORE) {
             // all steps in one go
         }
     }
 
     /**
-     * Completing a report session (a multi-step task): orphan GC (if allowed), then removal of the
-     * worker's copies that the report did not list (their mark is not this session's), then the
-     * bookkeeping; {@code applied} catches up with the baseline. Every step re-checks the epoch
-     * and the session, and leaves the state consistent.
+     * Completing a resync, in this order: (1) re-check {@code applied ≤ baseline}; (2) drop every op
+     * targeting the worker with version ≤ t0 (the fence made them unrunnable; the planner re-derives
+     * what is still needed with fresh versions); (3) collect garbage and orphans with {@code ensure}
+     * (after 2, so nothing just created is dropped); (4) sweep the worker's unmarked replicas; (5)
+     * {@code resyncing = false}, {@code lastCompleted = (t0, attempt)}, reported. Every step re-checks
+     * the epoch and the session and leaves the state consistent.
      */
     private final class Completion {
         private final String workerId;
         private final long epoch;
         private final long number;
         private final long baseline;
-        private int phase;                    // 0 = GC, 1 = sweep, 2 = done
+        private final long floor;
+        private final int attempt;
+        private int phase;
         private List<String> sweep;
         private int cursor;
+        private int dropped;
         private int garbage;
         private int orphans;
         private int missing;
 
-        Completion(String workerId, long epoch, long number, long baseline) {
+        Completion(String workerId, long epoch, long number, long baseline, long floor, int attempt) {
             this.workerId = workerId;
             this.epoch = epoch;
             this.number = number;
             this.baseline = baseline;
+            this.floor = floor;
+            this.attempt = attempt;
         }
 
         Task.Step step(long deadline) {
@@ -342,55 +410,81 @@ public class ChangeApplier {
                 return Task.Step.DONE;
             }
             ReportSession session = worker.session;
-            if (session == null || session.closed || session.number != number) {
+            if (session == null || session.closed || session.number != number || !worker.resyncing
+                    || worker.fenceFloor != floor || worker.attempt != attempt) {
                 cluster.increment("stale_tasks_dropped");
                 return Task.Step.DONE;
             }
-            if (phase == 0) {
-                collectGarbage(session);
-                sweep = new ArrayList<>(cluster.chunksOn(workerId));
-                phase = 1;
-                return Task.Step.MORE;
-            }
-            int items = 0;
-            while (cursor < sweep.size()) {
-                String chunkId = sweep.get(cursor++);
-                Replica replica = cluster.replica(chunkId, workerId);
-                if (replica != null && replica.mark != number) {
-                    cluster.removeReplica(chunkId, workerId);   // runs protect()
-                    missing++;
-                    log.warn("[report] missing chunk={} on {} (was {})", chunkId, workerId, replica.state);
-                }
-                if (++items >= NamespaceTasks.STEP_ITEMS || System.nanoTime() >= deadline) {
-                    if (cursor < sweep.size()) {
-                        return Task.Step.MORE;
+            switch (phase) {
+                case 0 -> {
+                    if (worker.applied > baseline) {             // cannot happen: the queue is FIFO
+                        cluster.newAttempt(worker, "applied " + worker.applied + " > baseline " + baseline);
+                        return Task.Step.DONE;
                     }
+                    dropped = cluster.ops().dropTargeting(workerId, floor, "resync completion: below fence " + floor);
+                    phase = 1;
+                    return Task.Step.MORE;
+                }
+                case 1 -> {
+                    collectGarbage(session);
+                    sweep = new ArrayList<>(cluster.chunksOn(workerId));
+                    phase = 2;
+                    return Task.Step.MORE;
+                }
+                default -> {
+                    int items = 0;
+                    while (cursor < sweep.size()) {
+                        String chunkId = sweep.get(cursor++);
+                        Replica replica = cluster.replica(chunkId, workerId);
+                        if (replica != null && replica.mark != number) {
+                            cluster.removeReplica(chunkId, workerId);
+                            missing++;
+                            log.warn("[report] chunk={} not listed by {}: removed from the map", chunkId, workerId);
+                        }
+                        if (++items >= NamespaceTasks.STEP_ITEMS || System.nanoTime() >= deadline) {
+                            if (cursor < sweep.size()) {
+                                return Task.Step.MORE;
+                            }
+                        }
+                    }
+                    finish(worker, session);
+                    return Task.Step.DONE;
                 }
             }
+        }
+
+        private void finish(WorkerInfo worker, ReportSession session) {
+            worker.resyncing = false;
+            worker.lastCompletedFloor = floor;
+            worker.lastCompletedAttempt = attempt;
             worker.hasReported = true;
             worker.lastReportAt = cluster.now();
+            worker.nextPeriodicAt = 0;                         // the monitor draws the next periodic time
+            worker.periodicResync = false;
             worker.applied = Math.max(worker.applied, baseline);
             cluster.closeSession(worker);
-            cluster.ledger().retryWorker(workerId);        // its deletions can be queued now
+            cluster.markInsertTargetsDirty(workerId);
+            for (Op op : cluster.ops().opsOn(workerId)) {
+                cluster.ops().tryQueue(op);                    // its waiting deletions can go out now
+            }
             cluster.releasePostponed(properties.postponedBudget());
-            log.info("[report] {} full report {} complete: listed={} missing={} garbage={} orphans={} baseline={}",
-                    workerId, worker.rxSession == number ? Registry.shortId(worker.rxReportId) : "#" + number,
-                    session.listed, missing, garbage, orphans, baseline);
-            return Task.Step.DONE;
+            log.info("[report] {} resync fence {} attempt {} complete: listed={} missing={} garbage={} orphans={} "
+                    + "ops dropped={} baseline={}", workerId, floor, attempt, session.listed, missing, garbage, orphans,
+                    dropped, baseline);
         }
 
         private void collectGarbage(ReportSession session) {
             if (!gcAllowed()) {
-                return;                       // asked again later (Block 14)
+                return;                       // the GC-triggered resync collects it later
             }
             for (String chunkId : session.garbage) {
                 if (cluster.chunk(chunkId) == null && deleteUnknown(workerId, chunkId,
-                        "chunk of a failed upload or a deleted object; DELETE queued")) {
+                        cluster.garbageReason(ChunkIds.objectIdOf(chunkId)), "a copy of a failed upload or a deleted object")) {
                     garbage++;
                 }
             }
-            // Safety valve, over the whole report: a report that would delete much of a worker's
-            // data the controller cannot account for is more likely a bug or a wrong database.
+            // The orphan safety valve, over the whole listing: a resync that would delete much of a
+            // worker's data the controller cannot account for is more likely a bug or a wrong database.
             if (session.orphans.size() > ORPHAN_VALVE_MIN
                     && (double) session.orphans.size() / Math.max(1, session.listed) > properties.orphanGcMaxFraction()) {
                 log.error("[report] orphan GC refused on {}: {} of {} chunks unknown", workerId, session.orphans.size(),
@@ -398,7 +492,8 @@ public class ChangeApplier {
                 cluster.increment("orphan_gc_refused");
             } else {
                 for (String chunkId : session.orphans) {
-                    if (cluster.chunk(chunkId) == null && deleteUnknown(workerId, chunkId, "unknown chunk on disk; DELETE queued")) {
+                    if (cluster.chunk(chunkId) == null && deleteUnknown(workerId, chunkId, Reason.ORPHAN,
+                            "unknown chunk on disk")) {
                         orphans++;
                     }
                 }
@@ -408,48 +503,21 @@ public class ChangeApplier {
 
     // ---- helpers -----------------------------------------------------------------------------
 
-    /** A ledger DELETE for a chunk the namespace does not know (orphan GC); false if one was already tracked. */
-    private boolean deleteUnknown(String workerId, String chunkId, String reason) {
-        if (cluster.ledger().entry(chunkId, workerId) != null) {
+    /** A DELETE for a chunk the namespace does not know; false if a DELETE was already pending. */
+    private boolean deleteUnknown(String workerId, String chunkId, Reason reason, String why) {
+        Op existing = cluster.ops().get(chunkId, workerId);
+        if (existing != null && existing.kind() == Kind.DELETE) {
             return false;
         }
-        cluster.ledger().request(chunkId, workerId, DeletionLedger.ORPHAN);
-        cluster.record("orphan", chunkId, workerId, null, reason);
-        return true;
+        Op op = cluster.ops().ensure(chunkId, workerId, reason);
+        if (op != null) {
+            cluster.record("orphan", chunkId, workerId, null, why + "; DELETE (" + reason.wire + ") queued");
+        }
+        return op != null;
     }
 
-    /** The copy becomes CORRUPT (added as CORRUPT if absent); protect() keeps I6 true. */
-    private Replica setCorrupt(String chunkId, String workerId) {
-        Replica replica = cluster.replica(chunkId, workerId);
-        if (replica == null) {
-            replica = cluster.addReplica(chunkId, workerId, ReplicaState.CORRUPT);
-            cluster.protect(chunkId);
-            return replica;
-        }
-        cluster.markCorrupt(chunkId, workerId);
-        return replica;
-    }
-
-    /** CORRUPT → OK on fresh evidence; a delivered DELETE cannot be called back, so that copy stays CORRUPT. */
-    private void makeOk(String chunkId, String workerId, Replica replica, String why) {
-        if (replica.deleteDelivered) {
-            return;
-        }
-        cluster.ledger().cancel(chunkId, workerId);   // a corrupt copy's undelivered DELETE
-        cluster.setReplicaState(chunkId, workerId, ReplicaState.OK);
-        log.info("[report] chunk={} on {} OK again ({})", chunkId, workerId, why);
-    }
-
-    private void completePending(String chunkId, String workerId) {
-        PendingCopy completed = cluster.removePending(chunkId, workerId);
-        if (completed == null) {
-            return;
-        }
-        long ms = (cluster.now() - completed.startedAt()) / 1_000_000;
-        if (completed.kind() == PendingKind.UPLOAD) {
-            log.debug("[report] upload copy of chunk={} on {} confirmed after {} ms", chunkId, workerId, ms);
-        } else {
-            cluster.record("copied", chunkId, completed.source(), workerId, ms + " ms");
-        }
+    /** Copies from a change type to its log name (for tests and logs). */
+    static String name(ChangeType type) {
+        return type.name();
     }
 }

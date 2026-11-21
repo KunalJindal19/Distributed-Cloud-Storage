@@ -50,9 +50,9 @@
   code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
   .tag { display: inline-block; min-width: 40px; padding: 2px 8px; border-radius: 6px; font-weight: 700; font-size: 13px; text-align: center; }
   .tag.OK, .tag.copied, .tag.HEALTHY, .tag.restored { background: var(--ok-bg); color: var(--ok); }
-  .tag.C, .tag.unrecoverable, .tag.CORRUPT { background: var(--bad-bg); color: var(--bad); }
-  .tag.E, .tag.trimmed, .tag.deleted, .tag.orphan, .tag.down { background: var(--idle-bg); color: var(--idle); }
-  .tag.invalidated, .tag.timeout, .tag.DEGRADED { background: var(--warn-bg); color: var(--warn); }
+  .tag.C, .tag.unrecoverable, .tag.CORRUPT, .tag.quarantined { background: var(--bad-bg); color: var(--bad); }
+  .tag.E, .tag.trimmed, .tag.deleted, .tag.orphan, .tag.down, .tag.missing { background: var(--idle-bg); color: var(--idle); }
+  .tag.invalidated, .tag.timeout, .tag.DEGRADED, .tag.stale, .tag.failed { background: var(--warn-bg); color: var(--warn); }
   .tag.replicate { background: var(--info-bg); color: var(--info); }
   .empty { color: var(--muted); padding: 6px 0; }
   .reason { white-space: normal; color: var(--muted); }
@@ -73,11 +73,14 @@
     <a href="/app" style="font-size:15px">Open the web client →</a>
   </header>
   <div class="banner" id="banner">controller unreachable &mdash; retrying every 2 s</div>
-  <div class="banner" id="safemode">SAFE MODE &mdash; waiting for block reports; writes are refused and nothing is repaired or deleted</div>
+  <div class="banner" id="safemode">SAFE MODE &mdash; waiting for the workers' resyncs; writes are refused and nothing is repaired or deleted</div>
 
   <section class="grid kpis" id="kpis"></section>
 
-  <h2>Writer, priority levels and deletion ledger</h2>
+  <h2>Pending operations, resyncs and VERIFY</h2>
+  <section class="grid kpis" id="ops"></section>
+
+  <h2>Writer and priority levels</h2>
   <section class="grid kpis" id="engine"></section>
 
   <h2>Workers</h2>
@@ -129,7 +132,7 @@ function renderStatus(status) {
   const c = status.config;
   $("config").textContent = `cluster ${status.cluster_id.slice(0, 8)} · chunk ${c.chunk_size / 1048576} MiB · ` +
       `replication factor ${c.replication_factor} · STALE after ${c.stale_after} s · DEAD after ${c.dead_after} s · ` +
-      `monitor every ${c.monitor_interval} s`;
+      `monitor every ${c.monitor_interval} s · term ${status.term}`;
   $("safemode").style.display = status.safe_mode ? "block" : "none";
 
   const r = status.replicas;
@@ -137,17 +140,34 @@ function renderStatus(status) {
   $("kpis").replaceChildren(
       kpi("Objects", status.objects),
       kpi("Chunks", status.chunks),
-      kpi("Copies OK", r.ok),
+      kpi("Copies available (ALIVE)", r.ok + r.corrupt + r.excess - (r.on_stale_workers || 0)),
+      kpi("Copies uncertain (STALE)", r.on_stale_workers || 0, r.on_stale_workers > 0 ? "warn" : ""),
       kpi("Under-replicated", status.under_replicated, status.under_replicated > 0 ? "alert" : ""),
-      kpi("Pending copies", status.pending_replications, status.pending_replications > 0 ? "warn" : ""),
-      kpi("Missing chunks", status.missing_chunks, status.missing_chunks > 0 ? "alert" : ""),
-      kpi("Corrupt copies", r.corrupt, r.corrupt > 0 ? "alert" : ""),
-      kpi("Excess copies", r.excess, r.excess > 0 ? "warn" : ""),
+      kpi("Copies on their way", status.pending_replications, status.pending_replications > 0 ? "warn" : ""),
+      kpi("Unrecoverable (no live copy)", status.missing_chunks, status.missing_chunks > 0 ? "alert" : ""),
+      kpi("Being quarantined", r.corrupt, r.corrupt > 0 ? "alert" : ""),
+      kpi("Surplus being deleted", r.excess, r.excess > 0 ? "warn" : ""),
       kpi("Invariant violations", violations, violations > 0 ? "alert" : ""));
 
-  // The event-driven core: the writer's queue, the (L,P) levels and the deletion ledger.
+  // v5: pending ops by kind and reason, resyncs, VERIFY credit, stale rejections.
+  const reasons = (status.ops && status.ops.by_reason) || {};
+  const states = (status.ops && status.ops.by_state) || {};
+  const n = (k) => status.counters[k] || 0;
+  $("ops").replaceChildren(
+      kpi("INSERT repair · upload", `${reasons.repair || 0} · ${reasons.upload || 0}`, (reasons.repair || 0) > 0 ? "warn" : ""),
+      kpi("DELETE excess · corrupt", `${reasons.excess || 0} · ${reasons.corrupt || 0}`, (reasons.corrupt || 0) > 0 ? "alert" : ""),
+      kpi("DELETE object · upload failed · orphan",
+          `${reasons.object_deleted || 0} · ${reasons.upload_failed || 0} · ${reasons.orphan || 0}`),
+      kpi("Ops waiting · queued · sent", `${states.waiting || 0} · ${states.queued || 0} · ${states.sent || 0}`),
+      kpi("Surplus waiting for VERIFY", status.postponed_size, status.postponed_size > 0 ? "warn" : ""),
+      kpi("VERIFYs outstanding", status.verify_outstanding),
+      kpi("Workers resyncing", status.resyncing, status.resyncing > 0 ? "warn" : ""),
+      kpi("Stale ops rejected", n("stale_rejections")),
+      kpi("Quarantines", n("quarantines"), n("quarantines") > 0 ? "warn" : ""),
+      kpi("Ops resent", n("ops_resent")));
+
+  // The event-driven core: the writer's queue and the (L,P) levels.
   const levels = status.levels || {};
-  const ledger = status.ledger || {waiting: 0, queued: 0, delivered: 0};
   const levelCards = Object.entries(levels).map(([lp, size]) => {
     const live = Number(lp.split(",")[0]);
     return kpi(`Level (${lp})${live === 0 ? " · no live copy" : ""}`, size, size > 0 ? (live === 0 ? "alert" : "warn") : "");
@@ -159,8 +179,7 @@ function renderStatus(status) {
       kpi("Longest lock hold (ms)", status.lock_max_hold_ms),
       ...levelCards,
       kpi("Cleanup / postponed", `${status.cleanup_size} / ${status.postponed_size}`),
-      kpi("Ledger waiting · queued · delivered", `${ledger.waiting} · ${ledger.queued} · ${ledger.delivered}`),
-      kpi("Report sessions open", status.report_sessions_open));
+      kpi("Resync listings open", status.report_sessions_open));
 
   const workers = [...status.workers].sort((a, b) => a.worker_id.localeCompare(b.worker_id, undefined, {numeric: true}));
   $("workers").replaceChildren(...workers.map((w) =>
@@ -169,9 +188,15 @@ function renderStatus(status) {
           el("dl", {},
               el("dt", {}, "address"), el("dd", {class: "mono"}, w.url),
               el("dt", {}, "process"), el("dd", {class: "mono"}, w.boot_id + (w.has_reported ? "" : " (not reported)")),
+              el("dt", {}, "fence"), el("dd", {class: "mono"}, w.resyncing
+                  ? `${w.fence} · resyncing, attempt ${w.attempt}` : String(w.fence)),
               el("dt", {}, "last heartbeat"), el("dd", {}, w.last_seen_s_ago.toFixed(1) + " s ago"),
               el("dt", {}, "chunk copies"), el("dd", {}, w.chunk_count),
               el("dt", {}, "free space"), el("dd", {}, w.stats ? bytes(w.stats.free_bytes) : "?"),
+              el("dt", {}, "quarantined"), el("dd", {}, w.stats
+                  ? `${w.stats.quarantined_chunks || 0} copies · ${bytes(w.stats.quarantined_bytes || 0)}` : "?"),
+              el("dt", {}, "tombstones"), el("dd", {}, w.stats ? (w.stats.tombstones || 0) : "?"),
+              el("dt", {}, "pending ops"), el("dd", {}, w.pending_ops),
               el("dt", {}, "commands queued"), el("dd", {}, w.queued_commands),
               el("dt", {}, "copies sending"), el("dd", {}, w.pending_as_source)))));
 
@@ -257,7 +282,14 @@ async function runFsck() {
         el("dl", {},
             el("dt", {}, "objects"), el("dd", {}, `${r.objects.total} total, ${r.objects.healthy} healthy, ` +
                 `${r.objects.under_replicated} under-replicated, ${r.objects.missing} with a missing chunk`),
-            el("dt", {}, "corrupt copies"), el("dd", {}, r.objects.corrupt_replicas),
+            el("dt", {}, "copies being quarantined"), el("dd", {}, r.objects.corrupt_replicas),
+            el("dt", {}, "chunks short of copies"), el("dd", {}, r.chunks ? r.chunks.under_replicated : "?"),
+            el("dt", {}, "unrecoverable chunks"), el("dd", {class: "mono"}, r.chunks ? list(r.chunks.unrecoverable) : "?"),
+            el("dt", {}, "chunks with a surplus"), el("dd", {}, r.chunks ? r.chunks.excess : "?"),
+            el("dt", {}, "workers not current / quarantines"), el("dd", {}, r.workers && r.workers.length
+                ? r.workers.map((w) => `${w.worker_id}: ${w.state}${w.reported ? "" : ", not reported"}${w.resyncing ? ", resyncing" : ""}` +
+                    (w.quarantined_chunks ? `, ${w.quarantined_chunks} quarantined (${bytes(w.quarantined_bytes)})` : "")).join(" · ")
+                : "none"),
             el("dt", {}, "orphans on disk"), el("dd", {}, r.orphans_on_disk),
             el("dt", {}, "on disk, not in map"), el("dd", {class: "mono"}, list(d.on_disk_not_in_map)),
             el("dt", {}, "in map, not on disk"), el("dd", {class: "mono"}, list(d.in_map_not_on_disk)),

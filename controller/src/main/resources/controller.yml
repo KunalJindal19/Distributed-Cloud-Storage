@@ -44,10 +44,8 @@ objectstore:
   stale-ratio: ${STALE_RATIO:0.5}
   health-interval-seconds: ${HEALTH_INTERVAL:1}
   monitor-interval-seconds: ${MONITOR_INTERVAL:3}
-  pending-timeout-seconds: ${PENDING_TIMEOUT:15}
   target-backoff-seconds: ${TARGET_BACKOFF:30}
   max-streams: ${MAX_STREAMS:2}
-  command-ttl-seconds: ${COMMAND_TTL:30}
   max-commands-per-worker: ${MAX_COMMANDS_PER_WORKER:1000}
   max-message-age-seconds: ${MAX_MESSAGE_AGE:10}
   safe-mode-threshold: ${SAFE_MODE_THRESHOLD:0.999}
@@ -56,7 +54,6 @@ objectstore:
   orphan-gc-delay-seconds: ${ORPHAN_GC_DELAY:60}
   orphan-gc-max-fraction: ${ORPHAN_GC_MAX_FRACTION:0.5}
   min-free-bytes: ${MIN_FREE_BYTES:16777216}
-  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:300}
   connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
   read-timeout-seconds: ${READ_TIMEOUT:10}
   invariant-checks: ${INVARIANT_CHECKS:true}
@@ -68,6 +65,16 @@ objectstore:
   planner-visit-budget: ${PLANNER_VISIT_BUDGET:2000}
   postponed-budget: ${POSTPONED_BUDGET:1000}
   rolling-check-chunks: ${ROLLING_CHECK_CHUNKS:1000}
+  # v5: versioned operations, fenced resyncs and VERIFY (README "Configuration").
+  op-resend-initial-seconds: ${OP_RESEND_INITIAL:15}
+  op-resend-max-seconds: ${OP_RESEND_MAX:240}
+  op-max-insert-attempts: ${OP_MAX_INSERT_ATTEMPTS:5}
+  resync-interval-seconds: ${RESYNC_INTERVAL:3600}
+  resync-jitter: ${RESYNC_JITTER:0.1}
+  resync-max-concurrent: ${RESYNC_MAX_CONCURRENT:1}
+  resync-stall-timeout-seconds: ${RESYNC_STALL_TIMEOUT:60}
+  verify-fresh-for-delete-seconds: ${VERIFY_FRESH_FOR_DELETE:3600}
+  verify-resend-seconds: ${VERIFY_RESEND:60}
   # Showcase output (docker-compose.showcase.yml): every message to and from the workers, and the
   # cluster state every N seconds. Off by default.
   trace-messages: ${TRACE_MESSAGES:off}
