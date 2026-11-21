@@ -19,8 +19,9 @@ class ChangeStreamSystemTest extends ClusterTest {
     @Override
     void configure(InProcessCluster cluster) {
         cluster.workerSetting("worker.report-segment-size", "1");          // one chunk per segment: slow reports
-        cluster.workerSetting("worker.full-report-interval-seconds", "1.5"); // a periodic report to land in
-        cluster.controllerSetting("objectstore.pending-timeout-seconds", "15");
+        cluster.controllerSetting("objectstore.resync-interval-seconds", "1.5"); // a periodic resync to land in
+        cluster.controllerSetting("objectstore.op-resend-initial-seconds", "15");
+        cluster.controllerSetting("objectstore.op-resend-max-seconds", "60");
     }
 
     @AfterEach
@@ -40,54 +41,48 @@ class ChangeStreamSystemTest extends ClusterTest {
     }
 
     @Test
-    void edge9_anUploadDuringAFullReportIsRecordedWhenTheReportCompletesWithoutAnExtraCopy() {
-        // Give worker1 several chunks, so that its full report has several (slow) segments.
+    void edge9_anUploadDuringAResyncSkipsTheResyncingWorkerAndNeedsNoRepair() {
+        // Give worker1 several chunks, so that its resync listing has several (slow) segments.
         for (int i = 0; i < 30 && cluster.chunkFilesOn("worker1").size() < 3; i++) {
             api.uploadOk("pre-" + i + ".bin", Api.randomBytes(2 * MIB, 50 + i));
         }
-        assertThat(cluster.chunkFilesOn("worker1")).as("worker1's report needs several segments").hasSizeGreaterThanOrEqualTo(3);
+        assertThat(cluster.chunkFilesOn("worker1")).as("worker1's listing needs several segments").hasSizeGreaterThanOrEqualTo(3);
         awaitHealthy();
         ControllerLink link = cluster.workerBean("worker1", ControllerLink.class);
         ControllerLink.delaySegmentsForTests("worker1", SEGMENT_DELAY_MS);
-        // Wait for worker1's next periodic report to start.
+        // Wait for worker1's next periodic resync to start.
         await().atMost(PATIENCE).pollInterval(Duration.ofMillis(5)).until(() -> link.reportInProgress() != null);
         String reportId = link.reportInProgress();
 
-        // Four chunks rotate around the four-worker ring: worker1 holds some of them.
+        // Four chunks rotate around the ring of write-eligible workers: a resyncing worker is not one (v5 §5.2).
         byte[] data = Api.randomBytes(4 * MIB, 77);
         String id = api.uploadOk("during.bin", data);
-        assertThat(link.reportInProgress()).as("the upload landed during the report").isEqualTo(reportId);
-
-        List<Integer> onWorker1 = new ArrayList<>();
+        assertThat(link.reportInProgress()).as("the upload happened during the resync").isEqualTo(reportId);
         for (int index = 0; index < 4; index++) {
-            if (cluster.chunkFilesOn("worker1").contains(id + "-%05d".formatted(index))) {
-                onWorker1.add(index);
-            }
-        }
-        assertThat(onWorker1).isNotEmpty();
-        // Held back: the controller does not list worker1's copies yet, but they are not repaired either.
-        for (int index : onWorker1) {
-            assertThat(api.holders(id, index)).doesNotContain("worker1");
+            assertThat(cluster.chunkFilesOn("worker1")).doesNotContain(id + "-%05d".formatted(index));
+            assertThat(api.holders(id, index)).as("chunk %d has RF copies at once", index).hasSize(2)
+                    .doesNotContain("worker1");
         }
         assertThat(api.download(id).body()).as("reads work meanwhile").isEqualTo(data);
 
-        // Once the report completes, the held-back RECEIVED records the copies.
         await().atMost(PATIENCE).until(() -> !reportId.equals(link.reportInProgress()));
-        await().atMost(PATIENCE).untilAsserted(() -> {
-            for (int index : onWorker1) {
-                assertThat(api.holders(id, index)).contains("worker1");
-            }
-        });
         awaitHealthy();
         JsonNode log = api.status().get("repair_log");
         for (JsonNode event : log) {
             if (event.get("chunk_id") != null && event.get("chunk_id").asString().startsWith(id)) {
                 assertThat(event.get("event").asString()).as("no repair for the uploaded object")
-                        .isNotIn("replicate", "copied", "timeout");
+                        .isNotIn("replicate", "copied", "timeout", "trimmed");
             }
         }
-        for (int index = 0; index < 4; index++) {
-            assertThat(api.holders(id, index)).as("chunk %d has exactly RF copies", index).hasSize(2);
-        }
+        // Once the resync completed, worker1 takes new data again.
+        ControllerLink.delaySegmentsForTests("worker1", 0);
+        await().atMost(PATIENCE).untilAsserted(() -> {
+            String later = api.uploadOk("after.bin", Api.randomBytes(4 * MIB, 78));
+            boolean onWorker1 = false;
+            for (int index = 0; index < 4; index++) {
+                onWorker1 |= api.holders(later, index).contains("worker1");
+            }
+            assertThat(onWorker1).isTrue();
+        });
     }
 }

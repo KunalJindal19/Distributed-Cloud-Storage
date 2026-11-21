@@ -20,7 +20,7 @@ class FsckSystemTest extends ClusterTest {
      */
     @Override
     void configure(InProcessCluster cluster) {
-        cluster.workerSetting("worker.full-report-interval-seconds", "1.5");
+        cluster.controllerSetting("objectstore.resync-interval-seconds", "1.5");
     }
 
     private JsonNode fsck() {

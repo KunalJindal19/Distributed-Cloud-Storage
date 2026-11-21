@@ -91,15 +91,20 @@ class PlacementPolicyTest {
     }
 
     @Test
-    void excessCopiesComeOffTheBusiestWorkerAndNeverBelowTheReplicationFactor() {
+    void theExcessVictimIsAnUnverifiedCopyFirstThenTheBusiestWorker() {
         t.knowChunk(TestSupport.chunk(0));
         t.knowChunk(TestSupport.chunk(1));
         t.join("worker1", TestSupport.chunk(0));
         t.join("worker2", TestSupport.chunk(0), TestSupport.chunk(1));
         t.join("worker3", TestSupport.chunk(0));
 
-        assertThat(cluster.locked(() -> placement.chooseExcess(TestSupport.chunk(0), 1))).containsExactly("worker2");
-        assertThat(cluster.locked(() -> placement.chooseExcess(TestSupport.chunk(0), 5))).hasSize(1);
+        assertThat(cluster.locked(() -> placement.chooseVictim(TestSupport.chunk(0)))).contains("worker2");
+        cluster.locked(() -> {
+            var replica = cluster.replica(TestSupport.chunk(0), "worker2");
+            replica.verifiedEpoch = cluster.worker("worker2").verifyEpoch;      // worker2's copy is verified now
+            replica.verifiedAt = cluster.now();
+        });
+        assertThat(cluster.locked(() -> placement.chooseVictim(TestSupport.chunk(0)))).contains("worker3");
     }
 
     @Test
@@ -108,7 +113,7 @@ class PlacementPolicyTest {
         t.join("worker1", TestSupport.chunk(0));
         t.join("worker2", TestSupport.chunk(0));
         t.join("worker3");
-        cluster.locked(() -> cluster.markCorrupt(TestSupport.chunk(0), "worker2"));
+        cluster.locked(() -> cluster.ops().ensure(TestSupport.chunk(0), "worker2", com.objectstore.controller.cluster.PendingOps.Reason.CORRUPT));
 
         assertThat(cluster.locked(() -> placement.chooseTarget(TestSupport.chunk(0)))).contains("worker3");
         assertThat(cluster.locked(() -> placement.chooseSource(TestSupport.chunk(0)))).contains("worker1");

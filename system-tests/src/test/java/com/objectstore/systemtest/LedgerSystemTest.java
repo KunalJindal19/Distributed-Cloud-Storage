@@ -25,8 +25,7 @@ class LedgerSystemTest extends ClusterTest {
 
     @Override
     void configure(InProcessCluster cluster) {
-        cluster.controllerSetting("objectstore.full-report-interval-seconds", "3600");
-        cluster.workerSetting("worker.full-report-interval-seconds", "3600");
+        cluster.controllerSetting("objectstore.resync-interval-seconds", "3600");
     }
 
     @AfterEach

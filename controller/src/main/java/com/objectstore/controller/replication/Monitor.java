@@ -9,23 +9,23 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * The planner tick (thread {@code planner-loop}, every MONITOR_INTERVAL; v4 §7.3). All its work
- * runs under the write lock in slices of at most MAX_LOCK_HOLD_MS: between slices the lock is
- * released, so heartbeats and the writer are never held up for long.
+ * The planner tick (thread {@code planner-loop}, every MONITOR_INTERVAL). All its work runs under the
+ * write lock in slices of at most MAX_LOCK_HOLD_MS: between slices the lock is released, so
+ * heartbeats and the writer are never held up for long.
  *
  * <ol>
  *   <li>safe mode, from the O(1) {@code safeCount}; while it is on, nothing else runs;</li>
- *   <li>to 5. the {@link ReplicationPlanner}: free streams, under-replication by level, cleanup,
- *       postponed;</li>
- *   <li value="6">the deletion ledger: waiting entries are queued (at most CLEANUP_BUDGET);</li>
- *   <li>every 10th tick, workers whose last full report is older than 2 × FULL_REPORT_INTERVAL are
- *       asked for one;</li>
- *   <li>once orphan GC becomes allowed, every worker is asked for a full report (§6.4);</li>
- *   <li>the rolling invariant check on ROLLING_CHECK_CHUNKS chunks (INVARIANT_CHECKS);</li>
- *   <li>the results are published ({@code blocked}; the levels and sets are read from the index).</li>
+ *   <li>the {@link ReplicationPlanner}: free streams, repair by level, safe excess cleanup with
+ *       VERIFY, postponed, waiting ops;</li>
+ *   <li>periodic resyncs (v5 §5.7): a worker whose last resync is older than RESYNC_INTERVAL ±
+ *       RESYNC_JITTER is resynced, at most RESYNC_MAX_CONCURRENT periodic or GC-triggered resyncs at
+ *       once;</li>
+ *   <li>once orphan GC becomes allowed, every worker is asked for a resync (same limit), so orphans
+ *       seen before are collected;</li>
+ *   <li>the rolling invariant check on ROLLING_CHECK_CHUNKS chunks (INVARIANT_CHECKS).</li>
  * </ol>
  *
- * Pending copies and ledger deadlines expire through the pending-timer, not here.
+ * Unanswered ops are resent through the resend timer, not here.
  */
 @Service
 public class Monitor {
@@ -37,7 +37,6 @@ public class Monitor {
     private final SafeMode safeMode;
     private final ReplicationPlanner planner;
     private final ControllerProperties properties;
-    private long ticks;
     private boolean gcAnnounced;
     private long lastBlockedWarning;
     private volatile ReplicationPlanner.TickResult lastTick;
@@ -66,7 +65,6 @@ public class Monitor {
         cluster.lockWrite();
         sliceEnd[0] = System.nanoTime() + maxHold;
         try {
-            ticks++;
             cluster.purgeExpiredFailures();
             if (safeMode.evaluate()) {
                 return;
@@ -75,13 +73,15 @@ public class Monitor {
             lastTick = result;
             warnIfBlocked(result);
             slicer.check();
-            cluster.ledger().retryWaiting(properties.cleanupBudget());
+            planner.retryWaiting(properties.cleanupBudget(), slicer);
             slicer.check();
-            if (ticks % 10 == 0) {
-                requestOverdueReports();
-            }
             announceGc();
+            startResyncs();
             if (properties.invariantChecks() && properties.rollingCheckChunks() > 0) {
+                // A hold of its own: the check (about 1.5 ms for 1,000 chunks at scale) must not be
+                // added to whatever is left of the last planner slice (found by the scale test).
+                cluster.unlockWrite();
+                cluster.lockWrite();
                 cluster.rollingCheck(properties.rollingCheckChunks());
             }
         } finally {
@@ -102,9 +102,9 @@ public class Monitor {
     }
 
     /**
-     * §6.4: when orphan GC becomes allowed (safe mode off and ORPHAN_GC_DELAY since the start),
-     * every non-dead worker is asked for a full report, once, so orphans seen before are collected
-     * without waiting for FULL_REPORT_INTERVAL.
+     * When orphan GC becomes allowed (safe mode off and ORPHAN_GC_DELAY since the start), every
+     * non-dead worker is asked for a resync, once, so orphans seen before are collected without
+     * waiting for RESYNC_INTERVAL.
      */
     private void announceGc() {
         if (gcAnnounced || cluster.now() - cluster.startedAt() < properties.orphanGcDelay().toNanos()) {
@@ -113,22 +113,37 @@ public class Monitor {
         gcAnnounced = true;
         for (WorkerInfo worker : cluster.workers().values()) {
             if (!worker.isDead()) {
-                worker.fullReportRequested = true;
+                worker.resyncRequested = "orphan GC allowed";
             }
         }
-        log.info("[monitor] orphan GC is allowed now; asking every worker for a full report");
+        log.info("[monitor] orphan GC is allowed now; every worker gets a resync");
     }
 
-    private void requestOverdueReports() {
-        long limit = 2 * properties.fullReportInterval().toNanos();
+    /**
+     * Periodic and GC-triggered resyncs, at most RESYNC_MAX_CONCURRENT at once: a requested one first,
+     * then any worker whose last resync is older than RESYNC_INTERVAL ± RESYNC_JITTER.
+     */
+    private void startResyncs() {
         long now = cluster.now();
-        for (WorkerInfo worker : cluster.workers().values()) {
-            boolean overdue = worker.hasReported ? now - worker.lastReportAt > limit
-                    : worker.session == null && !worker.reportInProgress();
-            if (!worker.isDead() && overdue) {
-                worker.fullReportRequested = true;
-                log.info("[monitor] asking {} for a full report", worker.workerId);
+        int running = cluster.periodicResyncs();
+        for (WorkerInfo worker : cluster.workersSorted()) {
+            if (worker.isDead() || worker.state != ClusterState.WorkerState.ALIVE || !worker.hasReported
+                    || worker.resyncing) {
+                continue;
+            }
+            if (worker.nextPeriodicAt == 0) {
+                double jitter = properties.resyncJitter() * (random.nextDouble() * 2 - 1);
+                worker.nextPeriodicAt = worker.lastReportAt
+                        + (long) (properties.resyncInterval().toNanos() * (1 + jitter));
+            }
+            boolean due = worker.resyncRequested != null || now >= worker.nextPeriodicAt;
+            if (due && running < properties.resyncMaxConcurrent()) {
+                String why = worker.resyncRequested != null ? worker.resyncRequested : "periodic";
+                cluster.startResync(worker, why, true);
+                running++;
             }
         }
     }
+
+    private final java.util.Random random = new java.util.Random();
 }

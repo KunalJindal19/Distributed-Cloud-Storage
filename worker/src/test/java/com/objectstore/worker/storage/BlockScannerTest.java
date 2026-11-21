@@ -1,11 +1,14 @@
 package com.objectstore.worker.storage;
 
+import static com.objectstore.worker.TestSupport.v;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.objectstore.common.Checksums;
+import com.objectstore.common.dto.Change;
+import com.objectstore.common.dto.ChangeType;
 import com.objectstore.common.dto.ChunkInfo;
-import com.objectstore.worker.config.WorkerProperties;
 import com.objectstore.worker.TestSupport;
+import com.objectstore.worker.config.WorkerProperties;
 import com.objectstore.worker.reporting.ChangeLog;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -13,12 +16,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
+import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.springframework.test.util.ReflectionTestUtils;
 
-/** Block 11 (v4 §3.3, §3.5): reconciliation of the index with the disk, verification, the rate limit. */
+/**
+ * The scanner (v5 §4.5): reconciliation of the index with the disk (files placed or removed by hand
+ * are local observations with odd versions), verification with quarantine, the rate limit.
+ */
 class BlockScannerTest {
 
     private static final String OBJECT = "3f1c9a52-7d0e-4c1b-9a54-1f2e3d4c5b6a";
@@ -36,15 +43,10 @@ class BlockScannerTest {
         return "%s-%05d".formatted(OBJECT, i);
     }
 
-    private static WorkerProperties properties(Path dataDir, long rate) {
-        return TestSupport.properties(dataDir, rate, 100_000);
-    }
-
     private void open(long rate) {
-        WorkerProperties properties = properties(dataDir, rate);
+        WorkerProperties properties = TestSupport.properties(dataDir, rate, 100_000);
         changes = new ChangeLog(properties);
-        store = new ChunkStore(properties, changes);
-        ReflectionTestUtils.invokeMethod(store, "initialise");
+        store = TestSupport.openStore(properties, changes);
         scanner = new BlockScanner(store, properties);
         chunkDir = properties.chunkDir();
     }
@@ -57,7 +59,7 @@ class BlockScannerTest {
     private byte[] write(int i, int size) {
         byte[] data = new byte[size];
         new java.util.Random(i).nextBytes(data);
-        store.write(chunk(i), data, Checksums.sha256Hex(data));
+        store.put(chunk(i), v(i + 1), data, Checksums.sha256Hex(data));
         return data;
     }
 
@@ -65,8 +67,14 @@ class BlockScannerTest {
         Files.setLastModifiedTime(chunkDir.resolve(fileName), FileTime.fromMillis(System.currentTimeMillis() - 60_000));
     }
 
+    private List<Path> quarantine() throws IOException {
+        try (Stream<Path> files = Files.list(store.quarantineDir())) {
+            return files.toList();
+        }
+    }
+
     @Test
-    void edge18_aFileRemovedByHandIsReportedDeletedWithinOnePass() throws Exception {
+    void edge18_aFileRemovedByHandIsReportedMissingAtAnOddVersionWithinOnePass() throws Exception {
         write(0, 1000);
         write(1, 1000);
         TestSupport.drain(changes);
@@ -75,14 +83,20 @@ class BlockScannerTest {
 
         scanner.scanOnce();
 
-        assertThat(TestSupport.drain(changes).deleted()).containsExactly(chunk(0));
+        List<Change> deleted = TestSupport.drain(changes).of(ChangeType.DELETED);
+        assertThat(deleted).singleElement().satisfies(change -> {
+            assertThat(change.chunkId()).isEqualTo(chunk(0));
+            assertThat(change.detail()).isEqualTo("missing");
+            assertThat(change.version() & 1).as("a local observation is odd").isEqualTo(1);
+            assertThat(change.version()).isGreaterThan(v(1));
+        });
         assertThat(store.index()).containsOnlyKeys(chunk(1));
         assertThat(store.stats(0).chunks()).isEqualTo(1);
         assertThat(store.stats(0).usedBytes()).isEqualTo(1000);
     }
 
     @Test
-    void edge18_aFileAddedByHandIsIndexedAndReportedReceivedWithItsSidecarRebuilt() throws Exception {
+    void edge18_aFileAddedByHandIsIndexedAtAnOddVersionWithItsSidecarRebuilt() throws Exception {
         byte[] data = new byte[700];
         new java.util.Random(9).nextBytes(data);
         Files.write(chunkDir.resolve(chunk(5)), data);                    // no sidecar
@@ -96,45 +110,49 @@ class BlockScannerTest {
 
         scanner.scanOnce();
 
-        assertThat(TestSupport.drain(changes).received()).containsExactlyInAnyOrder(
+        TestSupport.Drained drained = TestSupport.drain(changes);
+        assertThat(drained.received()).containsExactlyInAnyOrder(
                 new ChunkInfo(chunk(5), 700, Checksums.sha256Hex(data)),
                 new ChunkInfo(chunk(6), 300, Checksums.sha256Hex(other)));
+        assertThat(drained.of(ChangeType.RECEIVED)).allSatisfy(change ->
+                assertThat(change.version() & 1).as("odd: never completes a controller op").isEqualTo(1));
         assertThat(store.readMeta(chunk(5)).orElseThrow().checksum()).isEqualTo(Checksums.sha256Hex(data));
         assertThat(store.index()).containsOnlyKeys(chunk(5), chunk(6));
         assertThat(store.stats(0).usedBytes()).isEqualTo(1000);
     }
 
     @Test
-    void aCorruptedFileIsReportedBadExactlyOnceAndClearedWhenReplaced() throws Exception {
-        byte[] data = write(0, 2000);
+    void aCorruptedFileIsQuarantinedExactlyOnceAndItsBytesAreKept() throws Exception {
+        write(0, 2000);
         write(1, 2000);
         TestSupport.drain(changes);
         Files.write(chunkDir.resolve(chunk(0)), "XXXX".getBytes(StandardCharsets.US_ASCII), StandardOpenOption.WRITE);
 
         assertThat(scanner.scanOnce()).isEqualTo(1);
-        assertThat(scanner.scanOnce()).isEqualTo(1);
-        assertThat(scanner.scanOnce()).isEqualTo(1);
+        assertThat(scanner.scanOnce()).isZero();                          // no longer indexed
 
-        assertThat(TestSupport.drain(changes).bad()).containsExactly(chunk(0));          // exactly one BAD over three passes
-        assertThat(store.isKnownBad(chunk(0))).isTrue();
-        assertThat(Files.exists(chunkDir.resolve(chunk(0)))).as("the scanner never deletes").isTrue();
-
-        Files.write(chunkDir.resolve(chunk(0)), data);                     // the file is replaced by good bytes
-        assertThat(scanner.scanOnce()).isZero();
-        assertThat(store.isKnownBad(chunk(0))).isFalse();
-        assertThat(TestSupport.pending(changes)).isFalse();
+        TestSupport.Drained drained = TestSupport.drain(changes);
+        assertThat(drained.quarantined()).containsExactly(chunk(0));
+        assertThat(drained.of(ChangeType.DELETED).getFirst().version() & 1).isEqualTo(1);
+        assertThat(Files.exists(chunkDir.resolve(chunk(0)))).isFalse();
+        assertThat(quarantine()).as("the scanner never destroys bytes").hasSize(1);
+        assertThat(quarantine().getFirst().getFileName().toString()).startsWith(chunk(0) + ".").endsWith(".bad");
+        assertThat(store.stats(0).quarantinedChunks()).isEqualTo(1);
+        assertThat(store.stats(0).quarantinedBytes()).isEqualTo(2000);
+        assertThat(store.isQuarantined(chunk(0))).isTrue();
+        assertThat(store.index()).containsOnlyKeys(chunk(1));
     }
 
     @Test
-    void aMissingSidecarAtRuntimeMakesTheChunkBad() throws Exception {
+    void aMissingSidecarAtRuntimeQuarantinesTheCopy() throws Exception {
         write(0, 500);
         TestSupport.drain(changes);
         Files.delete(chunkDir.resolve(chunk(0) + ".meta"));
 
         assertThat(scanner.scanOnce()).isEqualTo(1);
 
-        assertThat(TestSupport.drain(changes).bad()).containsExactly(chunk(0));
-        assertThat(store.list()).containsExactly(new ChunkInfo(chunk(0), 500, ChunkStore.UNVERIFIED));
+        assertThat(TestSupport.drain(changes).quarantined()).containsExactly(chunk(0));
+        assertThat(store.reportEntries()).isEmpty();
     }
 
     @Test

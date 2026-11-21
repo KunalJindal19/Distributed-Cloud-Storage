@@ -5,7 +5,6 @@ import com.objectstore.controller.api.dto.ClusterStatusResponse.Config;
 import com.objectstore.controller.api.dto.ClusterStatusResponse.ReplicaCounts;
 import com.objectstore.controller.api.dto.ClusterStatusResponse.WorkerView;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.config.ControllerProperties;
 import com.objectstore.controller.repository.ObjectRepository;
@@ -56,6 +55,12 @@ public class ClusterStatusService {
         Map<String, Double> lockMaxHold = cluster.takeLockMaxHoldMs();   // reset by reading
         return cluster.read(() -> {
             Health health = health();
+            long onStale = 0;
+            for (WorkerInfo worker : cluster.workers().values()) {
+                if (worker.state == ClusterState.WorkerState.STALE) {
+                    onStale += cluster.chunksOn(worker.workerId).size();     // O(workers): set sizes are O(1)
+                }
+            }
             List<WorkerView> workers = new ArrayList<>();
             for (WorkerInfo worker : cluster.workersSorted()) {
                 double ago = cluster.secondsSince(worker.lastSeen);
@@ -70,29 +75,35 @@ public class ClusterStatusService {
                         Math.round(ago * 10) / 10.0,
                         cluster.chunksOn(worker.workerId).size(),
                         worker.commands.size(),
-                        cluster.pendingFrom(worker.workerId),
-                        worker.stats));
+                        cluster.ops().streamsOf(worker.workerId),
+                        worker.stats,
+                        worker.resyncing,
+                        worker.fenceFloor,
+                        worker.attempt,
+                        worker.verifyEpoch,
+                        cluster.ops().opsOn(worker.workerId).size()));
             }
             Map<String, Long> counters = cluster.counters();
             for (String name : List.of("invariant_violations", "orphan_gc_refused", "stale_messages", "duplicates", "blocked",
                     "changes_gap", "apply_queue_full", "writer_task_failures", "namespace_reconciled",
-                    "index_mismatches", "upload_commit_wait_timeouts")) {
+                    "index_mismatches", "upload_commit_wait_timeouts", "stale_rejections", "ops_resent", "resyncs",
+                    "quarantines", "excess_postponed", "verify_requests")) {
                 counters.putIfAbsent(name, 0L);
             }
             return new ClusterStatusResponse(
                     new Config(properties.chunkSize(), properties.replicationFactor(), properties.staleAfterSeconds(),
                             properties.deadAfterSeconds(), properties.monitorIntervalSeconds(),
-                            properties.pendingTimeoutSeconds(), properties.fullReportIntervalSeconds()),
+                            properties.opResendInitialSeconds(), properties.resyncIntervalSeconds()),
                     cluster.clusterId(),
                     cluster.isSafeMode(),
                     workers,
                     objectCount,
                     cluster.chunks().size(),
-                    new ReplicaCounts(health.ok(), health.corrupt(), health.excess()),
+                    new ReplicaCounts(health.ok(), health.corrupt(), health.excess(), onStale),
                     health.underReplicated(),
                     health.overReplicated(),
                     health.missing(),
-                    cluster.pendingTotal(),
+                    cluster.ops().inserts(),
                     cluster.blockedLastTick(),
                     counters,
                     cluster.events(),
@@ -102,15 +113,16 @@ public class ClusterStatusService {
                     queue.oldestAgeMillis(),
                     writer.takeBusyRatio(),
                     cluster.openSessions(),
-                    cluster.ledger().counts(),
+                    cluster.ops().deleteCounts(),
                     cluster.levels().sizes(),
                     cluster.cleanupSize(),
-                    cluster.postponedSize());
+                    cluster.postponedSize(),
+                    cluster.ops().counts(),
+                    cluster.verifyOutstanding(),
+                    cluster.resyncingWorkers(),
+                    cluster.versions().term(),
+                    cluster.versions().current());
         });
     }
 
-    /** Copy states on a chunk, as the status endpoint names them. */
-    static String stateName(ReplicaState state) {
-        return state.name();
-    }
 }
