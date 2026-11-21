@@ -45,7 +45,7 @@ class MarkDeadTest {
         List<ReportEntry> entries = new ArrayList<>();
         for (int i = 0; i < copies; i++) {
             t.knowChunk(TestSupport.chunk(i));
-            entries.add(new ReportEntry(TestSupport.chunk(i), 10, TestSupport.SUM, false));
+            entries.add(new ReportEntry(TestSupport.chunk(i), 10, TestSupport.SUM, 0));
         }
         t.register("worker1");
         t.report("worker1", entries);
@@ -78,7 +78,7 @@ class MarkDeadTest {
         List<ReportEntry> entries = new ArrayList<>();
         for (int i = 0; i < copies; i++) {
             t.knowChunk(TestSupport.chunk(i));
-            entries.add(new ReportEntry(TestSupport.chunk(i), 10, TestSupport.SUM, false));
+            entries.add(new ReportEntry(TestSupport.chunk(i), 10, TestSupport.SUM, 0));
         }
         t.register("worker1");
         t.report("worker1", entries);

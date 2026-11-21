@@ -25,9 +25,9 @@ import org.springframework.stereotype.Component;
  * <pre>
  * [state] ═══ worker2 at 10:42:07 ═══ registered · process 5d2e1a90 · 7 chunks · 6.4 MB · 54.2 GB free
  * [state]   link: heartbeat #812 sent 0.4 s ago · changes acknowledged up to #144 · 0 waiting to be sent
- * [state]   full report: none in progress (last one 2.1 min ago)
+ * [state]   resync listing: none in progress (last one 2.1 min ago)
  * [state]   chunks by object: 3f1c9a52 #0 #1 · 7a0b11c2 #0 · 9e2f0b13 #0 #1 #2
- * [state]   known bad: none · copies being sent to other workers: 0
+ * [state]   fence: 4398046511106 · tombstones: 3 · quarantined: 0 copies (0 B) · copies being sent: 0 · commands waiting: 0
  * </pre>
  */
 @Component
@@ -101,7 +101,7 @@ public class StatePrinter {
                 + changes.lastSeq() + ") · " + changes.size() + " waiting to be acknowledged");
         String report = link.reportProgress();
         long lastReport = link.sinceLastReportNanos();
-        lines.add("  full report: " + (report != null ? "in progress, " + report
+        lines.add("  resync listing: " + (report != null ? "in progress, " + report
                 : "none in progress" + (lastReport < 0 ? "" : " (last one " + seconds(lastReport) + " ago)")));
 
         // chunk ids are <object id>-<index>: group them by object
@@ -141,10 +141,10 @@ public class StatePrinter {
             lines.add(line.toString());
         }
 
-        List<String> bad = index.keySet().stream().filter(ChunkIds::isValid).filter(store::isKnownBad)
-                .map(c -> c.substring(0, 8) + " #" + Integer.parseInt(c.substring(37))).sorted().toList();
-        lines.add("  known bad: " + (bad.isEmpty() ? "none" : String.join(", ", bad)) + " · copies being sent to other workers: "
-                + executor.activeTransfers());
+        lines.add("  fence: " + (store.isFenceSet() ? String.valueOf(store.fence()) : "none yet") + " · tombstones: "
+                + store.tombstoneCount() + " · quarantined: " + stats.quarantinedChunks() + " copies ("
+                + bytes(stats.quarantinedBytes()) + ") · copies being sent: " + executor.activeTransfers()
+                + " · commands waiting: " + executor.waiting());
         return lines;
     }
 

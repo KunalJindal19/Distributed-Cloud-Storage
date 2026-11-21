@@ -92,7 +92,7 @@ class ReplicationSystemTest extends ClusterTest {
     }
 
     @Test
-    void aCorruptCopyIsReplacedBeforeItIsDeleted() throws Exception {
+    void aCorruptCopyIsQuarantinedNeverServedAndRepairedFromTheGoodCopy() throws Exception {
         byte[] data = Api.randomBytes(2 * MIB + 5, 3);
         String id = api.uploadOk("c.bin", data);
         String chunkId = id + "-00000";
@@ -101,16 +101,27 @@ class ReplicationSystemTest extends ClusterTest {
         Watchdog watchdog = Watchdog.start(api, id);
         Files.write(cluster.chunkFile(bad, chunkId), "XXXX".getBytes(), StandardOpenOption.WRITE);
 
+        // The scanner quarantines it (the bytes are kept for diagnosis, never deleted) ...
         await().atMost(PATIENCE).until(() -> !cluster.chunkFilesOn(bad).contains(chunkId));
-        // The worker's DELETED change reaches the controller with its next heartbeat.
-        await().atMost(PATIENCE).until(() -> repairOrder(chunkId).contains("invalidated@" + bad));
+        assertThat(quarantined(bad, chunkId)).as("kept in the quarantine").isTrue();
+        // ... its DELETED(corrupt) reaches the controller, and the chunk is repaired from the good copy.
+        await().atMost(PATIENCE).until(() -> repairOrder(chunkId).contains("quarantined@" + bad));
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(api.metadata(id).get("replication_ok").asBoolean()).isTrue());
         watchdog.stop();
 
-        assertThat(repairOrder(chunkId)).as("copy confirmed before the corrupt copy is invalidated")
-                .containsSubsequence("copied@" + newHolder(id, holders), "invalidated@" + bad);
-        assertThat(watchdog.fewestOkCopies.get()).isPositive();
-        await().atMost(PATIENCE).untilAsserted(() -> assertThat(api.metadata(id).get("replication_ok").asBoolean()).isTrue());
+        List<String> order = repairOrder(chunkId);
+        int quarantined = order.indexOf("quarantined@" + bad);
+        assertThat(order.subList(quarantined, order.size())).as("repaired after the quarantine")
+                .anyMatch(event -> event.startsWith("copied@"));
+        assertThat(watchdog.fewestOkCopies.get()).as("a good copy existed all along").isPositive();
         assertThat(api.download(id).body()).isEqualTo(data);
+    }
+
+    private boolean quarantined(String workerId, String chunkId) throws java.io.IOException {
+        java.nio.file.Path dir = cluster.dataDir(workerId).resolve("quarantine");
+        try (java.util.stream.Stream<java.nio.file.Path> files = Files.list(dir)) {
+            return files.anyMatch(f -> f.getFileName().toString().startsWith(chunkId + "."));
+        }
     }
 
     private List<String> repairOrder(String chunkId) {

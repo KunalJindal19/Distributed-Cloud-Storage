@@ -10,7 +10,6 @@ import com.objectstore.common.dto.HeartbeatRequest;
 import com.objectstore.common.dto.HeartbeatResponse;
 import com.objectstore.common.dto.RegisterRequest;
 import com.objectstore.common.web.ApiException;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerState;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -31,13 +30,12 @@ class ProtocolTest {
         t.knowChunk(chunk(0));
         String boot = t.join("worker1");
         java.util.List<com.objectstore.common.dto.Change> changes = java.util.List.of(
-                new com.objectstore.common.dto.Change(1, com.objectstore.common.dto.ChangeType.RECEIVED, chunk(0), 10L,
-                        TestSupport.SUM, null, null, null));
+                com.objectstore.common.dto.Change.received(1, chunk(0), 10L, TestSupport.SUM, 3, null));
 
         assertCode(() -> t.registry.heartbeat(new HeartbeatRequest("worker1", "other-boot", 5, InternalApi.nowSeconds(),
-                TestSupport.STATS, changes, null)), 409, "stale_boot");
+                TestSupport.STATS, changes, null, null)), 409, "stale_boot");
         assertCode(() -> t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 5, InternalApi.nowSeconds() - 20,
-                TestSupport.STATS, changes, null)), 409, "too_old");
+                TestSupport.STATS, changes, null, null)), 409, "too_old");
 
         cluster.locked(() -> {
             assertThat(cluster.chunksOn("worker1")).isEmpty();
@@ -48,11 +46,12 @@ class ProtocolTest {
     @Test
     void aDuplicateHeartbeatDeliversNoCommands() {
         t.knowChunk(chunk(0));
-        String boot = t.join("worker1", chunk(0));
-        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://a:1", null));
+        t.knowChunk(chunk(1));
+        String boot = t.join("worker1", chunk(0), chunk(1));
+        cluster.locked(() -> cluster.ops().ensure(chunk(0), "worker1", PendingOps.Reason.OBJECT_DELETED));
 
         HeartbeatResponse first = t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 3, InternalApi.nowSeconds(), TestSupport.STATS));
-        cluster.locked(() -> cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://b:1", null));
+        cluster.locked(() -> cluster.ops().ensure(chunk(1), "worker1", PendingOps.Reason.OBJECT_DELETED));
         HeartbeatResponse duplicate = t.registry.heartbeat(new HeartbeatRequest("worker1", boot, 3, InternalApi.nowSeconds(), TestSupport.STATS));
 
         assertThat(first.commands()).hasSize(1);
@@ -62,21 +61,25 @@ class ProtocolTest {
     }
 
     @Test
-    void aRestartedProcessKeepsItsCopiesButLosesItsQueueAndItsOutgoingCopies() {
+    void aRestartedProcessKeepsItsCopiesLosesItsQueueAndItsOutgoingCopiesAreReSourced() {
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         t.join("worker2");
         cluster.locked(() -> {
-            cluster.queueCommand("worker1", InternalApi.COMMAND_REPLICATE, chunk(0), TestSupport.SUM, "http://worker2:8001", null);
-            cluster.addPending(chunk(0), "worker1", "worker2", "cmd");
+            PendingOps.Op repair = cluster.ops().ensure(chunk(0), "worker2", PendingOps.Reason.REPAIR);
+            cluster.ops().setSource(repair, "worker1");
+            cluster.ops().tryQueue(repair);
         });
 
         t.register("worker1"); // a new boot id
 
         cluster.locked(() -> {
             assertThat(cluster.worker("worker1").commands).isEmpty();
-            assertThat(cluster.pendingTotal()).isZero();
+            PendingOps.Op repair = cluster.ops().get(chunk(0), "worker2");
+            assertThat(repair.source()).isNull();
+            assertThat(repair.state()).isEqualTo(PendingOps.State.WAITING);
             assertThat(cluster.worker("worker1").hasReported).isFalse();
+            assertThat(cluster.worker("worker1").resyncing).as("a registration starts a resync").isTrue();
             assertThat(cluster.replica(chunk(0), "worker1")).isNotNull();
         });
     }
@@ -135,29 +138,31 @@ class ProtocolTest {
         t.knowChunk(chunk(1));
         t.knowChunk(chunk(2));
         String boot = t.join("worker1", chunk(0), chunk(1));
+        t.send("worker1", List.of(), null, "tombstones");          // the worker asks: a resync starts
 
         // chunk 1 is gone from the disk; chunk 2 appeared; chunk 0 now has a wrong checksum.
         t.report("worker1", List.of(
-                new ReportEntry(chunk(0), 10, "b".repeat(64), false),
-                new ReportEntry(chunk(2), 10, TestSupport.SUM, false)));
+                new ReportEntry(chunk(0), 10, "b".repeat(64), 0),
+                new ReportEntry(chunk(2), 10, TestSupport.SUM, 0)));
 
         cluster.locked(() -> {
-            assertThat(cluster.chunksOn("worker1")).containsExactlyInAnyOrder(chunk(0), chunk(2));
-            assertThat(cluster.replica(chunk(0), "worker1").state).isEqualTo(ReplicaState.CORRUPT);
+            assertThat(cluster.chunksOn("worker1")).containsExactly(chunk(2));
+            assertThat(cluster.ops().deleteReason(chunk(0), "worker1")).isEqualTo(PendingOps.Reason.CORRUPT);
             assertThat(cluster.worker("worker1").hasReported).isTrue();
+            assertThat(cluster.worker("worker1").resyncing).isFalse();
             assertThat(cluster.worker("worker1").session).isNull();
         });
         t.assertNoViolations();
     }
 
     @Test
-    void edge19_aReportEntryMarkedBadMakesTheCopyCorrupt() {
+    void edge19_aListedCopyKeepsTheVersionTheWorkerHasItAt() {
         t.knowChunk(chunk(0));
-        t.join("worker1", chunk(0));
+        t.register("worker1");
 
-        t.report("worker1", List.of(new ReportEntry(chunk(0), 10, TestSupport.SUM, true)));
+        t.report("worker1", List.of(TestSupport.entry(chunk(0), 7)));            // an odd one: placed by hand
 
-        assertThat(cluster.locked(() -> cluster.replica(chunk(0), "worker1").state)).isEqualTo(ReplicaState.CORRUPT);
+        assertThat(cluster.locked(() -> cluster.replica(chunk(0), "worker1").version)).isEqualTo(7);
     }
 
     @Test
@@ -167,12 +172,14 @@ class ProtocolTest {
         assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands)).isEmpty();
 
         Thread.sleep(350);
-        // Completion (a task) queues the DELETE; the next heartbeat hands it over.
+        // The next resync's completion (a task) queues the DELETE; the next heartbeat hands it over.
+        delayed.send("worker1", List.of(), null, "tombstones");
         delayed.fullReport("worker1", boot, chunk(7));
         assertThat(delayed.cluster.locked(() -> delayed.cluster.worker("worker1").commands))
                 .singleElement().satisfies(c -> assertThat(c.reason()).isEqualTo("orphan"));
 
         String[] many = java.util.stream.IntStream.range(10, 30).mapToObj(TestSupport::chunk).toArray(String[]::new);
+        delayed.send("worker1", List.of(), null, "tombstones");
         delayed.fullReport("worker1", boot, many);
         assertThat(delayed.cluster.counter("orphan_gc_refused")).isEqualTo(1);
     }
@@ -183,7 +190,7 @@ class ProtocolTest {
         Thread.sleep(150);
         String failedUpload = "aaaaaaaa-7d0e-4c1b-9a54-1f2e3d4c5b6a";
         String unknown = "bbbbbbbb-7d0e-4c1b-9a54-1f2e3d4c5b6a";
-        delayed.cluster.locked(() -> delayed.cluster.addGarbage(failedUpload));
+        delayed.cluster.locked(() -> delayed.cluster.addGarbage(failedUpload, PendingOps.Reason.UPLOAD_FAILED));
         String[] reported = java.util.stream.Stream.concat(
                         java.util.stream.IntStream.range(0, 10).mapToObj(i -> "%s-%05d".formatted(failedUpload, i)),
                         java.util.stream.IntStream.range(0, 20).mapToObj(i -> "%s-%05d".formatted(unknown, i)))
@@ -199,16 +206,19 @@ class ProtocolTest {
     }
 
     @Test
-    void changesAddDeleteAndFlagCopies() {
+    void changesAddAndRemoveCopiesAndAQuarantineRemovesOne() {
         t.knowChunk(chunk(0));
         t.knowChunk(chunk(1));
-        String boot = t.join("worker1", chunk(0));
+        t.join("worker1", chunk(0));
 
-        t.ibr("worker1", boot, List.of(chunk(1)), List.of(chunk(0)), List.of());
+        t.ibr("worker1", t.received("worker1", chunk(1), t.local("worker1")),
+                t.deleted("worker1", chunk(0), t.local("worker1"), "missing"));
         cluster.locked(() -> assertThat(cluster.chunksOn("worker1")).containsExactly(chunk(1)));
 
-        t.ibr("worker1", boot, List.of(), List.of(), List.of(chunk(1)));
-        cluster.locked(() -> assertThat(cluster.replica(chunk(1), "worker1").state).isEqualTo(ReplicaState.CORRUPT));
+        t.ibr("worker1", t.deleted("worker1", chunk(1), t.local("worker1"), "corrupt"));
+        cluster.locked(() -> assertThat(cluster.chunksOn("worker1")).isEmpty());
+        assertThat(cluster.events()).anyMatch(e -> e.event().equals("quarantined"));
+        assertThat(cluster.counter("quarantines")).isEqualTo(1);
     }
 
     /** Runs health passes every 40 ms (well under STALE_AFTER / 2, so no stall is detected). */

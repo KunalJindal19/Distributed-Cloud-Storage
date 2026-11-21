@@ -55,14 +55,16 @@ import org.springframework.web.multipart.MultipartFile;
  *   <li><b>All or nothing.</b> The namespace is written once, at the very end, in one durable
  *       transaction, and only after every chunk is fsynced on two workers. A 201 therefore
  *       survives a controller crash and the loss of any one worker. If the upload fails before
- *       that, nothing is recorded and every copy written so far gets a DELETE command
- *       ({@code EndUpload}); whatever is left is garbage, which the workers' streams and reports
- *       clean up.</li>
+ *       that, nothing is recorded and {@code ensure(DELETE, UPLOAD_FAILED)} goes to exactly the pairs
+ *       it attempted ({@code EndUpload}).</li>
+ *   <li><b>Versioned PUTs.</b> Every PUT carries a fresh operation version ({@code X-Op-Version}),
+ *       reserved together with the eligibility check, and the namespace checksum ({@code X-Checksum}).</li>
  *   <li><b>Copies come from the workers.</b> A 2xx answer to a PUT never creates a replica by
  *       itself. The PUT carries {@code X-Change-Ack} and the answer usually carries the worker's
- *       {@code RECEIVED} for the chunk, which becomes an upload receipt; at commit a receipt
- *       becomes a replica, and a copy without one becomes an UPLOAD pending copy, which counts
- *       against repair, may be read from, and expires into normal repair.</li>
+ *       {@code RECEIVED(v)} for the chunk, which becomes an upload receipt; at commit a receipt
+ *       becomes a replica, and a copy without one becomes an INSERT UPLOAD op at the PUT's version,
+ *       which counts in P, may be read from, and turns into a REPAIR at the same version if its
+ *       RECEIVED never comes.</li>
  * </ul>
  */
 @Service
@@ -81,8 +83,12 @@ public class UploadService {
     private record WrittenCopy(Target target, String chunkId) {
     }
 
+    /** A worker that confirmed writing a chunk, and the version its copy was installed at. */
+    private record Holder(Target target, long version) {
+    }
+
     /** A chunk and the workers that confirmed writing it. */
-    private record StoredChunk(Chunk chunk, List<Target> holders) {
+    private record StoredChunk(Chunk chunk, List<Holder> holders) {
     }
 
     /**
@@ -231,7 +237,7 @@ public class UploadService {
                 String checksum = Checksums.sha256Hex(piece);
                 objectDigest.update(piece);
                 size += piece.length;
-                List<Target> holders = storeChunk(objectId, index, chunkId, piece, checksum, exclude, attempted);
+                List<Holder> holders = storeChunk(objectId, index, chunkId, piece, checksum, exclude, attempted);
                 stored.add(new StoredChunk(new Chunk(chunkId, objectId, index, piece.length, checksum), holders));
             }
 
@@ -240,8 +246,8 @@ public class UploadService {
                     stored.size(), now, now);
             var beforeCommit = beforeCommitForTests;
             if (beforeCommit != null) {
-                beforeCommit.accept(objectId, stored.stream().flatMap(c -> c.holders().stream()).map(Target::workerId)
-                        .distinct().toList());
+                beforeCommit.accept(objectId, stored.stream().flatMap(c -> c.holders().stream())
+                        .map(h -> h.target().workerId()).distinct().toList());
             }
             try {
                 commit(object, metadata, stored, idempotencyKey);
@@ -284,7 +290,7 @@ public class UploadService {
     private void commit(StoredObject object, Map<String, String> metadata, List<StoredChunk> stored, String idempotencyKey) {
         List<NamespaceTasks.CommittedChunk> chunks = stored.stream()
                 .map(entry -> new NamespaceTasks.CommittedChunk(entry.chunk(), entry.holders().stream()
-                        .map(t -> new NamespaceTasks.Target(t.workerId(), t.epoch())).toList()))
+                        .map(h -> new NamespaceTasks.Target(h.target().workerId(), h.target().epoch(), h.version())).toList()))
                 .toList();
         Task task = namespaceTasks.commitObject(object.objectId(), chunks);
         namespaceLock.lock();
@@ -352,7 +358,7 @@ public class UploadService {
      * in parallel; a failed target is excluded for the rest of the upload and the next one on the
      * ring is tried instead.
      */
-    private List<Target> storeChunk(String objectId, int index, String chunkId, byte[] data, String checksum,
+    private List<Holder> storeChunk(String objectId, int index, String chunkId, byte[] data, String checksum,
                                     Set<String> exclude, Set<WrittenCopy> attempted) {
         int rf = properties.replicationFactor();
         List<Target> ring = cluster.read(() -> {
@@ -362,7 +368,7 @@ public class UploadService {
             }
             return targets;
         });
-        List<Target> holders = new ArrayList<>(rf);
+        List<Holder> holders = new ArrayList<>(rf);
         Set<String> tried = new HashSet<>();
         int next = 0;
         while (holders.size() < rf && next < ring.size()) {
@@ -373,10 +379,11 @@ public class UploadService {
                     batch.add(candidate);
                 }
             }
-            List<Boolean> outcomes = io.mapAll(batch, target -> tryStore(target, chunkId, data, checksum, attempted));
+            List<Long> versions = io.mapAll(batch, target -> tryStore(target, chunkId, data, checksum, attempted));
             for (int i = 0; i < batch.size(); i++) {
-                if (Boolean.TRUE.equals(outcomes.get(i))) {
-                    holders.add(batch.get(i));
+                Long version = versions.get(i);
+                if (version != null && version > 0) {
+                    holders.add(new Holder(batch.get(i), version));
                 } else {
                     exclude.add(batch.get(i).workerId());
                 }
@@ -390,19 +397,36 @@ public class UploadService {
         return holders;
     }
 
-    private boolean tryStore(Target target, String chunkId, byte[] data, String checksum, Set<WrittenCopy> attempted) {
+    /**
+     * One PUT (v5 §7): a fresh version is reserved under the cluster read lock together with the
+     * eligibility check (ALIVE, reported, not resyncing, same epoch), so a PUT that reaches a worker
+     * which started resyncing afterwards has {@code v < t0}: it was either committed before the fence
+     * (and listed) or is rejected as stale. A 409, 503 or 500 counts as a failed target.
+     *
+     * @return the version the copy was installed at, or -1
+     */
+    private long tryStore(Target target, String chunkId, byte[] data, String checksum, Set<WrittenCopy> attempted) {
+        long version = cluster.read(() -> {
+            WorkerInfo worker = cluster.worker(target.workerId());
+            return worker != null && worker.epoch == target.epoch() && placement.isWriteEligible(worker)
+                    ? cluster.versions().next() : -1L;
+        });
+        if (version < 0) {
+            log.info("[upload] chunk={} worker={} is no longer write-eligible; replacing it", chunkId, target.workerId());
+            return -1;
+        }
         // Recorded before the call: a write that timed out may still have reached the disk.
         attempted.add(new WrittenCopy(target, chunkId));
         try {
             String changeAck = cluster.read(() -> receipts.changeAck(target.workerId()));
             trace.putChunk(target.workerId(), chunkId, data.length);
-            ChunkPutResponse answer = workers.putChunk(target.url(), chunkId, data, checksum, changeAck);
+            ChunkPutResponse answer = workers.putChunk(target.url(), chunkId, data, checksum, version, changeAck);
             trace.putAnswer(target.workerId(), chunkId, answer == null || answer.changes() == null ? null
                     : answer.changes().items(), null);
             if (answer != null && answer.changes() != null) {
                 receipts.acceptPiggyback(target.workerId(), answer.changes().bootId(), answer.changes().items());
             }
-            return true;
+            return version;
         } catch (WorkerException e) {
             trace.putAnswer(target.workerId(), chunkId, null, e.getMessage());
             log.warn("[upload] chunk={} worker={} write failed ({}); replacing it for this upload",
@@ -411,7 +435,7 @@ public class UploadService {
             if (worker != null) {
                 worker.lastDataError = System.nanoTime();          // a volatile field: no lock
             }
-            return false;
+            return -1;
         }
     }
 
