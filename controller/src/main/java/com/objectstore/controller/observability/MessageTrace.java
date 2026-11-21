@@ -91,7 +91,8 @@ public class MessageTrace {
             return;
         }
         String outcome = refused != null ? "refused: " + reason(refused)
-                : "accepted, " + (response == null ? "?" : response.state());
+                : "accepted, " + (response == null ? "?" : response.state() + ", fence " + response.floor()
+                        + " attempt " + response.attempt());
         log.info("[msg] ← {}  REGISTER    attempt {} · boot {} · change_seq {} · cluster {}  ⇒ {}", pad(request.workerId()),
                 request.attempt(), shortBoot(request.bootId()), request.changeSeq(),
                 request.clusterId() == null ? "(new volume)" : shortBoot(request.clusterId()), outcome);
@@ -106,7 +107,7 @@ public class MessageTrace {
         ReportSegment segment = request.segment();
         boolean empty = changes.isEmpty() && segment == null;
         boolean replyEmpty = response == null || ((response.commands() == null || response.commands().isEmpty())
-                && !response.requestFullReport() && response.ignored() == null && response.segmentAck() == null);
+                && response.resync() == null && response.ignored() == null && response.segmentAck() == null);
         if (mode == Mode.CHANGES && empty && replyEmpty && refused == null) {
             return;
         }
@@ -115,9 +116,13 @@ public class MessageTrace {
             in.append(" · ").append(changes(changes));
         }
         if (segment != null) {
-            in.append(" · full report ").append(shortBoot(segment.reportId())).append(" segment ").append(segment.index())
+            in.append(" · resync listing ").append(shortBoot(segment.reportId())).append(" (fence ").append(segment.floor())
+                    .append(" attempt ").append(segment.attempt()).append(") segment ").append(segment.index())
                     .append(segment.last() ? " (last)" : "").append(", ").append(segment.entries() == null ? 0 : segment.entries().size())
                     .append(" chunks, baseline #").append(segment.baseline());
+        }
+        if (request.resyncWanted() != null) {
+            in.append(" · resync wanted (").append(request.resyncWanted()).append(")");
         }
         if (empty) {
             in.append(" · alive");
@@ -133,10 +138,11 @@ public class MessageTrace {
         }
         out.append(" · ack #").append(response.changesReceivedUpTo());
         if (response.segmentAck() != null) {
-            out.append(" · segment ").append(response.segmentAck().index()).append(" received");
+            out.append(" · segment ").append(response.segmentAck().index()).append(" ")
+                    .append(response.segmentAck().status() == null ? "ok" : response.segmentAck().status());
         }
-        if (response.requestFullReport()) {
-            out.append(" · send a full report");
+        if (response.resync() != null) {
+            out.append(" · RESYNC fence ").append(response.resync().t0()).append(" attempt ").append(response.resync().attempt());
         }
         List<Command> commands = response.commands() == null ? List.of() : response.commands();
         for (Command command : commands.subList(0, Math.min(commands.size(), MAX_LISTED))) {
@@ -190,8 +196,11 @@ public class MessageTrace {
                 .append(": ");
         List<String> listed = new ArrayList<>();
         for (Change change : changes.subList(0, Math.min(changes.size(), MAX_LISTED))) {
-            listed.add(change.type() + " " + chunk(change.chunkId())
-                    + (change.type() == ChangeType.CMD_FAILED ? " (" + change.reason() + ")" : ""));
+            listed.add(change.type() + " " + chunk(change.chunkId()) + " v" + change.version()
+                    + (change.type() == ChangeType.CMD_FAILED ? " (" + change.reason() + ")"
+                    : change.type() == ChangeType.DELETED && change.detail() != null
+                            && !"deleted".equals(change.detail()) ? " (" + change.detail() + ")"
+                    : change.cmdId() != null && change.type() == ChangeType.RECEIVED ? " (verified)" : ""));
         }
         text.append(String.join(", ", listed));
         if (changes.size() > MAX_LISTED) {
@@ -207,10 +216,15 @@ public class MessageTrace {
     private static String command(Command command) {
         if (InternalApi.COMMAND_REPLICATE.equals(command.type())) {
             String target = command.targetUrl() == null ? "?" : command.targetUrl().replaceFirst("^https?://", "").replaceFirst(":\\d+$", "");
-            return "REPLICATE " + chunk(command.chunkId()) + " → " + target;
+            return "REPLICATE " + chunk(command.chunkId()) + " v" + command.version() + " → " + target;
         }
-        return command.type() + " " + chunk(command.chunkId()) + (command.reason() == null ? "" : " (" + command.reason() + ")");
+        if (InternalApi.COMMAND_VERIFY.equals(command.type())) {
+            return "VERIFY " + chunk(command.chunkId());
+        }
+        return command.type() + " " + chunk(command.chunkId()) + " v" + command.version()
+                + (command.reason() == null ? "" : " (" + command.reason() + ")");
     }
+
 
     /** {@code <object id prefix>/<index>}: short enough to follow a chunk through the log. */
     public static String chunk(String chunkId) {

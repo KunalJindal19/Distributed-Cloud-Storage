@@ -8,8 +8,9 @@
 #   2. uploads three files and shows where every copy of every chunk went (chunk x worker grid)
 #   3. docker stop worker2: STALE, then DEAD; every chunk it held is copied again from the surviving
 #      copy, until each has two live copies; all files still download intact
-#   4. docker start worker2: it registers again, reports the chunks on its disk, the controller
-#      deletes the surplus copies, and every chunk ends with exactly two copies
+#   4. docker start worker2: it registers again, adopts a new fence and resyncs (lists the chunks on
+#      its disk); the controller has the survivors VERIFY themselves, deletes the surplus copies, and
+#      every chunk ends with exactly two copies
 #   5. a new upload after the recovery; fsck confirms every disk matches the controller's map
 #
 # Between the steps it waits for Enter, so you can look at the logs in another terminal
@@ -142,7 +143,7 @@ note "docker-compose.showcase.yml turns on: TRACE_MESSAGES=all on the controller
 note "and out) and STATE_PRINT_INTERVAL=10 on every container (the state, every 10 seconds)."
 step "${COMPOSE[*]} up --build -d --wait"
 "${COMPOSE[@]}" up --build -d --wait 2>&1 | tail -n 6 | indent
-wait_until 300 "every worker is ALIVE and has reported its chunks" view check healthy
+wait_until 300 "every worker is ALIVE and has completed a resync" view check healthy
 STORED=$(view objects)
 if [ "$STORED" -gt 50 ]; then
     tip "The store already holds $STORED objects (from earlier runs). That works, but re-copying a stopped"
@@ -222,16 +223,17 @@ pause "start $VICTIM again"
 # ---- 4. the worker comes back ----------------------------------------------------------------
 
 banner "4  The worker comes back: docker start $VICTIM"
-note "$VICTIM still has its old copies on disk. It registers again (a new process id) and sends a full"
-note "report of every chunk it holds. Chunks that were re-copied meanwhile now have three copies, one"
-note "too many: the controller keeps two and sends DELETE for the surplus. Chunks not re-copied yet just"
-note "count $VICTIM's copy again. Either way every chunk ends with exactly two copies."
+note "$VICTIM still has its old copies on disk. It registers again (a new process id), adopts a new"
+note "fence and resyncs: it lists every chunk it holds. Chunks that were re-copied meanwhile now have"
+note "three copies, one too many: the controller asks the two that would stay to VERIFY themselves,"
+note "then sends a versioned DELETE for the surplus. Chunks not re-copied yet just count $VICTIM's copy"
+note "again. Either way every chunk ends with exactly two copies."
 SINCE=$(now)
 step "docker start $VICTIM"
 docker start "$VICTIM" > /dev/null
 view follow healthy "$VICTIM" 300 "${IDS[@]}" || FAILED=$((FAILED + 1))
-step "The registration, the full report on a heartbeat, and the DELETE commands in the replies:"
-show controller "$SINCE" '[msg]' "REGISTER|full report|segment .* received|DELETE" 10
+step "The registration with its fence, the resync listing on a heartbeat, VERIFY and DELETE commands in the replies:"
+show controller "$SINCE" '[msg]' "REGISTER|resync listing|segment .* (ok|done)|VERIFY|DELETE" 12
 step "What the replication monitor did for the showcase files ($(count controller "$SINCE" '[monitor] trimmed') surplus copies deleted in all):"
 show controller "$SINCE" '[monitor]' "$(ids_pattern)" 16
 step "$VICTIM's own view of itself, as it printed it after the restart:"

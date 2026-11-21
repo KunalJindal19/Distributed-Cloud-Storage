@@ -27,9 +27,11 @@ x-worker: &worker
   depends_on:
     controller:
       condition: service_healthy
-  # A crashed worker comes back by itself; "docker stop" still keeps it stopped (for the demo).
+  # A crashed (or fail-stopped, exit 70) worker comes back by itself; "docker stop" still keeps it
+  # stopped (for the demo). The grace period stays above Spring's 6 s shutdown phase, which stays above
+  # SHUTDOWN_DRAIN_TIMEOUT (3 s): mutations in progress finish before the process stops.
   restart: unless-stopped
-  stop_grace_period: 5s
+  stop_grace_period: 10s
   healthcheck:
     test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health > /dev/null || exit 1"]
     interval: 3s
@@ -46,7 +48,10 @@ x-worker-environment: &worker-environment
   HEARTBEAT_INTERVAL: "2"          # heartbeat period (s); sooner when changes are waiting
   HEARTBEAT_MIN_GAP_MS: "250"      # earliest next heartbeat when changes or report segments wait
   HEARTBEAT_HTTP_TIMEOUT: "3"      # must stay below STALE_AFTER
-  FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-300}" # full report period (s): rare; sent in segments on heartbeats
+  TOMBSTONE_MAX: "100000"          # above this many tombstones the worker asks for a resync
+  EXECUTOR_QUEUE_MAX: "500"        # commands waiting to run; beyond: CMD_FAILED(busy), VERIFY dropped
+  SERVER_READ_TIMEOUT: "20"        # longest a chunk PUT may take to deliver its body (s)
+  SHUTDOWN_DRAIN_TIMEOUT: "3"      # on shutdown, mutations in progress get this long to finish (s)
   CHANGE_LOG_MAX: "10000"          # un-acknowledged changes kept; overflow -> full report
   MAX_CHANGES_PER_MESSAGE: "2000"  # changes per heartbeat
   MAX_CHANGES_PER_PUT_ANSWER: "256" # changes per answer to a controller's chunk PUT
@@ -78,10 +83,11 @@ services:
       STALE_RATIO: "0.5"             # above this fraction of STALE workers, write to them anyway
       HEALTH_INTERVAL: "1"
       MONITOR_INTERVAL: "3"          # replication monitor period
-      PENDING_TIMEOUT: "15"          # an unconfirmed copy or DELETE is retried after this
+      OP_RESEND_INITIAL: "15"        # an unanswered op is resent after this (same version), then backing off
+      OP_RESEND_MAX: "240"           # ... up to this
+      OP_MAX_INSERT_ATTEMPTS: "5"    # an unanswered copy is dropped and re-planned after this many sends
       TARGET_BACKOFF: "30"           # avoid a (chunk, target) pair for this long after a failed copy
       MAX_STREAMS: "2"               # in-flight copies per source worker
-      COMMAND_TTL: "30"              # workers drop commands older than this
       MAX_COMMANDS_PER_WORKER: "1000"
       MAX_MESSAGE_AGE: "10"          # reject worker messages sent longer ago than this
       SAFE_MODE_THRESHOLD: "0.999"
@@ -90,7 +96,12 @@ services:
       ORPHAN_GC_DELAY: "60"          # no orphan deletion during the first minute after a start
       ORPHAN_GC_MAX_FRACTION: "0.5"
       MIN_FREE_BYTES: "16777216"
-      FULL_REPORT_INTERVAL: "${FULL_REPORT_INTERVAL:-300}" # as on the workers; overdue at 2x
+      RESYNC_INTERVAL: "${RESYNC_INTERVAL:-3600}" # periodic fenced resync of every worker (s), ± RESYNC_JITTER
+      RESYNC_JITTER: "0.1"
+      RESYNC_MAX_CONCURRENT: "1"     # periodic and GC-triggered resyncs at once
+      RESYNC_STALL_TIMEOUT: "60"     # no segment progress for this long: the next report attempt
+      VERIFY_FRESH_FOR_DELETE: "3600" # how recent a survivor's VERIFY must be before a surplus copy is deleted
+      VERIFY_RESEND: "60"            # minimum gap between VERIFYs of one copy
       INVARIANT_CHECKS: "1"            # the rolling invariant check, every planner tick
       PLANNER_VISIT_BUDGET: "2000"   # chunks visited in the under-replication levels per tick
       POSTPONED_BUDGET: "1000"       # postponed chunks re-checked per tick

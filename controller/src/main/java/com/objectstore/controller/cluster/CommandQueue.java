@@ -9,10 +9,11 @@ import java.util.Objects;
 import java.util.function.Predicate;
 
 /**
- * One worker's queue of commands waiting for its next heartbeat (v4 §6.2). It keeps a dedupe index
- * {@code (type, chunk, target) → command}, so a duplicate check is O(1), and it never drops a
- * command: the cap MAX_COMMANDS_PER_WORKER is enforced by the producers (the deletion ledger waits,
- * the planner does not schedule a copy from a full source). Guarded by the cluster lock.
+ * One worker's queue of commands waiting for its next heartbeat. It keeps a dedupe index
+ * {@code (type, chunk, target) → command}, so a duplicate check is O(1), and it never drops a command
+ * by itself: the cap MAX_COMMANDS_PER_WORKER is enforced by the producers (a pending op waits, the
+ * planner does not schedule a copy from a full source). The hand-out filter ({@link #drain}) may leave
+ * commands queued (their target is resyncing) or drop ones whose op is gone. Guarded by the cluster lock.
  */
 public final class CommandQueue implements Iterable<Command> {
 
@@ -32,7 +33,7 @@ public final class CommandQueue implements Iterable<Command> {
         return index.get(key(type, chunkId, targetUrl));
     }
 
-    void add(Command command) {
+    public void add(Command command) {
         commands.addLast(command);
         index.put(key(command), command);
     }
@@ -46,7 +47,7 @@ public final class CommandQueue implements Iterable<Command> {
     }
 
     /** Removes the command with this id; true if it was queued. */
-    boolean remove(String cmdId) {
+    public boolean remove(String cmdId) {
         return removeIf(command -> command.cmdId().equals(cmdId)) > 0;
     }
 
@@ -66,6 +67,30 @@ public final class CommandQueue implements Iterable<Command> {
     void clear() {
         commands.clear();
         index.clear();
+    }
+
+    /** What {@link #drain} does with one queued command. */
+    public enum Decision { TAKE, KEEP, DROP }
+
+    /**
+     * Walks the queue in order and takes (or drops) commands as {@code decide} says, keeping the rest
+     * in place (the hand-out filter, v5 §5.2), until {@code max} commands were taken.
+     */
+    public java.util.List<Command> drain(java.util.function.Function<Command, Decision> decide, int max) {
+        java.util.List<Command> taken = new java.util.ArrayList<>();
+        for (Iterator<Command> it = commands.iterator(); it.hasNext() && taken.size() < max; ) {
+            Command command = it.next();
+            Decision decision = decide.apply(command);
+            if (decision == Decision.KEEP) {
+                continue;
+            }
+            it.remove();
+            index.remove(key(command), command);
+            if (decision == Decision.TAKE) {
+                taken.add(command);
+            }
+        }
+        return taken;
     }
 
     public int size() {

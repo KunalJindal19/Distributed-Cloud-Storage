@@ -1,7 +1,6 @@
 package com.objectstore.worker.reporting;
 
 import com.objectstore.common.dto.Change;
-import com.objectstore.common.dto.ChangeType;
 import com.objectstore.worker.config.WorkerProperties;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -16,26 +15,28 @@ import org.springframework.stereotype.Component;
  * The worker's ordered change stream: every change to the disk gets the next number (the first
  * is 1 in each process) and is kept until the controller acknowledges having received it. Changes
  * travel on heartbeats and on the worker's answers to the controller's chunk PUTs; both channels
- * send {@link #suffix} runs, which are always contiguous.
+ * send {@link #suffix} runs, which are always contiguous. Each change carries the version of the
+ * record it produced (v5 §3): even for the controller's operations, odd for the worker's own
+ * observations.
  *
  * <table>
  *   <caption>Change types</caption>
- *   <tr><td>{@code RECEIVED(chunk, size, checksum)}</td><td>this worker now holds bytes of {@code chunk}
- *       that it verified, with this checksum</td></tr>
- *   <tr><td>{@code DELETED(chunk)}</td><td>this worker does not hold {@code chunk}; logged even if the
- *       chunk was already absent</td></tr>
- *   <tr><td>{@code BAD(chunk)}</td><td>this worker's copy failed verification</td></tr>
- *   <tr><td>{@code CMD_FAILED(cmdId, chunk, target, reason)}</td><td>a REPLICATE command could not be
- *       completed</td></tr>
+ *   <tr><td>{@code RECEIVED(chunk, size, checksum, version[, cmd_id])}</td><td>this worker holds verified bytes
+ *       of {@code chunk} at {@code version} (with a VERIFY's {@code cmd_id}: that VERIFY passed)</td></tr>
+ *   <tr><td>{@code DELETED(chunk, version, detail)}</td><td>this worker no longer holds {@code chunk}
+ *       ({@code deleted}, {@code corrupt} = quarantined, {@code missing})</td></tr>
+ *   <tr><td>{@code CMD_FAILED(chunk, version, reason[, target])}</td><td>the operation with this version
+ *       could not be carried out</td></tr>
  * </table>
  *
- * <p><b>Hold-back.</b> While a full report with baseline {@code M} is in progress
+ * <p><b>Hold-back.</b> While a resync listing with baseline {@code M} is in progress
  * ({@link #beginHold()} .. {@link #endHold()}), {@link #suffix} returns nothing numbered above
- * {@code M}, on every channel: the report covers everything up to {@code M}, and the controller
- * must not apply anything newer before the report completes.
+ * {@code M}, on every channel: the listing covers everything up to {@code M}, and the controller
+ * must not apply anything newer before the resync completes.
  *
  * <p><b>Overflow.</b> More than CHANGE_LOG_MAX un-acknowledged changes drop all of them and set
- * {@link #takeOverflow() overflowed}: the link then starts a full report, which supersedes them.
+ * {@link #isOverflowed() overflowed}: the link then asks the controller for a resync
+ * ({@code resync_wanted = overflow}), whose listing supersedes them.
  *
  * <p>Every method is synchronized on the log.
  */
@@ -61,34 +62,34 @@ public class ChangeLog {
         this.max = max;
     }
 
-    public synchronized Change append(ChangeType type, String chunkId, Long size, String checksum, String cmdId,
-                                      String target, String reason) {
-        Change change = new Change(++lastSeq, type, chunkId, size, checksum, cmdId, target, reason);
+    private synchronized Change append(Change unnumbered) {
+        Change change = new Change(++lastSeq, unnumbered.type(), unnumbered.chunkId(), unnumbered.size(),
+                unnumbered.checksum(), unnumbered.version(), unnumbered.cmdId(), unnumbered.target(),
+                unnumbered.reason(), unnumbered.detail());
         entries.addLast(change);
         if (entries.size() > max) {
             entries.clear();
             overflowed = true;
             overflows++;
-            log.warn("[link] change log overflowed ({} un-acknowledged changes); a full report replaces them", max);
+            log.warn("[link] change log overflowed ({} un-acknowledged changes); asking the controller for a resync", max);
         }
         notifyAll();
         return change;
     }
 
-    public Change received(String chunkId, long size, String checksum) {
-        return append(ChangeType.RECEIVED, chunkId, size, checksum, null, null, null);
+    /** This worker holds verified bytes of the chunk at {@code version} ({@code cmdId}: a VERIFY's answer). */
+    public Change received(String chunkId, long size, String checksum, long version, String cmdId) {
+        return append(Change.received(0, chunkId, size, checksum, version, cmdId));
     }
 
-    public Change deleted(String chunkId) {
-        return append(ChangeType.DELETED, chunkId, null, null, null, null, null);
+    /** This worker no longer holds the chunk, as of {@code version}; detail = deleted / corrupt / missing. */
+    public Change deleted(String chunkId, long version, String detail) {
+        return append(Change.deleted(0, chunkId, version, detail));
     }
 
-    public Change bad(String chunkId) {
-        return append(ChangeType.BAD, chunkId, null, null, null, null, null);
-    }
-
-    public Change cmdFailed(String cmdId, String chunkId, String target, String reason) {
-        return append(ChangeType.CMD_FAILED, chunkId, null, null, cmdId, target, reason);
+    /** The operation with this version could not be carried out. */
+    public Change cmdFailed(String chunkId, long version, String reason, String target, String cmdId, String detail) {
+        return append(Change.cmdFailed(0, chunkId, version, reason, target, cmdId, detail));
     }
 
     /** The controller has received every change up to {@code n}: forget them. Ignores {@code n > lastSeq}. */
@@ -151,11 +152,14 @@ public class ChangeLog {
         return entries.size();
     }
 
-    /** True once if the log overflowed since the last call. */
-    public synchronized boolean takeOverflow() {
-        boolean was = overflowed;
+    /** True if the log overflowed and no resync has replaced the dropped changes yet. */
+    public synchronized boolean isOverflowed() {
+        return overflowed;
+    }
+
+    /** A resync attempt started: its listing replaces whatever was dropped. */
+    public synchronized void clearOverflow() {
         overflowed = false;
-        return was;
     }
 
     public synchronized long overflows() {
@@ -163,13 +167,13 @@ public class ChangeLog {
     }
 
     /**
-     * The link's early wake-up: waits until a change above {@code after} may be sent (or the log
-     * overflowed), at most until {@code deadlineNanos} ({@link System#nanoTime()} scale).
+     * The link's early wake-up: waits until a change above {@code after} may be sent, at most until
+     * {@code deadlineNanos} ({@link System#nanoTime()} scale).
      *
      * @return true if there is something to send
      */
     public synchronized boolean awaitSendable(long after, long deadlineNanos) throws InterruptedException {
-        while (!overflowed && !hasSendable(after)) {
+        while (!hasSendable(after)) {
             long left = deadlineNanos - System.nanoTime();
             if (left <= 0) {
                 return false;

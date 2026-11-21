@@ -23,7 +23,7 @@ class ProtocolSystemTest extends ClusterTest {
      */
     @Override
     void configure(InProcessCluster cluster) {
-        cluster.workerSetting("worker.full-report-interval-seconds", "1.5");
+        cluster.controllerSetting("objectstore.resync-interval-seconds", "1.5");
     }
 
     @Test
@@ -82,19 +82,34 @@ class ProtocolSystemTest extends ClusterTest {
         HttpResponse<String> register = register(boot, 2, now);
         assertThat(register.statusCode()).isEqualTo(200);
         assertThat(api.json(register.body()).get("cluster_id").asString()).isEqualTo(api.status().get("cluster_id").asString());
+        long floor = api.json(register.body()).get("floor").asLong();
+        int attempt = api.json(register.body()).get("attempt").asInt();
+        assertThat(floor % 2).as("the registration fence is a controller version").isZero();
 
-        // A report segment and a change on a heartbeat; then the same heartbeat again.
-        HttpResponse<String> first = heartbeat(boot, 3, now, "[{\"seq\":1,\"type\":\"DELETED\",\"chunk_id\":\"%s-00000\"}]"
-                .formatted(UUID.randomUUID()), "{\"report_id\":\"r1\",\"index\":0,\"last\":true,\"baseline\":0,\"entries\":[]}");
+        // The registration listing on one heartbeat, then a change (the worker holds changes back while it
+        // lists); then the same heartbeat again.
+        HttpResponse<String> listing = heartbeat(boot, 3, now, "[]",
+                "{\"report_id\":\"r1\",\"floor\":%d,\"attempt\":%d,\"index\":0,\"last\":true,\"baseline\":0,\"entries\":[]}"
+                        .formatted(floor, attempt));
+        assertThat(listing.statusCode()).as(listing.body()).isEqualTo(200);
+        assertThat(api.json(listing.body()).get("segment_ack").get("report_id").asString()).isEqualTo("r1");
+        assertThat(api.json(listing.body()).get("segment_ack").get("status").asString()).isEqualTo("ok");
+        HttpResponse<String> first = heartbeat(boot, 4, now,
+                "[{\"seq\":1,\"type\":\"DELETED\",\"chunk_id\":\"%s-00000\",\"version\":%d,\"detail\":\"missing\"}]"
+                        .formatted(UUID.randomUUID(), floor | 1), null);
         assertThat(first.statusCode()).as(first.body()).isEqualTo(200);
         assertThat(api.json(first.body()).get("changes_received_up_to").asLong()).isEqualTo(1);
-        assertThat(api.json(first.body()).get("segment_ack").get("report_id").asString()).isEqualTo("r1");
-        HttpResponse<String> duplicate = heartbeat(boot, 3, now, "[]", null);
+        HttpResponse<String> duplicate = heartbeat(boot, 4, now, "[]", null);
         assertThat(duplicate.statusCode()).isEqualTo(200);
         assertThat(duplicate.body()).contains("\"ignored\":\"duplicate\"", "\"changes_received_up_to\":1");
+        // A resent listing segment of the completed attempt: "done", nothing applied twice.
+        HttpResponse<String> resent = heartbeat(boot, 5, now, "[]",
+                "{\"report_id\":\"r1\",\"floor\":%d,\"attempt\":%d,\"index\":0,\"last\":true,\"baseline\":0,\"entries\":[]}"
+                        .formatted(floor, attempt));
+        assertThat(api.json(resent.body()).get("segment_ack").get("status").asString()).isEqualTo("done");
 
-        assertError(heartbeat("another-boot", 4, now, "[]", null), 409, "stale_boot");
-        assertError(heartbeat(boot, 4, now - 20, "[]", null), 409, "too_old");
+        assertError(heartbeat("another-boot", 6, now, "[]", null), 409, "stale_boot");
+        assertError(heartbeat(boot, 6, now - 20, "[]", null), 409, "too_old");
         assertError(register(boot, 1, now), 409, "stale_registration");   // a delayed older attempt
         assertError(register(boot, 3, now - 20), 409, "too_old");
         assertError(api.postJson("/internal/workers/heartbeat",
@@ -106,7 +121,7 @@ class ProtocolSystemTest extends ClusterTest {
     }
 
     @Test
-    void theScannerFindsACorruptCopyWhichIsKeptAndNeverServed() throws Exception {
+    void theScannerQuarantinesACorruptCopyWhichIsKeptForDiagnosisAndNeverServed() throws Exception {
         byte[] data = Api.randomBytes(2 * MIB + 5, 3);
         String id = api.uploadOk("c.bin", data);
         String chunkId = id + "-00000";
@@ -114,9 +129,14 @@ class ProtocolSystemTest extends ClusterTest {
         Path file = cluster.chunkFile(holder, chunkId);
         Files.write(file, "XXXX".getBytes(), StandardOpenOption.WRITE);
 
-        await().atMost(PATIENCE).untilAsserted(() -> assertThat(locationState(id, 0, holder)).isEqualTo("CORRUPT"));
-        assertThat(Files.exists(file)).as("the corrupt file is kept").isTrue();
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(Files.exists(file)).isFalse());
+        Path quarantine = cluster.dataDir(holder).resolve("quarantine");
+        try (java.util.stream.Stream<Path> files = Files.list(quarantine)) {
+            assertThat(files.map(f -> f.getFileName().toString())).as("the corrupt bytes are kept")
+                    .anyMatch(name -> name.startsWith(chunkId + ".") && name.endsWith(".bad"));
+        }
         assertThat(api.download(id).body()).isEqualTo(data);
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(api.metadata(id).get("replication_ok").asBoolean()).isTrue());
     }
 
     @Test
