@@ -6,6 +6,7 @@ import com.objectstore.common.dto.HeartbeatRequest;
 import com.objectstore.common.dto.HeartbeatResponse;
 import com.objectstore.common.dto.RegisterRequest;
 import com.objectstore.common.dto.RegisterResponse;
+import com.objectstore.common.dto.Resync;
 import com.objectstore.common.dto.SegmentAck;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
@@ -29,6 +30,12 @@ import org.springframework.stereotype.Service;
  * <p>Registration and DEAD are tasks on the writer's queue ({@code Register}, {@code MarkDead}),
  * so they are ordered with everything else that worker did; the heartbeat's receipt step is one
  * brief block under the write lock that only queues work.
+ *
+ * <p><b>Fenced resync (v5 §5).</b> Every accepted registration starts a resync: the reply carries the
+ * fence {@code floor = t0} and attempt 1. Heartbeat replies carry {@code resync {t0, attempt}} until
+ * the attempt's segment 0 has arrived. While a worker is resyncing nothing new is handed to it (the
+ * hand-out filter in {@link ClusterState#takeCommands}); a resync without segment progress for
+ * RESYNC_STALL_TIMEOUT gets a new attempt.
  */
 @Service
 public class Registry {
@@ -127,9 +134,9 @@ public class Registry {
             if (worker == null) {
                 worker = cluster.addWorker(workerId, url, request.bootId());
                 accept(worker, request, url, now);
-                log.info("[registry] registered {} url={} boot={} attempt={} change_seq={}", workerId, url,
-                        shortId(request.bootId()), request.attempt(), request.changeSeq());
-                return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
+                log.info("[registry] registered {} url={} boot={} attempt={} change_seq={} fence={}", workerId, url,
+                        shortId(request.bootId()), request.attempt(), request.changeSeq(), worker.fenceFloor);
+                return response(worker);
             }
             if (worker.purging) {
                 // Impossible: MarkDead's purge is one task whose steps keep their queue position.
@@ -149,7 +156,7 @@ public class Registry {
                         + " is older than the accepted attempt " + worker.lastAttempt);
             }
             if (sameProcess && request.attempt() == worker.lastAttempt) {
-                return new RegisterResponse(true, cluster.clusterId(), worker.state.name());   // a lost reply, repeated
+                return response(worker);                     // a lost reply, repeated: the same fence and attempt
             }
             if (!sameProcess && cluster.recordBootFlip(worker)) {
                 duplicateRefusedUntil.put(workerId, now + DUPLICATE_REFUSAL_NANOS);
@@ -159,21 +166,26 @@ public class Registry {
             }
             WorkerState was = worker.state;
             accept(worker, request, url, now);
-            log.info("[registry] re-registered {} url={} boot={} attempt={} change_seq={} (was {}{})", workerId, url,
-                    shortId(request.bootId()), request.attempt(), request.changeSeq(), was,
+            log.info("[registry] re-registered {} url={} boot={} attempt={} change_seq={} fence={} (was {}{})", workerId,
+                    url, shortId(request.bootId()), request.attempt(), request.changeSeq(), worker.fenceFloor, was,
                     sameProcess ? ", same process" : "");
             if (was == WorkerState.DEAD) {
                 log.info("[registry] {} is back", workerId);
             }
-            return new RegisterResponse(true, cluster.clusterId(), worker.state.name());
+            return response(worker);
         }
+    }
+
+    private RegisterResponse response(WorkerInfo worker) {
+        return new RegisterResponse(true, cluster.clusterId(), worker.state.name(), worker.fenceFloor, worker.attempt);
     }
 
     /**
      * An accepted registration: a new epoch whose change stream starts after {@code change_seq}.
-     * What was in flight with the old epoch is forgotten (commands, pending copies to or from the
-     * worker, upload receipts, an open report session). The copies are kept: the report that
-     * follows confirms or removes them.
+     * What was in flight with the old process is forgotten (its command queue, receipts, an open
+     * listing); REPAIR ops it was the source of are re-sourced. The copies and the ops targeting it
+     * are kept: the resync that starts here confirms or removes the copies, and its completion drops
+     * the ops at or below the fence.
      */
     private void accept(WorkerInfo worker, RegisterRequest request, String url, long now) {
         worker.url = url;
@@ -186,17 +198,13 @@ public class Registry {
         worker.received = request.changeSeq();
         worker.applied = request.changeSeq();
         worker.lastAttempt = request.attempt();
-        cluster.closeSession(worker);
-        worker.resetReceipt();
         worker.hasReported = false;
-        worker.fullReportRequested = false;
-        cluster.clearCommands(worker);                  // its ledger entries wait for the new process
-        int dropped = cluster.dropPendingForWorker(worker.workerId, true, true);
+        cluster.clearCommands(worker);
         int purged = cluster.purgeReceipts(worker.workerId);
-        if (dropped + purged > 0) {
-            log.info("[registry] {} new epoch {}: dropped {} pending copies to or from it and {} upload receipts",
-                    worker.workerId, worker.epoch, dropped, purged);
+        if (purged > 0) {
+            log.info("[registry] {} new epoch {}: dropped {} upload receipts", worker.workerId, worker.epoch, purged);
         }
+        cluster.startResync(worker, "registration", false);
     }
 
     // ---- heartbeat ------------------------------------------------------------------------
@@ -221,7 +229,7 @@ public class Registry {
             WorkerInfo worker = accept(request.workerId(), request.bootId(), request.sentAt());
             if (request.seq() <= worker.lastHbSeq) {
                 cluster.increment("duplicates");
-                return new HeartbeatResponse(true, worker.state.name(), List.of(), false, "duplicate", worker.received, null);
+                return new HeartbeatResponse(true, worker.state.name(), List.of(), null, "duplicate", worker.received, null);
             }
             worker.lastHbSeq = request.seq();
             worker.lastSeen = cluster.now();
@@ -229,19 +237,15 @@ public class Registry {
             if (worker.state == WorkerState.STALE) {
                 worker.state = WorkerState.ALIVE;
                 log.info("[registry] {} ALIVE again (was STALE)", worker.workerId);
+                cluster.markInsertTargetsDirty(worker.workerId);
                 cluster.releasePostponed(properties.postponedBudget());
             }
-            boolean reportRunning = worker.reportInProgress() || request.segment() != null;
             receipts.acceptChanges(worker, request.changes());
             SegmentAck segmentAck = receipts.acceptSegment(worker, request.segment());
+            receipts.resyncWanted(worker, request.resyncWanted());
             List<Command> commands = cluster.takeCommands(worker);
-            // A worker ignores a report request that arrives during a report, so it is held back
-            // until the report is over instead of being lost.
-            boolean requestFull = worker.fullReportRequested && !reportRunning;
-            if (requestFull) {
-                worker.fullReportRequested = false;
-            }
-            return new HeartbeatResponse(true, worker.state.name(), commands, requestFull, null, worker.received, segmentAck);
+            Resync resync = worker.resyncing && !worker.segmentSeen ? new Resync(worker.fenceFloor, worker.attempt) : null;
+            return new HeartbeatResponse(true, worker.state.name(), commands, resync, null, worker.received, segmentAck);
         });
     }
 
@@ -290,11 +294,17 @@ public class Registry {
                 }
             }
             lastHealthRun = now;
+            long stall = properties.resyncStallTimeout().toNanos();
             for (WorkerInfo worker : cluster.workers().values()) {
                 long silence = now - worker.lastSeen;
                 if (worker.state == WorkerState.ALIVE && silence > staleAfter) {
                     worker.state = WorkerState.STALE;
+                    cluster.markInsertTargetsDirty(worker.workerId);
                     log.warn("[registry] {} STALE after {}s of silence", worker.workerId, String.format("%.1f", silence / 1e9));
+                }
+                if (worker.resyncing && !worker.isDead() && worker.state == WorkerState.ALIVE
+                        && now - worker.lastSegmentAt > stall) {
+                    cluster.newAttempt(worker, "no segment progress for " + properties.resyncStallTimeoutSeconds() + " s");
                 }
                 if (!worker.isDead() && !worker.deadQueued && silence > deadAfter
                         && queue.offer(markDead(worker.workerId, worker.epoch))) {
@@ -305,10 +315,12 @@ public class Registry {
     }
 
     /**
-     * {@code MarkDead} (§5.5), a multi-step task. It first checks again: if the epoch changed or
+     * {@code MarkDead} (v5 §6.1), a multi-step task. It first checks again: if the epoch changed or
      * a heartbeat arrived since it was queued, nothing happens. Otherwise the worker is DEAD: a new
-     * epoch, nothing in flight survives (commands, pending copies to or from it, receipts, its
-     * report session), and its replicas are removed in steps while it is {@code purging}.
+     * epoch, its commands cleared, receipts purged, every op targeting it dropped, the REPAIR ops it
+     * was the source of re-sourced, its resync ended, its VERIFY credit void ({@code verifyEpoch++}),
+     * and its replicas removed in steps while it is {@code purging}. Removing them lowers L and the
+     * planner schedules repairs.
      */
     Task markDead(String workerId, long epoch) {
         List<String>[] sweep = new List[1];
@@ -334,7 +346,12 @@ public class Registry {
                 cluster.clearCommands(worker);
                 cluster.closeSession(worker);
                 worker.resetReceipt();
-                dropped[0] = cluster.dropPendingForWorker(workerId, true, true);
+                dropped[0] = cluster.ops().dropTargeting(workerId, Long.MAX_VALUE, "worker DEAD");
+                cluster.ops().resourceFrom(workerId);
+                worker.resyncing = false;
+                worker.periodicResync = false;
+                worker.resyncRequested = null;
+                worker.verifyEpoch++;
                 cluster.purgeReceipts(workerId);
                 sweep[0] = new java.util.ArrayList<>(cluster.chunksOn(workerId));
             }
@@ -349,7 +366,7 @@ public class Registry {
             }
             worker.purging = false;
             worker.deadQueued = false;
-            log.warn("[registry] {} DEAD after {}s - {} replicas removed, {} pending copies dropped", workerId,
+            log.warn("[registry] {} DEAD after {}s - {} replicas removed, {} pending ops dropped", workerId,
                     String.format("%.1f", silenceSeconds[0]), sweep[0].size(), dropped[0]);
             return Task.Step.DONE;
         });

@@ -159,8 +159,9 @@ if ! curl -fsS "$BASE_URL/health" > /dev/null 2>&1; then
     exit 2
 fi
 step "The deployment: 1 controller, 4 workers, 1 client, each worker with its own persistent volume"
-docker ps --filter network=objectstore_objectstore-net --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' | sort | indent
-docker volume ls --filter name=objectstore_ --format '{{.Name}}' | sort | tr '\n' ' ' | indent
+PROJECT="${COMPOSE_PROJECT_NAME:-objectstore}"
+docker ps --filter network="${PROJECT}_objectstore-net" --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' | sort | indent
+docker volume ls --filter name="${PROJECT}_" --format '{{.Name}}' | sort | tr '\n' ' ' | indent
 echo
 if [ -s "$WORK/objects.txt" ]; then
     step "Removing the objects left behind by the previous run of this script"
@@ -395,7 +396,7 @@ controller_log | grep -F "[registry] $VICTIM is back" | tail -1 | indent
 repair_events trimmed "$FAIL_ID" | indent
 show_workers
 oscli where "$FAIL_ID" | indent
-check "$VICTIM's copies survived on its volume and came back in its block report; the surplus was trimmed" \
+check "$VICTIM's copies survived on its volume and came back in its resync listing; the surplus was trimmed after its survivors passed VERIFY" \
     test "$(count_repair_events trimmed "$FAIL_ID")" -eq "$AFFECTED"
 check "the replication factor is exactly 2 again: no chunk under- or over-replicated" cluster_healthy
 check "the files on the workers' disks match the database" copies_on_disk_are_intact "$FAIL_ID"
@@ -424,21 +425,22 @@ note "after:  sha256 on disk $(disk_sha256 "$WORKER_A" "$CHUNK_A")"
 note "recorded at upload     $SUM_A"
 oscli download "$INT_ID" "$WORK/integrity.out" | jq -c '{bytes, etag_match}' | indent
 check "the corrupted copy was NOT returned: the download is identical to the original" cmp -s "$WORK/integrity.bin" "$WORK/integrity.out"
-# The worker re-hashes the chunk before serving it, refuses (409 chunk_corrupt) and reports it bad;
-# the controller marks the copy CORRUPT and reads the other copy instead.
-DETECT_A="\[integrity\] chunk=$CHUNK_A (worker=|on )$WORKER_A"
-wait_until 30 "the controller log shows the detection" sh -c "docker logs controller 2>&1 | grep -qE '$DETECT_A'"
-docker logs "$WORKER_A" 2>&1 | grep -F "get chunk=$CHUNK_A" | tail -1 | cut -c1-160 | indent
+# The worker re-hashes the chunk before serving it: the bytes fail, so it quarantines them (moves them to
+# /data/quarantine, kept for diagnosis), answers 409 chunk_corrupt and logs DELETED(corrupt); the
+# controller reads the other copy instead and repairs the chunk from it.
+DETECT_A="\[monitor\] quarantined chunk=$CHUNK_A src=$WORKER_A"
+wait_until 30 "the controller log shows the quarantine" sh -c "docker logs controller 2>&1 | grep -qE '$DETECT_A'"
+docker logs "$WORKER_A" 2>&1 | grep -F "chunk=$CHUNK_A QUARANTINED" | tail -1 | cut -c1-160 | indent
 controller_log | grep -E "$DETECT_A" | tail -1 | cut -c1-160 | indent
 check "the corruption was detected and logged" sh -c "docker logs controller 2>&1 | grep -qE '$DETECT_A'"
+check "the corrupt bytes are kept in the quarantine, not deleted" \
+    sh -c "docker exec $WORKER_A ls /data/quarantine | grep -q '^$CHUNK_A\\.'"
 
-step "Restoration: replace first, then delete the corrupt copy (as HDFS does)"
-wait_until 60 "the corrupt copy is replaced and invalidated" \
-    sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event == \"invalidated\" and .chunk_id == \"$CHUNK_A\")] | length') -ge 1 ]"
+step "Restoration: the chunk is copied again from the valid copy"
 wait_until 60 "chunk 0 has two good copies again" exactly_two_good_copies "$INT_ID"
 status | jq -r --arg c "$CHUNK_A" '.repair_log[] | select(.chunk_id == $c) | "\(.time)  \(.event)  \(.source // "-") -> \(.target // "-")  (\(.reason))"' | indent
 SEQ_A=$(status | jq -r --arg c "$CHUNK_A" '[.repair_log[] | select(.chunk_id == $c) | .event] | join(" ")')
-check "a new copy was made from the valid one before the corrupt copy was deleted" sh -c "echo '$SEQ_A' | grep -q 'copied.*invalidated'"
+check "the corrupt copy was quarantined and a new copy made from the valid one" sh -c "echo '$SEQ_A' | grep -q 'quarantined.*copied'"
 check "every copy on disk hashes to the recorded checksum again" copies_on_disk_are_intact "$INT_ID"
 
 # --- B: found by the scrubber, nobody reads the object ------------------------------------
@@ -446,10 +448,10 @@ CHUNK_B=$(meta "$INT_ID" | jq -r '.chunks[2].chunk_id')
 WORKER_B=$(meta "$INT_ID" | jq -r '.chunks[2].locations[1].worker_id')
 step "B) Corrupt chunk 2 on $WORKER_B and do NOT read the object: the worker's block scanner must find it (every 10 s)"
 corrupt_chunk "$WORKER_B" "$CHUNK_B"
-wait_until 40 "the block scanner reports the corrupt copy" \
-    sh -c "docker logs controller 2>&1 | grep -qF '[integrity] chunk=$CHUNK_B on $WORKER_B CORRUPT (reported by worker)'"
+wait_until 40 "the block scanner quarantines the corrupt copy" \
+    sh -c "docker logs controller 2>&1 | grep -qF '[monitor] quarantined chunk=$CHUNK_B src=$WORKER_B'"
 docker logs "$WORKER_B" 2>&1 | grep -F "[scanner] CORRUPT chunk=$CHUNK_B" | tail -1 | cut -c1-140 | indent
-controller_log | grep -F "[integrity] chunk=$CHUNK_B" | tail -1 | cut -c1-160 | indent
+controller_log | grep -F "[monitor] quarantined chunk=$CHUNK_B" | tail -1 | cut -c1-160 | indent
 check "the block scanner detected the corruption without any download" \
     sh -c "docker logs $WORKER_B 2>&1 | grep -qF '[scanner] CORRUPT chunk=$CHUNK_B'"
 wait_until 60 "the chunk has two good copies again" exactly_two_good_copies "$INT_ID"
@@ -501,7 +503,7 @@ curl -fsS -o "$WORK/crash.out" "$API/objects/$CRASH_ID"
 check "it downloads byte-identical" cmp -s "$WORK/crash.bin" "$WORK/crash.out"
 
 step "fsck: the chunks the killed attempt had written are orphans; workers report them and they are deleted"
-note "(orphan deletion waits ORPHAN_GC_DELAY = 60 s after a controller start, then the next full block report, every 30 s)"
+note "(orphan deletion waits ORPHAN_GC_DELAY = 60 s after a controller start; then every worker is asked for a resync, whose listing names them)"
 fsck_healthy() { curl -fsS -m 60 "$API/fsck" | jq -e '.status == "HEALTHY" and .quiescent and .orphans_on_disk == 0
     and (.disk_vs_map | [.[] | length] | add) == 0' > /dev/null; }
 wait_until 180 "fsck reports HEALTHY with no orphans" fsck_healthy

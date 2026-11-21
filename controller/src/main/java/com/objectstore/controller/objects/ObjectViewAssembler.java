@@ -5,7 +5,6 @@ import com.objectstore.controller.api.dto.LocationResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
 import com.objectstore.controller.api.dto.ObjectSummary;
 import com.objectstore.controller.cluster.ClusterState;
-import com.objectstore.controller.cluster.ClusterState.Replica;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.config.ControllerProperties;
 import com.objectstore.controller.domain.Chunk;
@@ -43,9 +42,9 @@ public class ObjectViewAssembler {
             List<ChunkResponse> views = new ArrayList<>();
             for (Chunk chunk : chunkRows) {
                 List<LocationResponse> locations = new ArrayList<>();
-                for (Map.Entry<String, Replica> entry : cluster.replicasOf(chunk.chunkId()).entrySet()) {
-                    WorkerInfo worker = cluster.worker(entry.getKey());
-                    locations.add(new LocationResponse(entry.getKey(), entry.getValue().state.name(),
+                for (String workerId : cluster.replicasOf(chunk.chunkId()).keySet()) {
+                    WorkerInfo worker = cluster.worker(workerId);
+                    locations.add(new LocationResponse(workerId, cluster.replicaStatus(chunk.chunkId(), workerId),
                             worker == null ? "DEAD" : worker.state.name()));
                 }
                 replicationOk &= cluster.live(chunk.chunkId()).size() >= properties.replicationFactor();

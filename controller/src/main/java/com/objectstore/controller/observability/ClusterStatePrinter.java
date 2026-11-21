@@ -2,8 +2,7 @@ package com.objectstore.controller.observability;
 
 import com.objectstore.common.ChunkIds;
 import com.objectstore.controller.cluster.ClusterState;
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
-import com.objectstore.controller.cluster.ClusterState.Replica;
+import com.objectstore.controller.cluster.PendingOps;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.config.ControllerProperties;
 import com.objectstore.controller.domain.StoredObject;
@@ -126,7 +125,9 @@ public class ClusterStatePrinter {
         for (WorkerInfo w : workers) {
             lines.add(String.format("  %-8s  %-5s  %6d  %10d  %9s  %11d  %11d%s", w.workerId, w.state, cluster.chunksOn(w.workerId).size(),
                     heartbeats.getOrDefault(w.workerId, 0L), String.format("%.1f s", cluster.secondsSince(w.lastSeen)),
-                    w.commands.size(), cluster.pendingFrom(w.workerId), w.hasReported || w.isDead() ? "" : "   (registered, report not done yet)"));
+                    w.commands.size(), cluster.ops().streamsOf(w.workerId), w.resyncing
+                            ? "   (resyncing: fence " + w.fenceFloor + " attempt " + w.attempt + ")"
+                            : w.hasReported || w.isDead() ? "" : "   (registered, resync not done yet)"));
         }
 
         if (!newest.isEmpty()) {
@@ -142,15 +143,17 @@ public class ClusterStatePrinter {
                 for (int i = 0; i < shown; i++) {
                     String chunkId = ChunkIds.of(object.objectId(), i);
                     Map<String, String> marks = new LinkedHashMap<>();
-                    for (Map.Entry<String, Replica> copy : cluster.replicasOf(chunkId).entrySet()) {
-                        marks.put(copy.getKey(), switch (copy.getValue().state) {
-                            case OK -> "●";
-                            case CORRUPT -> "✗";
-                            case EXCESS -> "○";
+                    for (String holder : cluster.replicasOf(chunkId).keySet()) {
+                        marks.put(holder, switch (cluster.replicaStatus(chunkId, holder)) {
+                            case "CORRUPT" -> "✗";
+                            case "EXCESS" -> "○";
+                            default -> "●";
                         });
                     }
-                    for (PendingCopy copy : cluster.pendingOf(chunkId)) {
-                        marks.putIfAbsent(copy.target(), "⇢");
+                    for (PendingOps.Op op : cluster.ops().opsFor(chunkId)) {
+                        if (op.kind() == PendingOps.Kind.INSERT) {
+                            marks.putIfAbsent(op.workerId, "⇢");
+                        }
                     }
                     rows.add(new ChunkRow(i == 0 ? truncate(object.name()) : "", i, marks));
                 }
@@ -167,10 +170,11 @@ public class ClusterStatePrinter {
                 }
             }
         }
-        Map<String, Integer> ledger = cluster.ledger().counts();
-        lines.add("  repairs: " + h[1] + " chunks short of copies · " + h[0] + " with no live copy · " + cluster.pendingTotal()
-                + " copies on their way · surplus " + h[2] + " · deletions " + ledger.get("waiting") + " waiting, "
-                + ledger.get("queued") + " queued, " + ledger.get("delivered") + " sent");
+        Map<String, Integer> deletes = cluster.ops().deleteCounts();
+        lines.add("  repairs: " + h[1] + " chunks short of copies · " + h[0] + " with no live copy · " + cluster.ops().inserts()
+                + " copies on their way · surplus " + h[2] + " · deletions " + deletes.get("waiting") + " waiting, "
+                + deletes.get("queued") + " queued, " + deletes.get("delivered") + " sent · VERIFYs outstanding "
+                + cluster.verifyOutstanding() + " · surplus waiting for VERIFY " + cluster.postponedSize());
         return lines;
     }
 

@@ -8,7 +8,8 @@ spring:
     virtual:
       enabled: true
   lifecycle:
-    timeout-per-shutdown-phase: 3s
+    # Must stay above SHUTDOWN_DRAIN_TIMEOUT and below the container's stop_grace_period (10 s).
+    timeout-per-shutdown-phase: 6s
   autoconfigure:
     # A worker has no database. These only matter when the controller's jars share the classpath
     # (the in-process system tests); in a worker container the classes do not exist.
@@ -31,7 +32,6 @@ worker:
   max-chunk-size: ${CHUNK_SIZE:1048576}
   heartbeat-interval-seconds: ${HEARTBEAT_INTERVAL:2}
   heartbeat-http-timeout-seconds: ${HEARTBEAT_HTTP_TIMEOUT:3}
-  full-report-interval-seconds: ${FULL_REPORT_INTERVAL:300}
   # Showcase output (docker-compose.showcase.yml): this worker's state every N seconds. Off by default.
   state-print-interval-seconds: ${STATE_PRINT_INTERVAL:0}
   heartbeat-min-gap-ms: ${HEARTBEAT_MIN_GAP_MS:250}
@@ -44,6 +44,11 @@ worker:
   disk-check-interval-seconds: ${DISK_CHECK_INTERVAL:30}
   connect-timeout-seconds: ${CONNECT_TIMEOUT:2}
   read-timeout-seconds: ${READ_TIMEOUT:10}
+  tombstone-max: ${TOMBSTONE_MAX:100000}
+  executor-queue-max: ${EXECUTOR_QUEUE_MAX:500}
+  server-read-timeout-seconds: ${SERVER_READ_TIMEOUT:20}
+  shutdown-drain-timeout-seconds: ${SHUTDOWN_DRAIN_TIMEOUT:3}
+  exit-on-fail-stop: true
   background-enabled: true
 
 logging:

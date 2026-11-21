@@ -56,7 +56,7 @@ class WriterTest {
         t.reRegister("worker1");                                // a new epoch
 
         t.queue.put(t.applier.applyChangesTask("worker1", oldEpoch, List.of(
-                new Change(1, ChangeType.RECEIVED, chunk(0), 10L, TestSupport.SUM, null, null, null))));
+                Change.received(1, chunk(0), 10L, TestSupport.SUM, 3, null))));
         t.writer.barrier(WAIT);
 
         assertThat(cluster.read(() -> cluster.chunksOn("worker1"))).isEmpty();
@@ -148,7 +148,7 @@ class WriterTest {
         t.join("worker1");
         cluster.write(() -> {
             cluster.putChunk(object + "-00000", new ClusterState.ChunkInfo(object, 0, 10, TestSupport.SUM));
-            cluster.addReplica(object + "-00000", "worker1", ClusterState.ReplicaState.OK);
+            cluster.addReplica(object + "-00000", "worker1", 0);
         });
 
         t.queue.put(t.namespaceTasks.applyObjectMirror(object, List.of()));   // deleted in the database

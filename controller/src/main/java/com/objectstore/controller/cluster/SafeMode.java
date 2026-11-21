@@ -3,7 +3,6 @@ package com.objectstore.controller.cluster;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.config.ControllerProperties;
 import java.util.Map;

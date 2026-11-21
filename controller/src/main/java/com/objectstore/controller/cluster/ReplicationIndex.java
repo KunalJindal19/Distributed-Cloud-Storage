@@ -1,8 +1,8 @@
 package com.objectstore.controller.cluster;
 
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
-import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
+import com.objectstore.controller.cluster.PendingOps.Kind;
+import com.objectstore.controller.cluster.PendingOps.Op;
+import com.objectstore.controller.cluster.PendingOps.Reason;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -14,18 +14,19 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Everything derived from the block map that must be cheap to read (v4 §7.1, §7.2): the
- * {@link NeededReplication} levels, the {@code cleanup} and {@code postponed} sets, and the counters
- * (copies by state, under-/over-replicated and missing chunks, {@code safeCount}).
+ * Everything derived from the block map that must be cheap to read: the {@link NeededReplication}
+ * levels, the {@code cleanup} and {@code postponed} sets, and the counters (copies by the state the
+ * API shows, under-/over-replicated and missing chunks, {@code safeCount}).
  *
- * <p><b>One place changes it.</b> Every method of {@link ClusterState} that changes a copy, a
- * pending copy, a ledger entry or the chunk mirror calls {@code markDirty(c)}; before every
- * write-lock release ({@code flushDirty}) each dirty chunk is recomputed from scratch, O(copies of
- * the chunk), and the counters move by the difference. Nothing else touches the index.
+ * <p><b>Accounting (v5 §6.2).</b> L = copies on ALIVE or STALE workers (a pending DELETE does not
+ * remove a copy from L until its DELETED arrives); P = INSERT ops (REPAIR, UPLOAD) whose target is
+ * ALIVE, reported and not resyncing. A chunk sits in the level for {@code (L, P)} while
+ * {@code L + P < RF}. A chunk is in {@code cleanup} when {@code L > RF} and no op of any kind is
+ * pending on it (at most one EXCESS at a time).
  *
- * <p>A chunk is in {@code cleanup} when it has more than RF live copies and nothing pending, or a
- * CORRUPT or EXCESS copy without a ledger entry while RF live copies exist. The planner moves a cleanup chunk whose holders are not all current (STALE or not
- * reported) to {@code postponed}. Guarded by the cluster lock.
+ * <p><b>One place changes it.</b> Every method that changes a copy, an op or the chunk mirror calls
+ * {@code markDirty(c)}; before every write-lock release each dirty chunk is recomputed from scratch,
+ * O(copies + ops of the chunk), and the counters move by the difference. Guarded by the cluster lock.
  */
 final class ReplicationIndex {
 
@@ -82,35 +83,29 @@ final class ReplicationIndex {
         int okCount = 0;
         int corruptCount = 0;
         int excessCount = 0;
-        for (Map.Entry<String, Replica> holder : cluster.replicasOf(chunkId).entrySet()) {
-            Replica replica = holder.getValue();
-            WorkerInfo worker = cluster.worker(holder.getKey());
-            switch (replica.state) {
-                case OK -> {
-                    okCount++;
-                    if (worker != null && !worker.isDead()) {
-                        live++;
-                    }
-                }
-                case CORRUPT -> corruptCount++;
-                case EXCESS -> excessCount++;
+        PendingOps ops = cluster.ops();
+        for (String workerId : cluster.replicasOf(chunkId).keySet()) {
+            WorkerInfo worker = cluster.worker(workerId);
+            if (worker != null && !worker.isDead()) {
+                live++;
+            }
+            Reason deletion = ops.deleteReason(chunkId, workerId);
+            if (deletion == Reason.CORRUPT) {
+                corruptCount++;
+            } else if (deletion == Reason.EXCESS) {
+                excessCount++;
+            } else {
+                okCount++;
             }
         }
-        int pending = cluster.pendingOf(chunkId).size();
-        boolean wantsCleanup = (live > rf && pending == 0) || needsDeletion(chunkId, live);
+        int pending = 0;
+        for (Op op : ops.opsFor(chunkId)) {
+            if (op.kind() == Kind.INSERT && cluster.isCurrent(cluster.worker(op.workerId))) {
+                pending++;
+            }
+        }
+        boolean wantsCleanup = live > rf && ops.countFor(chunkId) == 0;
         return new Entry(levels.levelFor(live, pending), live, pending, okCount, corruptCount, excessCount, wantsCleanup);
-    }
-
-    /** An EXCESS copy without a ledger entry, or a CORRUPT one while RF live copies exist. */
-    private boolean needsDeletion(String chunkId, int live) {
-        for (Map.Entry<String, Replica> holder : cluster.replicasOf(chunkId).entrySet()) {
-            ReplicaState state = holder.getValue().state;
-            if ((state == ReplicaState.EXCESS || state == ReplicaState.CORRUPT) && live >= rf
-                    && cluster.ledger().entry(chunkId, holder.getKey()) == null) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** Recomputes one chunk and moves it between levels and sets; the counters move by the difference. */
@@ -208,6 +203,28 @@ final class ReplicationIndex {
     /** Chunks with at least one live copy (safe mode). */
     long safeCount() {
         return entries.size() - missing;
+    }
+
+    /** A postponed chunk goes back to cleanup now (a VERIFY answer earned credit). */
+    void unpostpone(String chunkId) {
+        if (postponed.remove(chunkId)) {
+            cleanup.add(chunkId);
+        }
+    }
+
+    /** Known chunks with no live copy, at most {@code limit} (a scan: for fsck, not for the status). */
+    List<String> unrecoverable(int limit) {
+        List<String> list = new ArrayList<>();
+        for (Map.Entry<String, Entry> entry : entries.entrySet()) {
+            if (list.size() >= limit) {
+                break;
+            }
+            if (entry.getValue().live() == 0) {
+                list.add(entry.getKey());
+            }
+        }
+        list.sort(null);
+        return list;
     }
 
     /** Moves up to {@code budget} postponed chunks back to cleanup (a worker became current). */

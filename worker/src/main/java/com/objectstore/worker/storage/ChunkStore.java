@@ -2,10 +2,11 @@ package com.objectstore.worker.storage;
 
 import com.objectstore.common.Checksums;
 import com.objectstore.common.ChunkIds;
+import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.ChunkInfo;
+import com.objectstore.common.dto.ReportEntry;
 import com.objectstore.common.dto.WorkerStats;
 import com.objectstore.worker.config.WorkerProperties;
-import com.objectstore.common.dto.ReportEntry;
 import com.objectstore.worker.reporting.ChangeLog;
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
@@ -18,6 +19,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -28,37 +30,43 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
- * Disk operations for chunks (the DataNode's block storage). Each chunk is two files directly
- * under {@code DATA_DIR/chunks}: the data, named exactly after the chunk id, and a
- * {@code <chunk_id>.meta} sidecar holding its SHA-256 and size (HDFS's {@code .meta} file).
+ * The worker as a versioned store (v5 §4; the DataNode's block storage). Each chunk is two files
+ * directly under {@code DATA_DIR/chunks}: the data, named after the chunk id, and a
+ * {@code <chunk_id>.meta} sidecar ({@code <sha256> <size>}). Copies that failed verification move to
+ * {@code DATA_DIR/quarantine/<chunk_id>.<n>.bad} (same volume: an atomic rename), are never indexed
+ * and never deleted by a command.
  *
- * <p>Guarantees:
- * <ul>
- *   <li><b>No partial files.</b> Data and meta are each written to a unique temporary name, forced
- *       to the device and renamed; the directory is forced afterwards. A crash never leaves a
- *       half-written file under a chunk id, and a 201 means the bytes are on the platter.</li>
- *   <li><b>No silent corruption on write.</b> The bytes are hashed and compared with the checksum
- *       the sender declared before anything touches the disk. Writing a chunk that already
- *       exists verifies the stored data; rotten data is replaced by the new, verified bytes.</li>
- *   <li><b>No corruption served.</b> A read re-hashes the data and compares it with the sidecar.</li>
- *   <li><b>No path traversal.</b> Only ids matching the strict chunk id pattern are resolved.</li>
- * </ul>
+ * <p><b>Records and versions.</b> In memory every chunk has at most one record: a copy in
+ * {@link #index} (size, checksum, version) or a tombstone (the version it was deleted at). Every
+ * PUT and DELETE carries an operation version and passes {@link #check} under the chunk's stripe
+ * lock: newer than both the record and the fence → applied; equal to the record of the same kind →
+ * REPEAT (the same result is logged again, so a lost answer is re-delivered); anything else →
+ * STALE ({@code CMD_FAILED(stale)}, nothing changes). Tombstones are kept until a fence covers them,
+ * never just because their {@code DELETED} was acknowledged.
  *
- * <p><b>The in-memory index.</b> Every chunk on disk is in {@link #index} with its size and
- * sidecar checksum, plus running totals, so statistics are O(1) and listing needs no disk walk.
- * The index is built in {@link #initialise()} (the only full walk at start-up) and changed only
- * under the chunk's stripe lock, in this order: the disk operation, its fsync, the index, then
- * the change event. The block scanner reconciles the index with the directory for files added or
- * removed behind the store's back. {@link #knownBad} holds the chunks whose data failed
- * verification in this process.
+ * <p><b>The fence</b> is adopted from the controller under all stripes ({@link #adoptFence}); until
+ * the first registration of this process ({@code fenceSet = false}) every versioned operation is
+ * STALE.
  *
- * <p>Every change is appended to the {@link ChangeLog} after the index reflects it, so the
- * controller learns about it in order, on the next heartbeat or PUT answer.
+ * <p><b>Local observations</b> (a corrupt copy, a vanished file, a file placed by hand) use the odd
+ * {@code localVersion = max(record, fence) | 1}: never equal to a controller version, they never
+ * complete a controller operation. A verdict found outside the stripe is applied only under it,
+ * after checking that the record has not changed and re-hashing.
+ *
+ * <p><b>Installing a copy</b>: data to a temporary file + fsync; sidecar to a temporary file +
+ * fsync; sidecar renamed into place + directory fsync; data renamed into place, the commit point;
+ * directory fsync; index; {@code RECEIVED(v)}. A failure before the commit point cleans up and
+ * answers 500; at or after it the worker fail-stops ({@link FailStop}). A copy is never
+ * overwritten in place.
+ *
+ * <p>Every change is appended to the {@link ChangeLog} under the stripe, after the index reflects it.
  */
 @Component
 public class ChunkStore {
@@ -66,27 +74,38 @@ public class ChunkStore {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
     private static final String META_SUFFIX = ".meta";
     private static final String TMP_SUFFIX = ".tmp";
+    private static final String BAD_SUFFIX = ".bad";
     private static final long WRITE_HEADROOM = 1_048_576;
     private static final int LOCK_STRIPES = 64;
     /** A file modified more recently than this may be a write in progress: reconciliation leaves it alone. */
     public static final java.time.Duration SETTLE_TIME = java.time.Duration.ofSeconds(5);
+
+    /** The result of the version check (v5 §4.2). */
+    public enum Verdict { ACCEPT, REPEAT, STALE }
+
+    public enum PutOutcome { CREATED, REVERIFIED, REPEAT, STALE }
+
+    public enum DeleteOutcome { DELETED, REPEAT, STALE, IO_ERROR, REFUSED }
+
+    public enum VerifyOutcome { PASS, FAILED, MISSING, UNAVAILABLE }
+
+    /** A chunk as read from disk; only bytes that match their sidecar are ever returned. */
+    public record StoredChunk(byte[] data, String checksum, long version) {
+    }
+
     /**
-     * The checksum listed for a chunk whose data failed verification ({@link #knownBad}): it
-     * matches nothing, so the controller treats the copy as corrupt.
+     * A chunk read for a transfer, without the stripe: {@code version} of the record when the read
+     * began (-1 if not indexed), the bytes (null if the file is missing), the sidecar checksum, and
+     * whether the bytes match the sidecar.
      */
-    public static final String UNVERIFIED = "unverified";
-
-    public enum WriteResult { CREATED, EXISTS }
-
-    /** A chunk as read from disk. {@code corrupt} is set when the bytes no longer match the sidecar. */
-    public record StoredChunk(byte[] data, String checksum, boolean corrupt) {
+    public record LocalCopy(long version, byte[] data, String sidecarChecksum, boolean intact) {
     }
 
     public record Meta(String checksum, long size) {
     }
 
-    /** One chunk in the index: its size and the checksum from its sidecar. */
-    public record Entry(long size, String checksum) {
+    /** One chunk in the index: its size, the checksum from its sidecar, and its record version. */
+    public record Entry(long size, String checksum, long version) {
     }
 
     /** What one reconciliation of the index with the directory changed. */
@@ -95,6 +114,14 @@ public class ChunkStore {
         public boolean isEmpty() {
             return added + removed == 0;
         }
+    }
+
+    /** Test hook: called at named steps of the install, delete and quarantine paths. */
+    @FunctionalInterface
+    public interface Faults {
+        void at(String step) throws IOException;
+
+        Faults NONE = step -> { };
     }
 
     public static class InvalidChunkIdException extends RuntimeException {
@@ -109,42 +136,87 @@ public class ChunkStore {
         }
     }
 
-    public static class ChunkConflictException extends RuntimeException {
-        public ChunkConflictException(String chunkId) {
-            super("chunk " + chunkId + " already exists with different content");
-        }
-    }
-
     public static class InsufficientStorageException extends RuntimeException {
         public InsufficientStorageException(long needed, long free) {
             super("need " + needed + " bytes but only " + free + " are free");
         }
     }
 
-    private final Path chunkDir;
-    private final ChangeLog changes;
-    private final ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
-    private final ConcurrentHashMap<String, Entry> index = new ConcurrentHashMap<>();
-    private final AtomicLong chunkCount = new AtomicLong();
-    private final AtomicLong usedBytes = new AtomicLong();
-    private final Set<String> knownBad = ConcurrentHashMap.newKeySet();
-
-    public ChunkStore(WorkerProperties properties, ChangeLog changes) {
-        this.chunkDir = properties.chunkDir().toAbsolutePath().normalize();
-        this.changes = changes;
-        for (int i = 0; i < locks.length; i++) {
-            locks[i] = new ReentrantLock();
+    /** 503: the worker is shutting down or has fail-stopped. */
+    public static class UnavailableException extends RuntimeException {
+        public UnavailableException(String message) {
+            super(message);
         }
     }
 
+    /** 409 chunk_corrupt: the copy failed verification and is in quarantine. */
+    public static class CorruptChunkException extends RuntimeException {
+        public CorruptChunkException(String chunkId) {
+            super("chunk " + chunkId + " is corrupt on this worker (quarantined)");
+        }
+    }
+
+    /** 500: a disk error before the commit point; nothing changed. */
+    public static class StoreFailedException extends RuntimeException {
+        public StoreFailedException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    private final Path chunkDir;
+    private final Path quarantineDir;
+    private final ChangeLog changes;
+    private final FailStop failStop;
+    private final MutationGuard guard;
+    private final ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
+    private final ConcurrentHashMap<String, Entry> index = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> tombstones = new ConcurrentHashMap<>();
+    /** Chunks whose last record is a quarantine (a GET answers 409 chunk_corrupt). */
+    private final Set<String> quarantinedIds = ConcurrentHashMap.newKeySet();
+    /** (chunk, version) pairs being received right now. */
+    private final Set<String> incoming = ConcurrentHashMap.newKeySet();
+    private final AtomicLong chunkCount = new AtomicLong();
+    private final AtomicLong usedBytes = new AtomicLong();
+    private final AtomicLong quarantinedChunks = new AtomicLong();
+    private final AtomicLong quarantinedBytes = new AtomicLong();
+    private final AtomicLong quarantineNumber = new AtomicLong();
+    private volatile long fence;
+    private volatile boolean fenceSet;
+    private volatile Faults faults = Faults.NONE;
+
+    @Autowired
+    public ChunkStore(WorkerProperties properties, ChangeLog changes, FailStop failStop, MutationGuard guard) {
+        this.chunkDir = properties.chunkDir().toAbsolutePath().normalize();
+        this.quarantineDir = properties.quarantineDir().toAbsolutePath().normalize();
+        this.changes = changes;
+        this.failStop = failStop;
+        this.guard = guard;
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new ReentrantLock(true);              // fair (v5 §2)
+        }
+    }
+
+    /** For tests: no exit on fail-stop, no shutdown drain. */
+    public ChunkStore(WorkerProperties properties, ChangeLog changes) {
+        this(properties, changes, new FailStop(), new MutationGuard(0));
+    }
+
+    public void setFaultsForTests(Faults faults) {
+        this.faults = faults == null ? Faults.NONE : faults;
+    }
+
+    // ---- start-up recovery (v5 §4.7) ---------------------------------------------------------
+
     /**
-     * Start-up: one walk of the chunk directory that removes temporary files left by a crash,
-     * rebuilds a missing or unreadable sidecar from the data (the data was verified before it was
-     * renamed into place), drops sidecars whose data is gone, and fills the index.
+     * One walk of the chunk directory: temporary files and sidecars without data (left by a crash
+     * before a commit point) are deleted; data without a sidecar (only from v4 or placed by hand) is
+     * hashed and gets one; every data + sidecar pair is indexed at version 0. The quarantine is
+     * counted. There is no fence and no tombstone until the worker registers.
      */
     @PostConstruct
     void initialise() throws IOException {
         Files.createDirectories(chunkDir);
+        Files.createDirectories(quarantineDir);
         int tmp = 0;
         int rebuilt = 0;
         int strayMeta = 0;
@@ -165,105 +237,464 @@ public class ChunkStore {
                     if (meta.isEmpty()) {
                         byte[] data = Files.readAllBytes(file);
                         meta = Optional.of(new Meta(Checksums.sha256Hex(data), data.length));
-                        writeMeta(name, meta.get());
+                        writeMetaReplacing(name, meta.get());
                         rebuilt++;
                     }
-                    indexPut(name, new Entry(meta.get().size(), meta.get().checksum()));
+                    indexPut(name, new Entry(meta.get().size(), meta.get().checksum(), 0));
                 }
             }
         }
         FsyncSupport.fsyncDirectory(chunkDir);
+        long maxNumber = 0;
+        try (DirectoryStream<Path> files = Files.newDirectoryStream(quarantineDir)) {
+            for (Path file : files) {
+                String name = file.getFileName().toString();
+                if (!name.endsWith(BAD_SUFFIX)) {
+                    continue;
+                }
+                quarantinedChunks.incrementAndGet();
+                quarantinedBytes.addAndGet(Files.size(file));
+                String[] parts = name.split("\\.");
+                if (parts.length >= 3) {
+                    try {
+                        maxNumber = Math.max(maxNumber, Long.parseLong(parts[parts.length - 2]));
+                    } catch (NumberFormatException ignored) {
+                        // a file renamed by hand
+                    }
+                }
+            }
+        }
+        quarantineNumber.set(maxNumber);
         if (tmp + rebuilt + strayMeta > 0) {
-            log.warn("[store] start-up cleanup: {} temporary files removed, {} sidecars rebuilt, {} stray sidecars removed",
+            log.warn("[store] start-up recovery: {} temporary files removed, {} sidecars rebuilt, {} stray sidecars removed",
                     tmp, rebuilt, strayMeta);
         }
-        log.info("[store] chunk directory {} ready with {} chunks ({} bytes)", chunkDir, chunkCount.get(), usedBytes.get());
+        log.info("[store] chunk directory {} ready with {} chunks ({} bytes); {} quarantined copies ({} bytes)",
+                chunkDir, chunkCount.get(), usedBytes.get(), quarantinedChunks.get(), quarantinedBytes.get());
     }
 
-    // ---- writes, reads, deletes ------------------------------------------------------------
+    // ---- versions and the fence ----------------------------------------------------------------
+
+    /** The version check (v5 §4.2). Must be called under the chunk's stripe. */
+    Verdict check(String chunkId, long version, boolean put) {
+        if (!fenceSet) {
+            return Verdict.STALE;
+        }
+        Entry entry = index.get(chunkId);
+        Long tomb = tombstones.get(chunkId);
+        long current = entry != null ? entry.version() : tomb != null ? tomb : 0;
+        if (version <= Math.max(current, fence)) {
+            boolean sameKind = put ? entry != null : entry == null && tomb != null;
+            return version == current && sameKind ? Verdict.REPEAT : Verdict.STALE;
+        }
+        return Verdict.ACCEPT;
+    }
+
+    /** The odd version of a local observation: {@code max(record, fence) | 1}. Under the stripe. */
+    long localVersion(String chunkId) {
+        Entry entry = index.get(chunkId);
+        Long tomb = tombstones.get(chunkId);
+        long current = entry != null ? entry.version() : tomb != null ? tomb : 0;
+        return Math.max(current, fence) | 1;
+    }
+
+    public long fence() {
+        return fence;
+    }
+
+    public boolean isFenceSet() {
+        return fenceSet;
+    }
 
     /**
-     * Stores a chunk. Idempotent: writing identical content again verifies the stored data and
-     * reports {@link WriteResult#EXISTS} (the chunk is announced again). If the stored data no
-     * longer matches its sidecar it is rotten: it is replaced by the new, verified bytes and
-     * {@link WriteResult#CREATED} is reported.
+     * Adopts a fence (v5 §5.3): takes every stripe in index order (so every mutation in progress
+     * finishes first), sets the fence, removes the tombstones it covers, runs {@code underStripes}
+     * (the change log's {@code beginHold}, for a heartbeat resync) and releases the stripes.
      *
-     * @throws InvalidChunkIdException      if the id is not a well-formed chunk id
-     * @throws InsufficientStorageException if the volume lacks room for the chunk plus headroom
-     * @throws ChecksumMismatchException    if the bytes do not hash to {@code expectedChecksum}
-     * @throws ChunkConflictException       if a file with this id exists and holds different content
+     * @return what {@code underStripes} returned, or -1 if it is null
      */
-    public WriteResult write(String chunkId, byte[] data, String expectedChecksum) {
-        Path target = pathFor(chunkId);
-        long free = freeBytes();
-        if (free < data.length + WRITE_HEADROOM) {
-            throw new InsufficientStorageException(data.length + WRITE_HEADROOM, free);
+    public long adoptFence(long t0, LongSupplier underStripes) {
+        for (ReentrantLock lock : locks) {
+            lock.lock();
         }
+        try {
+            fence = t0;
+            fenceSet = true;
+            int before = tombstones.size();
+            tombstones.values().removeIf(version -> version <= t0);
+            long result = underStripes == null ? -1 : underStripes.getAsLong();
+            log.info("[store] fence {} adopted; {} tombstones it covers removed ({} left)", t0,
+                    before - tombstones.size(), tombstones.size());
+            return result;
+        } finally {
+            for (int i = locks.length - 1; i >= 0; i--) {
+                locks[i].unlock();
+            }
+        }
+    }
+
+    public int tombstoneCount() {
+        return tombstones.size();
+    }
+
+    /** The tombstone version of a chunk, or null. */
+    public Long tombstone(String chunkId) {
+        return tombstones.get(chunkId);
+    }
+
+    // ---- receiving (PUT) -----------------------------------------------------------------------
+
+    /** Marks {@code (chunk, version)} as being received; false if it already is (409 in_progress). */
+    public boolean beginIncoming(String chunkId, long version) {
+        return incoming.add(chunkId + "@" + version);
+    }
+
+    public void endIncoming(String chunkId, long version) {
+        incoming.remove(chunkId + "@" + version);
+    }
+
+    /** True if new mutations are refused (shutting down or fail-stopped). */
+    public boolean isClosing() {
+        return guard.isClosing() || failStop.failed();
+    }
+
+    /**
+     * Installs a copy at {@code version} (v5 §4.3). The caller read the body (at most one chunk).
+     *
+     * @throws ChecksumMismatchException    if the bytes do not hash to {@code expectedChecksum}
+     * @throws InsufficientStorageException if the volume lacks room
+     * @throws UnavailableException         if the worker is closing or failed (503)
+     * @throws StoreFailedException         on a disk error before the commit point (500)
+     */
+    public PutOutcome put(String chunkId, long version, byte[] data, String expectedChecksum) {
+        Path target = pathFor(chunkId);
+        failStop.check();
         String actual = Checksums.sha256Hex(data);
         if (!actual.equals(expectedChecksum)) {
             throw new ChecksumMismatchException(expectedChecksum, actual);
         }
-        ReentrantLock lock = lockFor(chunkId);
-        lock.lock();
+        long free = freeBytes();
+        if (free < data.length + WRITE_HEADROOM) {
+            throw new InsufficientStorageException(data.length + WRITE_HEADROOM, free);
+        }
+        if (!guard.enter()) {
+            throw new UnavailableException("this worker is shutting down");
+        }
         try {
-            if (Files.exists(target)) {
-                Optional<Meta> meta = readMeta(chunkId);
-                if (meta.isPresent() && !meta.get().checksum().equals(expectedChecksum)) {
-                    throw new ChunkConflictException(chunkId);
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                failStop.check();
+                Verdict verdict = check(chunkId, version, true);
+                if (verdict == Verdict.REPEAT) {
+                    Entry entry = index.get(chunkId);
+                    changes.received(chunkId, entry.size(), entry.checksum(), version, null);
+                    return PutOutcome.REPEAT;
                 }
-                String stored = hashFile(target);
-                if (stored.equals(expectedChecksum)) {
-                    if (meta.isEmpty()) {
-                        writeMeta(chunkId, new Meta(actual, data.length));
-                        FsyncSupport.fsyncDirectory(chunkDir);
+                if (verdict == Verdict.STALE) {
+                    changes.cmdFailed(chunkId, version, InternalApi.FAILED_STALE, null, null,
+                            "put not newer than " + describeRecord(chunkId));
+                    return PutOutcome.STALE;
+                }
+                if (index.containsKey(chunkId) || Files.exists(target)) {
+                    Optional<Meta> meta = readMeta(chunkId);
+                    String stored = hashOrNull(target);
+                    if (meta.isPresent() && expectedChecksum.equals(meta.get().checksum())
+                            && expectedChecksum.equals(stored) && meta.get().size() == data.length) {
+                        // The bytes are already here and intact: no disk write, only the new version.
+                        indexPut(chunkId, new Entry(data.length, expectedChecksum, version));
+                        tombstones.remove(chunkId);
+                        quarantinedIds.remove(chunkId);
+                        changes.received(chunkId, data.length, expectedChecksum, version, null);
+                        return PutOutcome.REVERIFIED;
                     }
-                    indexPut(chunkId, new Entry(data.length, actual));
-                    knownBad.remove(chunkId);
-                    changes.received(chunkId, data.length, actual); // re-announced
-                    return WriteResult.EXISTS;
+                    log.warn("[store] chunk={} stored copy fails its sidecar or the expected checksum; quarantining it "
+                            + "before installing the verified bytes", chunkId);
+                    quarantineLocked(chunkId, localVersion(chunkId), "replaced by a verified copy");
                 }
-                if (meta.isEmpty()) {
-                    throw new ChunkConflictException(chunkId); // no sidecar: rotten or different, unknowable
-                }
-                log.warn("[store] chunk={} stored data is rotten (disk={}); replacing it with the verified bytes",
-                        chunkId, stored);
+                install(chunkId, target, data, expectedChecksum, version);
+                return PutOutcome.CREATED;
+            } finally {
+                lock.unlock();
             }
-            writeNew(chunkId, target, data, actual);
-            indexPut(chunkId, new Entry(data.length, actual));
-            knownBad.remove(chunkId);
-            changes.received(chunkId, data.length, actual);
-            return WriteResult.CREATED;
-        } catch (IOException e) {
-            throw new UncheckedIOException("could not write chunk " + chunkId, e);
         } finally {
-            lock.unlock();
+            guard.exit();
         }
     }
 
-    /** The normal write path: unique temporary file, fsync, atomic rename, sidecar, directory fsync. */
-    private void writeNew(String chunkId, Path target, byte[] data, String checksum) throws IOException {
-        Path tmp = chunkDir.resolve(chunkId + "." + UUID.randomUUID() + TMP_SUFFIX);
+    /** The new-copy order (v5 §4.3 step 4). Under the stripe. */
+    private void install(String chunkId, Path target, byte[] data, String checksum, long version) {
+        String unique = UUID.randomUUID().toString();
+        Path dataTmp = chunkDir.resolve(chunkId + "." + unique + TMP_SUFFIX);
+        Path metaTmp = chunkDir.resolve(chunkId + META_SUFFIX + "." + unique + TMP_SUFFIX);
+        Path meta = metaPath(chunkId);
         try {
-            FsyncSupport.writeAndForce(tmp, data);
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
-        } finally {
-            Files.deleteIfExists(tmp);
+            faults.at("data-temp");
+            FsyncSupport.writeAndForce(dataTmp, data);
+        } catch (IOException e) {
+            deleteQuietly(dataTmp);
+            throw new StoreFailedException("could not write chunk " + chunkId, e);
         }
-        writeMeta(chunkId, new Meta(checksum, data.length));
-        FsyncSupport.fsyncDirectory(chunkDir);
+        try {
+            faults.at("meta-temp");
+            FsyncSupport.writeAndForce(metaTmp, metaBytes(new Meta(checksum, data.length)));
+        } catch (IOException e) {
+            deleteQuietly(dataTmp);
+            deleteQuietly(metaTmp);
+            throw new StoreFailedException("could not write the sidecar of " + chunkId, e);
+        }
+        try {
+            faults.at("meta-rename");
+            Files.move(metaTmp, meta, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            FsyncSupport.fsyncDirectory(chunkDir);
+        } catch (IOException e) {
+            deleteQuietly(dataTmp);
+            deleteQuietly(metaTmp);
+            deleteQuietly(meta);
+            throw new StoreFailedException("could not install the sidecar of " + chunkId, e);
+        }
+        try {
+            faults.at("data-rename");                                 // the commit point
+            Files.move(dataTmp, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            failStop.trigger(chunkId, "install: data rename (commit point)", e);
+            throw new UnavailableException("disk failure while installing " + chunkId);
+        }
+        try {
+            faults.at("after-commit");
+            FsyncSupport.fsyncDirectory(chunkDir);
+        } catch (IOException e) {
+            failStop.trigger(chunkId, "install: directory fsync after the commit point", e);
+            throw new UnavailableException("disk failure while installing " + chunkId);
+        }
+        indexPut(chunkId, new Entry(data.length, checksum, version));
+        tombstones.remove(chunkId);
+        quarantinedIds.remove(chunkId);
+        changes.received(chunkId, data.length, checksum, version, null);
+    }
+
+    // ---- deleting (DELETE command, v5 §4.4) ----------------------------------------------------------
+
+    /**
+     * Removes the copy as of {@code version}: reason {@code corrupt} quarantines the bytes (if any),
+     * any other reason unlinks data and sidecar. The tombstone becomes {@code version} and
+     * {@code DELETED(version)} is logged. A failure before the unlink logs
+     * {@code CMD_FAILED(io_error)}; at or after it the worker fail-stops.
+     */
+    public DeleteOutcome delete(String chunkId, long version, boolean corrupt, String cmdId) {
+        Path target = pathFor(chunkId);
+        if (failStop.failed() || !guard.enter()) {
+            return DeleteOutcome.REFUSED;
+        }
+        try {
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                if (failStop.failed()) {
+                    return DeleteOutcome.REFUSED;
+                }
+                Verdict verdict = check(chunkId, version, false);
+                if (verdict == Verdict.REPEAT) {
+                    changes.deleted(chunkId, version, quarantinedIds.contains(chunkId)
+                            ? InternalApi.DELETED_CORRUPT : InternalApi.DELETED_DELETED);
+                    return DeleteOutcome.REPEAT;
+                }
+                if (verdict == Verdict.STALE) {
+                    changes.cmdFailed(chunkId, version, InternalApi.FAILED_STALE, null, cmdId,
+                            "delete not newer than " + describeRecord(chunkId));
+                    return DeleteOutcome.STALE;
+                }
+                boolean exists = Files.exists(target);
+                try {
+                    faults.at("delete-prepare");
+                } catch (IOException e) {
+                    changes.cmdFailed(chunkId, version, InternalApi.FAILED_IO_ERROR, null, cmdId, e.toString());
+                    return DeleteOutcome.IO_ERROR;
+                }
+                if (corrupt && exists) {
+                    quarantineLocked(chunkId, version, "the controller found it corrupt");   // logs DELETED(v, corrupt)
+                    return DeleteOutcome.DELETED;
+                }
+                try {
+                    faults.at("delete-unlink");                              // the commit point
+                    Files.deleteIfExists(target);
+                } catch (IOException e) {
+                    failStop.trigger(chunkId, "delete: unlink (commit point)", e);
+                    throw new UnavailableException("disk failure while deleting " + chunkId);
+                }
+                try {
+                    Files.deleteIfExists(metaPath(chunkId));
+                    FsyncSupport.fsyncDirectory(chunkDir);
+                } catch (IOException e) {
+                    failStop.trigger(chunkId, "delete: sidecar unlink after the commit point", e);
+                    throw new UnavailableException("disk failure while deleting " + chunkId);
+                }
+                indexRemove(chunkId);
+                tombstones.put(chunkId, version);
+                changes.deleted(chunkId, version, corrupt ? InternalApi.DELETED_CORRUPT : InternalApi.DELETED_DELETED);
+                return DeleteOutcome.DELETED;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            guard.exit();
+        }
+    }
+
+    // ---- quarantine and other local observations (v5 §4.5) --------------------------------------------
+
+    /**
+     * Moves the data to the quarantine, deletes the sidecar, sets the tombstone and logs
+     * {@code DELETED(tombVersion, corrupt)}. Under the stripe. The rename is the commit point.
+     */
+    private void quarantineLocked(String chunkId, long tombVersion, String why) {
+        Path data = chunkDir.resolve(chunkId);
+        long size = 0;
+        boolean moved = false;
+        if (Files.exists(data)) {
+            Path bad = quarantineDir.resolve(chunkId + "." + quarantineNumber.incrementAndGet() + BAD_SUFFIX);
+            try {
+                size = Files.size(data);
+                faults.at("quarantine-rename");
+                Files.move(data, bad, StandardCopyOption.ATOMIC_MOVE);
+                moved = true;
+            } catch (IOException e) {
+                failStop.trigger(chunkId, "quarantine: rename (commit point)", e);
+                throw new UnavailableException("disk failure while quarantining " + chunkId);
+            }
+        }
+        try {
+            Files.deleteIfExists(metaPath(chunkId));
+            FsyncSupport.fsyncDirectory(chunkDir);
+            FsyncSupport.fsyncDirectory(quarantineDir);
+        } catch (IOException e) {
+            failStop.trigger(chunkId, "quarantine: sidecar unlink after the commit point", e);
+            throw new UnavailableException("disk failure while quarantining " + chunkId);
+        }
+        if (moved) {
+            quarantinedChunks.incrementAndGet();
+            quarantinedBytes.addAndGet(size);
+        }
+        indexRemove(chunkId);
+        tombstones.put(chunkId, tombVersion);
+        quarantinedIds.add(chunkId);
+        log.warn("[store] chunk={} QUARANTINED ({}); tombstone {}", chunkId, why, tombVersion);
+        changes.deleted(chunkId, tombVersion, InternalApi.DELETED_CORRUPT);
     }
 
     /**
-     * Reads a chunk and verifies it against its sidecar. A mismatch is returned as
-     * {@code corrupt = true}, the chunk joins {@link #knownBad} and is reported once; the bytes are
-     * never served.
+     * Applies a corruption verdict found outside the stripe: under the stripe, if the record still
+     * has {@code observedVersion}, the file is hashed again; if it still fails its sidecar (or the
+     * sidecar differs from {@code expected}, when given) it is quarantined at {@code localVersion}.
+     * A vanished file is recorded as missing instead.
+     *
+     * @return true if the copy was quarantined (or found missing)
+     */
+    public boolean quarantineIfBad(String chunkId, long observedVersion, String expected) {
+        pathFor(chunkId);
+        if (failStop.failed() || !guard.enter()) {
+            return false;
+        }
+        try {
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                Entry entry = index.get(chunkId);
+                if (entry == null || entry.version() != observedVersion) {
+                    return false;                               // the record changed: the verdict is void
+                }
+                Path data = chunkDir.resolve(chunkId);
+                if (!Files.exists(data)) {
+                    missingLocked(chunkId);
+                    return true;
+                }
+                if (intact(chunkId, data, expected)) {
+                    return false;                               // passes now (it was replaced meanwhile)
+                }
+                quarantineLocked(chunkId, localVersion(chunkId), expected == null ? "bytes do not match the sidecar"
+                        : "bytes or sidecar do not match the expected checksum");
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            guard.exit();
+        }
+    }
+
+    /** An indexed chunk whose file is gone: re-checked under the stripe, then {@code DELETED(odd, missing)}. */
+    public boolean observeMissing(String chunkId, long observedVersion) {
+        pathFor(chunkId);
+        if (failStop.failed() || !guard.enter()) {
+            return false;
+        }
+        try {
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                Entry entry = index.get(chunkId);
+                if (entry == null || entry.version() != observedVersion || Files.exists(chunkDir.resolve(chunkId))) {
+                    return false;
+                }
+                missingLocked(chunkId);
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            guard.exit();
+        }
+    }
+
+    private void missingLocked(String chunkId) {
+        long version = localVersion(chunkId);
+        try {
+            Files.deleteIfExists(metaPath(chunkId));
+        } catch (IOException ignored) {
+            // a stray sidecar is removed by the next start-up recovery
+        }
+        indexRemove(chunkId);
+        tombstones.put(chunkId, version);
+        log.warn("[store] chunk={} is gone from the disk; tombstone {}", chunkId, version);
+        changes.deleted(chunkId, version, InternalApi.DELETED_MISSING);
+    }
+
+    /** True if the file hashes to its sidecar (and the sidecar is {@code expected}, when given). */
+    private boolean intact(String chunkId, Path data, String expected) {
+        Optional<Meta> meta = readMeta(chunkId);
+        String actual = hashOrNull(data);
+        try {
+            return meta.isPresent() && actual != null && meta.get().checksum().equals(actual)
+                    && meta.get().size() == Files.size(data) && (expected == null || expected.equals(meta.get().checksum()));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    // ---- reading -----------------------------------------------------------------------------------
+
+    /**
+     * Reads a chunk for a GET and verifies it against its sidecar. Bytes that fail are quarantined
+     * (under the stripe, after a re-check) and never served.
+     *
+     * @return empty if the chunk is not here
+     * @throws CorruptChunkException if the copy is (now) in quarantine
      */
     public Optional<StoredChunk> read(String chunkId) {
         Path target = pathFor(chunkId);
+        failStop.check();
+        Entry entry = index.get(chunkId);
+        if (entry == null) {
+            if (quarantinedIds.contains(chunkId)) {
+                throw new CorruptChunkException(chunkId);
+            }
+            return Optional.empty();
+        }
         byte[] data;
         try {
             data = Files.readAllBytes(target);
         } catch (NoSuchFileException e) {
+            observeMissing(chunkId, entry.version());
             return Optional.empty();
         } catch (IOException e) {
             throw new UncheckedIOException("could not read chunk " + chunkId, e);
@@ -271,51 +702,74 @@ public class ChunkStore {
         String actual = Checksums.sha256Hex(data);
         Optional<Meta> meta = readMeta(chunkId);
         if (meta.isEmpty() || !meta.get().checksum().equals(actual) || meta.get().size() != data.length) {
-            markBad(chunkId, "read");
-            return Optional.of(new StoredChunk(data, meta.map(Meta::checksum).orElse(actual), true));
-        }
-        return Optional.of(new StoredChunk(data, actual, false));
-    }
-
-    /** Removes the data and the sidecar. Reports {@code deleted} even if there was nothing to delete. */
-    public boolean delete(String chunkId) {
-        Path target = pathFor(chunkId);
-        ReentrantLock lock = lockFor(chunkId);
-        lock.lock();
-        try {
-            boolean removed = Files.deleteIfExists(target);
-            Files.deleteIfExists(metaPath(chunkId));
-            FsyncSupport.fsyncDirectory(chunkDir);
-            indexRemove(chunkId);
-            knownBad.remove(chunkId);
-            changes.deleted(chunkId);
-            return removed;
-        } catch (IOException e) {
-            throw new UncheckedIOException("could not delete chunk " + chunkId, e);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** The chunk's data failed verification: remember it, and report it the first time. */
-    public boolean markBad(String chunkId, String by) {
-        if (knownBad.add(chunkId)) {
-            if (!"scanner".equals(by)) {          // the scanner logs its own [scanner] CORRUPT line
-                log.warn("[store] chunk={} failed verification ({}); reported bad", chunkId, by);
+            if (quarantineIfBad(chunkId, entry.version(), null)) {
+                throw new CorruptChunkException(chunkId);
             }
-            changes.bad(chunkId);
-            return true;
+            throw new UnavailableException("chunk " + chunkId + " changed while it was read; try again");
         }
-        return false;
+        return Optional.of(new StoredChunk(data, actual, entry.version()));
     }
 
-    /** The chunk's data verified again (the file was replaced): no longer known bad. */
-    boolean clearBad(String chunkId) {
-        return knownBad.remove(chunkId);
+    /** Reads a copy for a REPLICATE, without the stripe (v5 §4.6). */
+    public LocalCopy readLocal(String chunkId) {
+        Path target = pathFor(chunkId);
+        failStop.check();
+        Entry entry = index.get(chunkId);
+        long version = entry == null ? -1 : entry.version();
+        byte[] data;
+        try {
+            data = Files.readAllBytes(target);
+        } catch (NoSuchFileException e) {
+            return new LocalCopy(version, null, null, false);
+        } catch (IOException e) {
+            return new LocalCopy(version, null, null, false);
+        }
+        Optional<Meta> meta = readMeta(chunkId);
+        boolean intact = meta.isPresent() && meta.get().checksum().equals(Checksums.sha256Hex(data))
+                && meta.get().size() == data.length;
+        return new LocalCopy(version, data, meta.map(Meta::checksum).orElse(null), intact);
     }
 
-    public boolean isKnownBad(String chunkId) {
-        return knownBad.contains(chunkId);
+    /**
+     * The VERIFY command (v5 §4.6): hashes the copy and compares it with its sidecar and
+     * {@code expected}. Pass → {@code RECEIVED(current version, cmdId)}, logged under the stripe
+     * after checking the record did not change. Fail → quarantine. Missing → {@code DELETED(odd,
+     * missing)} if it was indexed. Cannot run → nothing is logged.
+     */
+    public VerifyOutcome verifyCopy(String chunkId, String expected, String cmdId) {
+        Path target = pathFor(chunkId);
+        if (failStop.failed()) {
+            return VerifyOutcome.UNAVAILABLE;
+        }
+        Entry entry = index.get(chunkId);
+        if (entry == null) {
+            return VerifyOutcome.MISSING;
+        }
+        if (!Files.exists(target)) {
+            return observeMissing(chunkId, entry.version()) ? VerifyOutcome.MISSING : VerifyOutcome.UNAVAILABLE;
+        }
+        if (!intact(chunkId, target, expected)) {
+            return quarantineIfBad(chunkId, entry.version(), expected) ? VerifyOutcome.FAILED : VerifyOutcome.UNAVAILABLE;
+        }
+        if (!guard.enter()) {
+            return VerifyOutcome.UNAVAILABLE;
+        }
+        try {
+            ReentrantLock lock = lockFor(chunkId);
+            lock.lock();
+            try {
+                Entry now = index.get(chunkId);
+                if (now == null || now.version() != entry.version()) {
+                    return VerifyOutcome.UNAVAILABLE;            // changed meanwhile: no credit, no harm
+                }
+                changes.received(chunkId, now.size(), now.checksum(), now.version(), cmdId);
+                return VerifyOutcome.PASS;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            guard.exit();
+        }
     }
 
     public Optional<Meta> readMeta(String chunkId) {
@@ -353,29 +807,18 @@ public class ChunkStore {
 
     /** The index, read-only. */
     public Map<String, Entry> index() {
-        return java.util.Collections.unmodifiableMap(index);
+        return Collections.unmodifiableMap(index);
     }
 
-    /**
-     * Every chunk with its size and sidecar checksum, from the index (no disk access), sorted by
-     * id. A chunk in {@link #knownBad} is listed with {@link #UNVERIFIED} as its checksum.
-     */
-    public List<ChunkInfo> list() {
-        List<ChunkInfo> chunks = new ArrayList<>(index.size());
-        index.forEach((chunkId, entry) -> chunks.add(new ChunkInfo(chunkId, entry.size(),
-                knownBad.contains(chunkId) ? UNVERIFIED : entry.checksum())));
-        chunks.sort(Comparator.comparing(ChunkInfo::chunkId));
-        return chunks;
+    public boolean isQuarantined(String chunkId) {
+        return quarantinedIds.contains(chunkId);
     }
 
-    /**
-     * The listing for a full report: every indexed chunk with its size, sidecar checksum and
-     * whether it is known bad, sorted by id. From memory only.
-     */
+    /** The resync listing (v5 §5.3): every indexed chunk with its size, checksum and version, sorted. No locks. */
     public List<ReportEntry> reportEntries() {
         List<ReportEntry> entries = new ArrayList<>(index.size());
-        index.forEach((chunkId, entry) -> entries.add(
-                new ReportEntry(chunkId, entry.size(), entry.checksum(), knownBad.contains(chunkId))));
+        index.forEach((chunkId, entry) -> entries.add(new ReportEntry(chunkId, entry.size(), entry.checksum(),
+                entry.version())));
         entries.sort(Comparator.comparing(ReportEntry::chunkId));
         return entries;
     }
@@ -420,10 +863,10 @@ public class ChunkStore {
 
     /**
      * Brings the index in line with the directory (the scanner's first step). A valid chunk file
-     * that is not in the index (copied in by hand) is added, its sidecar rebuilt from the data if
-     * missing, and reported {@code received}; an indexed chunk whose data file is gone (deleted by
-     * hand) is removed and reported {@code deleted}. Each is re-checked under its stripe lock.
-     * Files modified within {@link #SETTLE_TIME} are skipped: they may be writes in progress.
+     * that is not indexed (placed by hand) is indexed at {@code localVersion}, its sidecar rebuilt
+     * if missing, and reported {@code RECEIVED(odd)}; an indexed chunk whose file is gone is
+     * reported {@code DELETED(odd, missing)}. Each is re-checked under its stripe. Files modified
+     * within {@link #SETTLE_TIME} are skipped: they may be writes in progress.
      */
     public Reconciled reconcile() {
         Set<String> onDisk = chunkIdsOnDisk();
@@ -434,47 +877,47 @@ public class ChunkStore {
             if (index.containsKey(chunkId) || !isSettled(chunkId, settledBefore)) {
                 continue;
             }
-            ReentrantLock lock = lockFor(chunkId);
-            lock.lock();
+            if (failStop.failed() || !guard.enter()) {
+                break;
+            }
             try {
-                Path file = chunkDir.resolve(chunkId);
-                if (index.containsKey(chunkId) || !Files.exists(file)) {
-                    continue;
+                ReentrantLock lock = lockFor(chunkId);
+                lock.lock();
+                try {
+                    Path file = chunkDir.resolve(chunkId);
+                    if (index.containsKey(chunkId) || !Files.exists(file)) {
+                        continue;
+                    }
+                    Optional<Meta> meta = readMeta(chunkId);
+                    if (meta.isEmpty()) {
+                        byte[] data = Files.readAllBytes(file);
+                        meta = Optional.of(new Meta(Checksums.sha256Hex(data), data.length));
+                        writeMetaReplacing(chunkId, meta.get());
+                        FsyncSupport.fsyncDirectory(chunkDir);
+                    }
+                    long version = localVersion(chunkId);
+                    indexPut(chunkId, new Entry(meta.get().size(), meta.get().checksum(), version));
+                    tombstones.remove(chunkId);
+                    quarantinedIds.remove(chunkId);
+                    changes.received(chunkId, meta.get().size(), meta.get().checksum(), version, null);
+                    added++;
+                    log.warn("[scanner] chunk={} appeared on disk; indexed at version {}", chunkId, version);
+                } catch (IOException e) {
+                    log.warn("[scanner] chunk={} could not be added to the index: {}", chunkId, e.toString());
+                } finally {
+                    lock.unlock();
                 }
-                Optional<Meta> meta = readMeta(chunkId);
-                if (meta.isEmpty()) {
-                    byte[] data = Files.readAllBytes(file);
-                    meta = Optional.of(new Meta(Checksums.sha256Hex(data), data.length));
-                    writeMeta(chunkId, meta.get());
-                    FsyncSupport.fsyncDirectory(chunkDir);
-                }
-                indexPut(chunkId, new Entry(meta.get().size(), meta.get().checksum()));
-                changes.received(chunkId, meta.get().size(), meta.get().checksum());
-                added++;
-                log.warn("[scanner] chunk={} appeared on disk; added to the index", chunkId);
-            } catch (IOException e) {
-                log.warn("[scanner] chunk={} could not be added to the index: {}", chunkId, e.toString());
             } finally {
-                lock.unlock();
+                guard.exit();
             }
         }
         for (String chunkId : chunkIds()) {
             if (onDisk.contains(chunkId)) {
                 continue;
             }
-            ReentrantLock lock = lockFor(chunkId);
-            lock.lock();
-            try {
-                if (!index.containsKey(chunkId) || Files.exists(chunkDir.resolve(chunkId))) {
-                    continue;
-                }
-                indexRemove(chunkId);
-                knownBad.remove(chunkId);
-                changes.deleted(chunkId);
+            Entry entry = index.get(chunkId);
+            if (entry != null && observeMissing(chunkId, entry.version())) {
                 removed++;
-                log.warn("[scanner] chunk={} is gone from the disk; removed from the index", chunkId);
-            } finally {
-                lock.unlock();
             }
         }
         return new Reconciled(added, removed);
@@ -489,40 +932,30 @@ public class ChunkStore {
     }
 
     /**
-     * Verifies one chunk's data against its sidecar on disk (the scanner's second step).
+     * Verifies one chunk against its sidecar for the scanner, reading outside the stripe; a failure
+     * is applied by {@link #quarantineIfBad}.
      *
-     * @return true if it matches; false if it does not (or its sidecar is missing or invalid);
-     *         empty if the chunk is gone
+     * @return true if intact; false if quarantined; empty if gone or changed meanwhile
      */
-    public Optional<Boolean> verify(String chunkId) {
-        Path file = pathFor(chunkId);
-        try {
-            String actual = Checksums.sha256Hex(file);
-            Optional<Meta> meta = readMeta(chunkId);
-            return Optional.of(meta.isPresent() && meta.get().checksum().equals(actual)
-                    && meta.get().size() == Files.size(file));
-        } catch (NoSuchFileException gone) {
+    public Optional<Boolean> scan(String chunkId) {
+        Entry entry = index.get(chunkId);
+        if (entry == null) {
             return Optional.empty();
-        } catch (IOException e) {
-            log.warn("[scanner] chunk={} could not be read: {}", chunkId, e.toString());
-            return Optional.of(false);
         }
-    }
-
-    /** Re-verifies a chunk under its stripe lock (so a write in progress cannot look like damage). */
-    public Optional<Boolean> verifyLocked(String chunkId) {
-        ReentrantLock lock = lockFor(chunkId);
-        lock.lock();
-        try {
-            return verify(chunkId);
-        } finally {
-            lock.unlock();
+        Path file = pathFor(chunkId);
+        if (!Files.exists(file)) {
+            return Optional.empty();                   // the next reconciliation reports it
         }
+        if (intact(chunkId, file, null)) {
+            return Optional.of(true);
+        }
+        return quarantineIfBad(chunkId, entry.version(), null) ? Optional.of(false) : Optional.empty();
     }
 
     /** O(1): the index's running totals and the volume's free space. Never walks the disk. */
     public WorkerStats stats(int activeTransfers) {
-        return new WorkerStats(chunkCount.get(), usedBytes.get(), freeBytes(), activeTransfers);
+        return new WorkerStats(chunkCount.get(), usedBytes.get(), freeBytes(), activeTransfers,
+                quarantinedChunks.get(), quarantinedBytes.get(), tombstones.size());
     }
 
     public long freeBytes() {
@@ -538,22 +971,46 @@ public class ChunkStore {
         return chunkDir;
     }
 
-    private void writeMeta(String chunkId, Meta meta) throws IOException {
+    public Path quarantineDir() {
+        return quarantineDir;
+    }
+
+    private String describeRecord(String chunkId) {
+        Entry entry = index.get(chunkId);
+        Long tomb = tombstones.get(chunkId);
+        String record = entry != null ? "copy v" + entry.version() : tomb != null ? "tombstone v" + tomb : "no record";
+        return record + " / fence " + (fenceSet ? fence : "none");
+    }
+
+    private static byte[] metaBytes(Meta meta) {
+        return (meta.checksum() + " " + meta.size() + "\n").getBytes(StandardCharsets.US_ASCII);
+    }
+
+    /** Writes a sidecar where none (or an unreadable one) is: recovery and reconciliation only. */
+    private void writeMetaReplacing(String chunkId, Meta meta) throws IOException {
         Path target = metaPath(chunkId);
         Path tmp = chunkDir.resolve(chunkId + META_SUFFIX + "." + UUID.randomUUID() + TMP_SUFFIX);
         try {
-            FsyncSupport.writeAndForce(tmp, (meta.checksum() + " " + meta.size() + "\n").getBytes(StandardCharsets.US_ASCII));
+            FsyncSupport.writeAndForce(tmp, metaBytes(meta));
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } finally {
             Files.deleteIfExists(tmp);
         }
     }
 
-    private static String hashFile(Path file) {
+    private static String hashOrNull(Path file) {
         try {
             return Checksums.sha256Hex(file);
         } catch (IOException e) {
-            throw new UncheckedIOException("could not hash " + file, e);
+            return null;
+        }
+    }
+
+    private static void deleteQuietly(Path file) {
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException ignored) {
+            // start-up recovery removes it
         }
     }
 
