@@ -49,13 +49,17 @@ class RegistrationTest {
     @Test
     void theSameAttemptAgainIsAnsweredWithoutAReset() {
         t.knowChunk(chunk(0));
-        t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds()));
+        com.objectstore.common.dto.RegisterResponse first = t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds()));
         t.fake("worker1").boot = "boot-a";
+        t.fake("worker1").fence = first.floor();
+        t.fake("worker1").reportAttempt = first.attempt();
         t.fullReport("worker1", "boot-a", chunk(0));
-        cluster.locked(() -> cluster.ledger().request(chunk(0), "worker1", DeletionLedger.ORPHAN));
+        cluster.locked(() -> cluster.ops().ensure(chunk(0), "worker1", PendingOps.Reason.ORPHAN));
         long epoch = cluster.locked(() -> cluster.worker("worker1").epoch);
 
-        assertThat(t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds())).ok()).isTrue();
+        com.objectstore.common.dto.RegisterResponse again = t.registry.register(request("boot-a", 1, 0, InternalApi.nowSeconds()));
+        assertThat(again.ok()).isTrue();
+        assertThat(again.floor()).as("the same fence: the earlier reply was lost").isEqualTo(first.floor());
 
         cluster.locked(() -> {
             WorkerInfo worker = cluster.worker("worker1");
@@ -79,12 +83,15 @@ class RegistrationTest {
         String upload = "dddddddd-7d0e-4c1b-9a54-1f2e3d4c5b6a";
         cluster.locked(() -> {
             cluster.beginUpload(upload);
-            cluster.putReceipt(upload + "-00000", "worker1", cluster.worker("worker1").epoch, 10, TestSupport.SUM, 0);
-            cluster.addPending(chunk(0), "worker1", "worker2", "cmd-1");
-            cluster.ledger().request(chunk(0), "worker1", DeletionLedger.ORPHAN);
+            cluster.putReceipt(upload + "-00000", "worker1", cluster.worker("worker1").epoch, 10, TestSupport.SUM, 3, 0);
+            PendingOps.Op repair = cluster.ops().ensure(chunk(0), "worker2", PendingOps.Reason.REPAIR);
+            cluster.ops().setSource(repair, "worker1");
+            cluster.ops().tryQueue(repair);
         });
-        // A report is in progress when the process restarts.
-        t.send("worker1", List.of(), new ReportSegment("r", 0, false, 0, List.of()));
+        // A listing is in progress when the process restarts.
+        t.send("worker1", List.of(), null, InternalApi.RESYNC_TOMBSTONES);
+        t.send("worker1", List.of(), new ReportSegment("r", t.fake("worker1").fence, t.fake("worker1").reportAttempt, 0,
+                false, 0, List.of()));
         long epoch = cluster.locked(() -> cluster.worker("worker1").epoch);
 
         t.register("worker1");   // a new process: change_seq 0
@@ -97,7 +104,8 @@ class RegistrationTest {
             assertThat(worker.session).isNull();
             assertThat(worker.hasReported).isFalse();
             assertThat(worker.commands).isEmpty();
-            assertThat(cluster.pendingTotal()).isZero();
+            assertThat(worker.resyncing).isTrue();
+            assertThat(cluster.ops().get(chunk(0), "worker2").source()).as("its outgoing copy is re-sourced").isNull();
             assertThat(cluster.receipt(upload + "-00000", "worker1")).isNull();
             assertThat(cluster.replica(chunk(0), "worker1")).as("replicas are kept for the report").isNotNull();
         });
@@ -112,8 +120,7 @@ class RegistrationTest {
         t.register("worker1");
 
         cluster.locked(() -> t.applier.applyChanges("worker1", oldEpoch, List.of(
-                new com.objectstore.common.dto.Change(1, com.objectstore.common.dto.ChangeType.RECEIVED, chunk(0), 10L,
-                        TestSupport.SUM, null, null, null))));
+                com.objectstore.common.dto.Change.received(1, chunk(0), 10L, TestSupport.SUM, 3, null))));
 
         assertThat(cluster.locked(() -> cluster.chunksOn("worker1"))).isEmpty();
         assertThat(cluster.counter("stale_tasks_dropped")).isEqualTo(1);

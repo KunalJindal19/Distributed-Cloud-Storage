@@ -133,7 +133,7 @@ def reached(kind, s, victim, files_short=0):
         return state == "DEAD" and enough and not s["safe_mode"]
     clean = (s["over_replicated"] == 0 and s["replicas"]["excess"] == 0 and s["replicas"]["corrupt"] == 0
              and sum((s.get("ledger") or {}).values()) == 0)
-    everyone = all(w["state"] == "ALIVE" and w["has_reported"] for w in s["workers"])
+    everyone = all(w["state"] == "ALIVE" and w["has_reported"] and not w.get("resyncing") for w in s["workers"])
     return everyone and copies_ok and clean and not s["safe_mode"]
 
 
@@ -147,8 +147,8 @@ def follow(kind, victim, timeout, object_ids):
             rf = s["config"]["replication_factor"]
             w = next((w for w in s["workers"] if w["worker_id"] == victim), None)
             state = "unknown" if w is None else w["state"]
-            if w is not None and w["state"] == "ALIVE" and not w["has_reported"]:
-                state += " (registered, reporting its chunks)"
+            if w is not None and w["state"] == "ALIVE" and (not w["has_reported"] or w.get("resyncing")):
+                state += " (registered, resyncing)"
             short_of, surplus, total = mine(object_ids, rf)
             key = (state, short_of, surplus)
             if key != last_key or elapsed - last_print >= 10:

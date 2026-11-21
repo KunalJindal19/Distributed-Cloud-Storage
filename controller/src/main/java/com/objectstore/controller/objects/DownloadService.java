@@ -35,9 +35,9 @@ import org.springframework.stereotype.Service;
  *   <caption>How a worker's answer is classified</caption>
  *   <tr><th>Answer</th><th>Meaning</th><th>Action</th></tr>
  *   <tr><td>connection error, time-out, 5xx, 404</td><td>transient</td><td>note the data error; next candidate</td></tr>
- *   <tr><td>409 {@code chunk_corrupt}</td><td>the worker's own check failed: disk corruption</td><td>mark CORRUPT; next</td></tr>
+ *   <tr><td>409 {@code chunk_corrupt}</td><td>the worker's own check failed: it quarantined the copy and reports it itself</td><td>next</td></tr>
  *   <tr><td>200, wrong length</td><td>truncated transfer: transient</td><td>next candidate</td></tr>
- *   <tr><td>200, worker's checksum differs from ours</td><td>disk corruption</td><td>mark CORRUPT; next</td></tr>
+ *   <tr><td>200, worker's checksum differs from ours</td><td>a copy that does not match the namespace</td><td>{@code ensure(DELETE, CORRUPT)}; next</td></tr>
  *   <tr><td>200, bytes do not hash to the worker's (correct) checksum</td><td>corrupted in transit</td><td>retry the same copy once, then next</td></tr>
  *   <tr><td>200, all checks pass</td><td>good</td><td>use it</td></tr>
  * </table>
@@ -55,12 +55,12 @@ public class DownloadService {
     public record DownloadPlan(StoredObject object, List<Chunk> chunks) {
     }
 
-    /** A copy to try: the worker, its address and the epoch it had when we chose it. */
-    public record Candidate(String workerId, String url, long epoch) {
+    /** A copy to try: the worker, its address, the epoch it had when we chose it, and the copy's generation. */
+    public record Candidate(String workerId, String url, long epoch, long gen) {
     }
 
     /** Classification of one worker answer. */
-    public enum Outcome { GOOD, TRANSIENT, CORRUPT, IN_TRANSIT }
+    public enum Outcome { GOOD, TRANSIENT, CORRUPT, QUARANTINED, IN_TRANSIT }
 
     private static final Duration SETTLE_POLL = Duration.ofMillis(100);
     private MessageTrace trace = MessageTrace.OFF;
@@ -142,7 +142,9 @@ public class DownloadService {
                         case GOOD -> {
                             return fetch.data();
                         }
-                        case CORRUPT -> markCorrupt(chunk.chunkId(), candidate, fetch.reason());
+                        case CORRUPT -> reportCorrupt(chunk.chunkId(), candidate, fetch.reason());
+                        case QUARANTINED -> log.warn("[download] chunk={} on {} is quarantined; trying the next copy",
+                                chunk.chunkId(), candidate.workerId());
                         case TRANSIENT -> markDataError(candidate.workerId());
                         case IN_TRANSIT -> {
                             log.warn("[download] chunk={} from {} corrupted in transit; {}", chunk.chunkId(),
@@ -170,8 +172,8 @@ public class DownloadService {
             fetched = workers.getChunk(candidate.url(), chunk.chunkId());
         } catch (WorkerException e) {
             if (e.status() != null && e.status() == 409 && e.getMessage().contains(ErrorCodes.CHUNK_CORRUPT)) {
-                trace.getAnswer(candidate.workerId(), chunk.chunkId(), "refused: its copy is corrupt");
-                return new Fetch(Outcome.CORRUPT, null, "the worker found its copy corrupt");
+                trace.getAnswer(candidate.workerId(), chunk.chunkId(), "refused: its copy is quarantined");
+                return new Fetch(Outcome.QUARANTINED, null, "the worker found its copy corrupt");
             }
             trace.getAnswer(candidate.workerId(), chunk.chunkId(), "failed: " + e.getMessage());
             return new Fetch(Outcome.TRANSIENT, null, e.getMessage());
@@ -201,18 +203,23 @@ public class DownloadService {
             List<Candidate> list = new ArrayList<>();
             for (String workerId : cluster.readCandidates(chunkId)) {
                 WorkerInfo worker = cluster.worker(workerId);
-                list.add(new Candidate(workerId, worker.url, worker.epoch));
+                ClusterState.Replica replica = cluster.replica(chunkId, workerId);
+                list.add(new Candidate(workerId, worker.url, worker.epoch, replica == null ? -1 : replica.gen));
             }
             return list;
         });
     }
 
     /**
-     * Queues {@code MarkCorrupt}: the copy becomes CORRUPT if it is still OK in the epoch we read
-     * it in. The download goes on with the next candidate at once.
+     * Queues {@code ReportCorrupt}: {@code ensure(DELETE, CORRUPT)} if it is still the same copy (same
+     * epoch and generation). The download goes on with the next candidate at once.
      */
-    private void markCorrupt(String chunkId, Candidate candidate, String reason) {
-        if (!queue.offer(namespaceTasks.markCorrupt(candidate.workerId(), candidate.epoch(), chunkId, reason))) {
+    private void reportCorrupt(String chunkId, Candidate candidate, String reason) {
+        if (candidate.gen() < 0) {
+            return;                       // an UPLOAD op's target: its RECEIVED will tell the controller
+        }
+        if (!queue.offer(namespaceTasks.reportCorrupt(candidate.workerId(), candidate.epoch(), chunkId, candidate.gen(),
+                reason))) {
             cluster.increment("apply_queue_full");
         }
     }

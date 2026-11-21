@@ -6,7 +6,6 @@ import com.objectstore.common.InternalApi;
 import com.objectstore.common.dto.Change;
 import com.objectstore.common.dto.ChangeType;
 import com.objectstore.common.dto.HeartbeatRequest;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.replication.Monitor;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -68,13 +67,17 @@ class ScaleTest {
                     String chunkId = chunk(i);
                     cluster.putChunk(chunkId, new ClusterState.ChunkInfo(chunkId.substring(0, 36), i % PER_OBJECT, 10,
                             TestSupport.SUM));
-                    cluster.addReplica(chunkId, worker(i % WORKERS), ReplicaState.OK);
-                    cluster.addReplica(chunkId, worker((i + 1) % WORKERS), ReplicaState.OK);
+                    cluster.addReplica(chunkId, worker(i % WORKERS), 0);
+                    cluster.addReplica(chunkId, worker((i + 1) % WORKERS), 0);
                 }
             });
         }
         assertThat(cluster.read(() -> cluster.chunksOn(worker(7)).size())).isEqualTo(CHUNKS * 2 / WORKERS);
         assertInvariants("setup");
+        // The setup grows the heap to ~600 MB in about a second; the young collections that follow
+        // (measured with -Xlog:gc: up to 32 ms each) would land inside the timed holds and measure the
+        // setup's garbage, not the planner. Collect it once before anything is timed.
+        System.gc();
 
         plannerTick();
         deadWorker();
@@ -180,11 +183,11 @@ class ScaleTest {
                         deleting = !deleting;
                     }
                     changes.add(deleting
-                            ? new Change(++seq, ChangeType.DELETED, chunkId, null, null, null, null, null)
-                            : new Change(++seq, ChangeType.RECEIVED, chunkId, 10L, TestSupport.SUM, null, null, null));
+                            ? Change.deleted(++seq, chunkId, seq | 1, "deleted")
+                            : Change.received(++seq, chunkId, 10L, TestSupport.SUM, seq | 1, null));
                 }
                 long received = t.registry.heartbeat(new HeartbeatRequest(busy, boot, ++hb, InternalApi.nowSeconds(),
-                        TestSupport.STATS, changes, null)).changesReceivedUpTo();
+                        TestSupport.STATS, changes, null, null)).changesReceivedUpTo();
                 assertThat(received).as("every change acknowledged").isEqualTo(seq);
                 next += 100_000_000L;                                 // 500 changes per 100 ms
                 long wait = next - System.nanoTime();

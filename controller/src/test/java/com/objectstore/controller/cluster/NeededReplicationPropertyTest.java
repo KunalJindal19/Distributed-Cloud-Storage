@@ -2,20 +2,21 @@ package com.objectstore.controller.cluster;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.ClusterState.WorkerState;
+import com.objectstore.controller.cluster.PendingOps.Kind;
+import com.objectstore.controller.cluster.PendingOps.Op;
+import com.objectstore.controller.cluster.PendingOps.Reason;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 
 /**
- * Block 15 (v4 §7.6, §10 row 26): 10⁴ random operation sequences for RF ∈ {1, 2, 3, 4}. After
- * every operation, the levels, the cleanup set and every counter must equal a from-scratch
- * recomputation (and every other invariant must hold).
+ * 10⁴ random operation sequences for RF ∈ {1, 2, 3, 4}. After every operation the levels, the
+ * cleanup set, every counter, the pending-op indexes and counters, and every other invariant must
+ * equal a from-scratch recomputation (v5 §6.2: L, P, at most one op per pair).
  */
 class NeededReplicationPropertyTest {
 
@@ -45,15 +46,15 @@ class NeededReplicationPropertyTest {
         for (int op = 0; op < OPERATIONS; op++) {
             String chunkId = chunk(random.nextInt(8));
             String workerId = WORKERS.get(random.nextInt(WORKERS.size()));
-            int kind = random.nextInt(16);
+            int kind = random.nextInt(19);
             ops.add(kind + ":" + chunkId.substring(chunkId.length() - 1) + "@" + workerId);
             if (kind == 7) {
                 markDead(t, workerId);
             } else if (kind == 8) {
                 if (t.fake(workerId).boot != null) {
+                    List<String> held = List.copyOf(cluster.read(() -> cluster.chunksOn(workerId)));
                     t.reRegister(workerId);
-                    t.fullReport(workerId, t.fake(workerId).boot, List.copyOf(cluster.read(() -> cluster.chunksOn(workerId)))
-                            .toArray(String[]::new));
+                    t.fullReport(workerId, t.fake(workerId).boot, held.toArray(String[]::new));
                 }
             } else {
                 cluster.write(() -> apply(t, kind, chunkId, workerId, random));
@@ -65,47 +66,52 @@ class NeededReplicationPropertyTest {
 
     private static void apply(TestSupport t, int kind, String chunkId, String workerId, Random random) {
         ClusterState cluster = t.cluster;
+        PendingOps pending = cluster.ops();
         WorkerInfo worker = cluster.worker(workerId);
         boolean known = cluster.chunk(chunkId) != null;
         Replica replica = cluster.replica(chunkId, workerId);
+        Op op = pending.get(chunkId, workerId);
         switch (kind) {
-            case 0 -> {                                            // a copy arrives (RECEIVED)
-                if (known && !worker.isDead() && replica == null) {
-                    cluster.removePending(chunkId, workerId);
-                    cluster.addReplica(chunkId, workerId, ReplicaState.OK);
+            case 0 -> {                                            // RECEIVED(v): physical part, then completion
+                long version = random.nextBoolean() ? cluster.versions().current() : cluster.versions().current() | 1;
+                if (known && !worker.isDead()) {
+                    cluster.addReplica(chunkId, workerId, version);
+                }
+                if (op != null && op.kind() == Kind.INSERT && (version & 1) == 0 && version >= op.version()) {
+                    pending.complete(op);
                 }
             }
-            case 1 -> {                                            // the copy is gone (DELETED)
+            case 1 -> {                                            // DELETED(v)
                 cluster.removeReplica(chunkId, workerId);
-                cluster.ledger().completed(chunkId, workerId);
-            }
-            case 2 -> cluster.markCorrupt(chunkId, workerId);       // BAD
-            case 3 -> {                                            // freshly verified again
-                if (replica != null && replica.state == ReplicaState.CORRUPT && !replica.deleteDelivered) {
-                    cluster.ledger().cancel(chunkId, workerId);
-                    cluster.setReplicaState(chunkId, workerId, ReplicaState.OK);
+                if (op != null && op.kind() == Kind.DELETE && random.nextBoolean()) {
+                    pending.complete(op);
                 }
             }
-            case 4 -> {                                            // a repair is ordered
+            case 2 -> pending.ensure(chunkId, workerId, Reason.CORRUPT);
+            case 3 -> {                                            // a repair is ordered
                 List<String> sources = cluster.live(chunkId);
-                boolean pendingTarget = cluster.pendingOf(chunkId).stream().anyMatch(p -> p.target().equals(workerId));
-                if (known && !sources.isEmpty() && !worker.isDead() && replica == null && !pendingTarget) {
-                    String source = sources.get(random.nextInt(sources.size()));
-                    if (!cluster.worker(source).isDead() && cluster.pendingFrom(source) < t.properties.maxStreams()) {
-                        cluster.addPending(chunkId, source, workerId, "cmd-" + random.nextInt());
+                if (known && !sources.isEmpty() && replica == null && op == null) {
+                    Op repair = pending.ensure(chunkId, workerId, Reason.REPAIR);
+                    if (repair != null) {
+                        pending.setSource(repair, sources.get(random.nextInt(sources.size())));
+                        pending.tryQueue(repair);
                     }
                 }
             }
-            case 5 -> {                                            // an upload copy awaits its RECEIVED
-                boolean pendingTarget = cluster.pendingOf(chunkId).stream().anyMatch(p -> p.target().equals(workerId));
-                if (known && !worker.isDead() && replica == null && !pendingTarget) {
-                    cluster.addUploadPending(chunkId, workerId);
+            case 4 -> {                                            // an upload copy awaits its RECEIVED
+                if (known && replica == null && op == null) {
+                    pending.upload(chunkId, workerId, cluster.versions().next());
                 }
             }
-            case 6 -> {                                            // a pending copy ends
-                List<PendingCopy> copies = cluster.pendingOf(chunkId);
-                if (!copies.isEmpty()) {
-                    cluster.removePendingCopy(copies.get(random.nextInt(copies.size())));
+            case 5 -> {                                            // an op ends (dropped)
+                List<Op> onChunk = pending.opsFor(chunkId);
+                if (!onChunk.isEmpty()) {
+                    pending.drop(onChunk.get(random.nextInt(onChunk.size())), "test");
+                }
+            }
+            case 6 -> {                                            // a resend deadline passes
+                if (op != null) {
+                    pending.deadline(chunkId, workerId, op.version(), cluster.now() + (1L << 50));
                 }
             }
             case 9 -> {                                            // a chunk is committed
@@ -115,24 +121,54 @@ class NeededReplicationPropertyTest {
             }
             case 10 -> {                                           // a chunk is deleted
                 if (known) {
-                    cluster.ledger().chunkRemoved(chunkId, DeletionLedger.OBJECT_DELETED);
+                    for (String holder : List.copyOf(cluster.replicasOf(chunkId).keySet())) {
+                        pending.ensure(chunkId, holder, Reason.OBJECT_DELETED);
+                    }
                     cluster.removeChunk(chunkId);
                 }
             }
-            case 11 -> {                                           // a surplus copy is trimmed
+            case 11 -> {                                           // a surplus copy, with verified survivors
                 List<String> live = cluster.live(chunkId);
-                if (live.size() > t.properties.replicationFactor() && cluster.pendingOf(chunkId).isEmpty()) {
+                if (live.size() > t.properties.replicationFactor() && pending.countFor(chunkId) == 0) {
                     String victim = live.get(random.nextInt(live.size()));
-                    cluster.setReplicaState(chunkId, victim, ReplicaState.EXCESS);
-                    cluster.sendDelete(victim, chunkId, "excess");
+                    List<PendingOps.Survivor> survivors = new ArrayList<>();
+                    for (String other : live) {
+                        if (!other.equals(victim)) {
+                            Replica r = cluster.replica(chunkId, other);
+                            r.verifiedEpoch = cluster.worker(other).verifyEpoch;
+                            r.verifiedAt = cluster.now();
+                            survivors.add(new PendingOps.Survivor(other, r.gen));
+                        }
+                    }
+                    pending.setDelete(chunkId, victim, survivors);
                 }
             }
             case 12 -> cluster.takeCommands(worker);                // a heartbeat takes its commands
             case 13 -> {                                           // STALE / ALIVE
                 if (!worker.isDead()) {
                     worker.state = worker.state == WorkerState.ALIVE ? WorkerState.STALE : WorkerState.ALIVE;
+                    cluster.markInsertTargetsDirty(workerId);
                 }
             }
+            case 14 -> {                                           // a resync starts, or (a short-cut) completes
+                if (!worker.isDead()) {
+                    if (!worker.resyncing) {
+                        cluster.startResync(worker, "test", false);
+                    } else {
+                        pending.dropTargeting(workerId, worker.fenceFloor, "test completion");
+                        worker.resyncing = false;
+                        worker.hasReported = true;
+                        cluster.markInsertTargetsDirty(workerId);
+                    }
+                }
+            }
+            case 15 -> {                                           // a VERIFY, answered
+                if (cluster.requestVerify(chunkId, workerId)) {
+                    cluster.takeCommands(worker);
+                    cluster.verifyAnswered(chunkId, workerId, cluster.replica(chunkId, workerId).verifyCmdId);
+                }
+            }
+            case 16 -> pending.nextWaiting(5).forEach(pending::tryQueue);
             default -> t.planner.plan();                            // a planner pass
         }
     }

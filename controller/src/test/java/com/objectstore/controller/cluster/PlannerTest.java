@@ -11,13 +11,13 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/** Block 15 (v4 §7.3, §7.6, §10 rows 23-25, 41): the planner on the priority levels. */
+/** The planner on the priority levels (v4 §7.3; v5 §6.2 accounting and §6.4 excess). */
 class PlannerTest {
 
     private static void report(TestSupport t, String workerId, int from, int to) {
         List<ReportEntry> entries = new ArrayList<>();
         for (int i = from; i < to; i++) {
-            entries.add(new ReportEntry(chunk(i), 10, TestSupport.SUM, false));
+            entries.add(TestSupport.entry(chunk(i), 0));
         }
         t.report(workerId, entries);
     }
@@ -26,8 +26,10 @@ class PlannerTest {
         return t.cluster.write(() -> t.planner.plan());
     }
 
+    /** INSERT ops on the chunk. */
     private static int pendingOf(TestSupport t, int chunk) {
-        return t.cluster.read(() -> t.cluster.pendingOf(chunk(chunk)).size());
+        return t.cluster.read(() -> (int) t.cluster.ops().opsFor(chunk(chunk)).stream()
+                .filter(op -> op.kind() == PendingOps.Kind.INSERT).count());
     }
 
     @Test
@@ -116,8 +118,8 @@ class PlannerTest {
 
         tick(t);
 
-        assertThat(t.cluster.read(() -> t.cluster.pendingOf(chunk(0))))
-                .extracting(ClusterState.PendingCopy::target).containsExactlyInAnyOrder("worker2", "worker3");
+        assertThat(t.cluster.read(() -> t.cluster.ops().opsFor(chunk(0))))
+                .extracting(op -> op.workerId).containsExactlyInAnyOrder("worker2", "worker3");
         t.assertNoViolations();
     }
 
@@ -153,7 +155,7 @@ class PlannerTest {
     }
 
     @Test
-    void edge41_withRfOneNothingIsEverScheduledButSurplusCopiesAreTrimmed() {
+    void edge41_withRfOneNothingIsEverScheduledButSurplusCopiesAreTrimmedOnceTheSurvivorIsVerified() {
         TestSupport t = TestSupport.withRf(1, 2);
         t.knowChunk(chunk(0));
         t.knowChunk(chunk(1));
@@ -164,61 +166,72 @@ class PlannerTest {
 
         assertThat(t.cluster.levels().count()).isEqualTo(1);         // only (0,0)
         assertThat(pendingOf(t, 0)).isZero();
+        assertThat(t.cluster.read(() -> t.cluster.ops().countFor(chunk(1)))).as("a VERIFY first").isZero();
+        t.settle("worker1", "worker2");
         assertThat(t.cluster.read(() -> t.cluster.live(chunk(1)))).hasSize(1);
-        assertThat(t.cluster.read(() -> t.cluster.ledger().entriesFor(chunk(1)))).hasSize(1);
         t.assertNoViolations();
     }
 
     @Test
-    void edge28_anUploadCopyAndARepairThatBothLandAreTrimmedBackToRf() {
+    void edge28_aLateUploadCopyAndItsRepairAreOneOpAtOneVersionSoNoSurplusArises() {
         TestSupport t = new TestSupport();
         t.knowChunk(chunk(0));
-        t.knowChunk(chunk(1));
         t.join("worker1");
-        t.join("worker2", chunk(1));                                 // busier: the repair goes to worker3
+        t.join("worker2");
         t.join("worker3");
-        t.join("worker4", chunk(1));                                 // (chunk 1 is fully replicated)
+        long v1 = t.versions.next();
+        long v2 = t.versions.next();
         t.cluster.write(() -> {
-            t.cluster.addUploadPending(chunk(0), "worker1");
-            t.cluster.addUploadPending(chunk(0), "worker2");
+            t.cluster.ops().upload(chunk(0), "worker1", v1);
+            t.cluster.ops().upload(chunk(0), "worker2", v2);
         });
-        t.ibr("worker1", t.fake("worker1").boot, List.of(chunk(0)), List.of(), List.of());   // worker1's RECEIVED
-        // worker2's never arrives in time: the upload copy expires into normal repair.
-        t.cluster.write(() -> t.cluster.expireDue(t.cluster.now() + t.properties.pendingTimeout().toNanos() + 1));
+        t.ibr("worker1", t.received("worker1", chunk(0), v1));       // worker1's RECEIVED
+        // worker2's does not arrive in time: its UPLOAD op becomes a REPAIR at the same version.
+        PendingOps.Op op = t.op(chunk(0), "worker2");
+        t.cluster.write(() -> t.cluster.ops().deadline(chunk(0), "worker2", v2,
+                t.cluster.now() + t.properties.opResendMax().toNanos() + 1));
+        assertThat(op.reason()).isEqualTo(PendingOps.Reason.REPAIR);
+        assertThat(op.version()).isEqualTo(v2);
         tick(t);
-        String repairTarget = t.cluster.read(() -> t.cluster.pendingOf(chunk(0)).get(0).target());
-        assertThat(repairTarget).isEqualTo("worker3");
+        assertThat(op.source()).isEqualTo("worker1");
+        List<com.objectstore.common.dto.Command> replicate = t.handOut("worker1");
+        assertThat(replicate).singleElement().satisfies(c -> {
+            assertThat(c.version()).isEqualTo(v2);
+            assertThat(c.targetUrl()).isEqualTo("http://worker2:8001");
+        });
 
-        // Both land: the late upload copy and the repair.
-        t.ibr("worker2", t.fake("worker2").boot, List.of(chunk(0)), List.of(), List.of());
-        t.ibr(repairTarget, t.fake(repairTarget).boot, List.of(chunk(0)), List.of(), List.of());
+        // Both "land": the late upload copy and the repair are the same version: REPEAT, one op, done.
+        t.ibr("worker2", t.received("worker2", chunk(0), v2));
+        t.ibr("worker2", t.received("worker2", chunk(0), v2));
         tick(t);
 
-        assertThat(t.cluster.read(() -> t.cluster.live(chunk(0)))).hasSize(2);
-        assertThat(t.cluster.read(() -> t.cluster.ledger().entriesFor(chunk(0)))).hasSize(1);
+        assertThat(t.cluster.read(() -> t.cluster.live(chunk(0)))).containsExactlyInAnyOrder("worker1", "worker2");
+        assertThat(t.cluster.read(() -> t.cluster.ops().size())).isZero();
         t.assertNoViolations();
     }
 
     @Test
-    void edge38_aTargetRestartingBetweenItsPutAndItsReceivedOnlyCausesASurplusThatIsTrimmed() {
+    void edge38_aTargetRestartingBetweenItsPutAndItsReceivedOnlyCausesASurplusThatIsTrimmedSafely() {
         TestSupport t = new TestSupport();
         t.knowChunk(chunk(0));
         t.join("worker1", chunk(0));
         t.join("worker2");
         t.join("worker3");
         tick(t);
-        String target = t.cluster.read(() -> t.cluster.pendingOf(chunk(0)).get(0).target());
+        String target = t.cluster.read(() -> t.cluster.ops().opsFor(chunk(0)).get(0).workerId);
 
-        t.register(target);                                        // a new process: its pending copy is dropped
-        assertThat(pendingOf(t, 0)).isZero();
-        tick(t);                                                   // repaired elsewhere meanwhile
-        String other = t.cluster.read(() -> t.cluster.pendingOf(chunk(0)).get(0).target());
-        assertThat(other).isNotEqualTo(target);
+        t.register(target);                       // a new process: resyncing, so its op no longer counts in P
+        tick(t);                                  // repaired elsewhere meanwhile
+        String other = t.cluster.read(() -> t.cluster.ops().opsFor(chunk(0)).stream()
+                .filter(op -> !op.workerId.equals(target)).findFirst().orElseThrow().workerId);
+        PendingOps.Op otherOp = t.op(chunk(0), other);
 
-        t.fullReport(target, t.fake(target).boot, chunk(0));        // its report lists the file: an OK copy
-        t.ibr(other, t.fake(other).boot, List.of(chunk(0)), List.of(), List.of());
+        t.fullReport(target, t.fake(target).boot, chunk(0));        // its listing has the file: a copy
+        assertThat(t.op(chunk(0), target)).as("ops at or below the fence are dropped at completion").isNull();
+        t.ibr(other, t.received(other, chunk(0), otherOp.version()));
         assertThat(t.cluster.read(() -> t.cluster.live(chunk(0)))).hasSize(3);
-        tick(t);
+
+        t.settle("worker1", "worker2", "worker3");
 
         assertThat(t.cluster.read(() -> t.cluster.live(chunk(0)))).hasSize(2);
         t.assertNoViolations();

@@ -23,6 +23,10 @@ public final class ErrorCodes {
     public static final String SAFE_MODE = "safe_mode";
     public static final String INSUFFICIENT_STORAGE = "insufficient_storage";
     public static final String CHUNK_CORRUPT = "chunk_corrupt";
+    /** A chunk PUT or DELETE whose version is not newer than the worker's record or fence (v5 §4.2). */
+    public static final String STALE_VERSION = "stale_version";
+    /** The same (chunk, version) is being received already. */
+    public static final String IN_PROGRESS = "in_progress";
 
     // Controller answers to worker messages (see the protocol acceptance rules).
     public static final String STALE_BOOT = "stale_boot";

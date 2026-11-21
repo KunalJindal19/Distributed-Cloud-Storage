@@ -79,26 +79,33 @@ check "fully repaired within 60 s" python3 -c "import sys; sys.exit(0 if float('
 check "the 40 MB object is intact" download_matches "$BIG" "$WORK/big.bin"
 docker start worker3 > /dev/null; wait_for 90 healthy
 
-section "AC-7.5 a corrupt copy is replaced first, invalidated only afterwards"
+section "AC-7.5 (v5) a corrupt copy is quarantined, kept for diagnosis, and repaired from the good copy"
 C="$OBJ-00001"; BAD=$(meta "$OBJ" | jq -r '.chunks[1].locations[0].worker_id')
+# The chunk may already have a "copied" event from AC-7.1 (if it had a copy on worker2): wait for a new one.
+copied_before=$(status | jq --arg c "$C" '[.repair_log[] | select(.event=="copied" and .chunk_id==$c)] | length')
 corrupt_chunk "$BAD" "$C"; min_ok=99
-wait_for 40 sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"invalidated\" and .chunk_id==\"$C\")] | length') -ge 1 ]" &
+wait_for 40 sh -c "[ \$(curl -fsS $API/cluster/status | jq '[.repair_log[] | select(.event==\"copied\" and .chunk_id==\"$C\")] | length') -gt $copied_before ]" &
 WAITER=$!
 while kill -0 $WAITER 2>/dev/null; do m=$(ok_copies_min "$OBJ"); [ "$m" -lt "$min_ok" ] && min_ok=$m; sleep 0.3; done
 seq=$(status | jq -r --arg c "$C" '[.repair_log[] | select(.chunk_id==$c) | .event] | join(" ")')
 say "  events for $C: $seq"
-check "copied before invalidated" sh -c "echo '$seq' | grep -q 'copied.*invalidated'"
+check "quarantined before copied" sh -c "echo '$seq' | grep -q 'quarantined.*copied'"
 check "the chunk never had fewer than 1 OK copy" [ "$min_ok" -ge 1 ]
-check "the corrupt file is gone from $BAD" sh -c "! docker exec $BAD test -f /data/chunks/$C"
+# The repair may put a new copy back on $BAD itself (allowed in v5): then the file in /data/chunks
+# must be that new copy, i.e. hash to the namespace checksum, never the corrupt bytes.
+GOOD_SUM=$(meta "$OBJ" | jq -r '.chunks[1].checksum')
+check "the corrupt bytes left /data/chunks on $BAD (a file there now is a verified new copy)" sh -c \
+    "! docker exec $BAD test -f /data/chunks/$C || [ \"\$(docker exec $BAD sha256sum /data/chunks/$C | cut -d' ' -f1)\" = '$GOOD_SUM' ]"
+check "the corrupt bytes are kept in /data/quarantine on $BAD" sh -c "docker exec $BAD ls /data/quarantine | grep -q '^$C\\.'"
 wait_for 60 healthy
 
 section "AC-7.6 docker network disconnect worker3: DEAD, repaired; reconnect: re-registers, trimmed"
-docker network disconnect objectstore_objectstore-net worker3
+docker network disconnect "$NETWORK" worker3
 wait_for 25 sh -c "[ \"\$(curl -fsS $API/cluster/status | jq -r '.workers[]|select(.worker_id==\"worker3\")|.state')\" = DEAD ]"
 check "worker3 DEAD while partitioned" [ "$(worker_field worker3 state)" = DEAD ]
 # worker3 held ~25 copies (half of the 40 MB object from AC-7.4); at MAX_STREAMS per source this takes ~30 s.
 check "repaired while partitioned" wait_for 90 sh -c "curl -fsS $API/cluster/status | jq -e '.under_replicated == 0 and .pending_replications == 0' > /dev/null"
-docker network connect objectstore_objectstore-net worker3
+docker network connect "$NETWORK" worker3
 check "re-registers, reports, surplus trimmed: healthy again" wait_for 90 healthy
 check "re-registration logged" sh -c "docker logs worker3 2>&1 | grep -q 'registering again'"
 

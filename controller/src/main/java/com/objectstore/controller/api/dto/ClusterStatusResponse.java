@@ -17,6 +17,7 @@ public record ClusterStatusResponse(
         int underReplicated,
         int overReplicated,
         int missingChunks,
+        /** INSERT ops (repair and upload copies on their way). */
         int pendingReplications,
         long blocked,
         Map<String, Long> counters,
@@ -29,12 +30,22 @@ public record ClusterStatusResponse(
         /** Fraction of the time since the last status read that the writer held the lock. */
         double writerBusyRatio,
         long reportSessionsOpen,
-        /** The deletion ledger: {waiting, queued, delivered}. */
+        /** DELETE ops by state, under the v4 names {waiting, queued, delivered}. */
         Map<String, Integer> ledger,
         /** Chunks needing copies by priority level {"L,P": size} (L live, P pending). */
         Map<String, Integer> levels,
         int cleanupSize,
-        int postponedSize) {
+        /** Chunks whose surplus copy waits: holders not current, or survivors still being verified. */
+        int postponedSize,
+        /** v5: pending ops {by_reason, by_state}. */
+        Map<String, Map<String, Integer>> ops,
+        /** v5: VERIFY requests outstanding. */
+        int verifyOutstanding,
+        /** v5: workers resyncing now. */
+        int resyncing,
+        /** v5: the controller term, and the highest operation version issued. */
+        long term,
+        long version) {
 
     public record Config(
             int chunkSize,
@@ -42,13 +53,13 @@ public record ClusterStatusResponse(
             double staleAfter,
             double deadAfter,
             double monitorInterval,
-            double pendingTimeout,
-            double fullReportInterval) {
+            double opResendInitial,
+            double resyncInterval) {
     }
 
     /**
      * One worker. {@code status} is kept as an alias of {@code state} for the v2 shape;
-     * {@code chunk_count} is the number of copies recorded on the worker, whatever their state.
+     * {@code chunk_count} is the number of copies recorded on the worker.
      */
     public record WorkerView(
             String workerId,
@@ -63,17 +74,28 @@ public record ClusterStatusResponse(
             int chunkCount,
             int queuedCommands,
             int pendingAsSource,
-            WorkerStats stats) {
+            WorkerStats stats,
+            boolean resyncing,
+            long fence,
+            int attempt,
+            long verifyEpoch,
+            int pendingOps) {
     }
 
-    public record ReplicaCounts(long ok, long corrupt, long excess) {
+    /**
+     * Copies by the state the API shows: {@code ok}, {@code corrupt} (a quarantine is pending),
+     * {@code excess} (an EXCESS delete is pending); {@code on_stale_workers} are uncertain (their worker
+     * is STALE), so a chunk never looks fully available because of them.
+     */
+    public record ReplicaCounts(long ok, long corrupt, long excess, long onStaleWorkers) {
     }
 
     /**
      * One action of the replication monitor or one event it observed.
      *
-     * @param event {@code copied}, {@code trimmed}, {@code invalidated}, {@code deleted},
-     *              {@code timeout}, {@code unrecoverable}, {@code orphan}, {@code replicate}
+     * @param event {@code replicate}, {@code copied}, {@code trimmed}, {@code quarantined}, {@code deleted},
+     *              {@code missing}, {@code timeout}, {@code failed}, {@code source failed}, {@code stale},
+     *              {@code unrecoverable}, {@code recoverable}, {@code orphan}
      */
     public record RepairEvent(String time, String event, String chunkId, String source, String target, String reason) {
     }

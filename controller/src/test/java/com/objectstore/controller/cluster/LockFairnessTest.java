@@ -70,13 +70,13 @@ class LockFairnessTest {
                     long n = ++seq;
                     String chunkId = TestSupport.chunk((int) (n % CHUNKS));
                     changes.add(n % 2 == 1
-                            ? new Change(n, ChangeType.RECEIVED, chunkId, 10L, TestSupport.SUM, null, null, null)
-                            : new Change(n, ChangeType.DELETED, chunkId, null, null, null, null, null));
+                            ? Change.received(n, chunkId, 10L, TestSupport.SUM, n | 1, null)
+                            : Change.deleted(n, chunkId, n | 1, "deleted"));
                 }
                 long received;
                 do {   // a full queue acknowledges nothing: the worker resends
                     received = t.registry.heartbeat(new HeartbeatRequest("worker1", busy, ++hb, InternalApi.nowSeconds(),
-                            TestSupport.STATS, changes, null)).changesReceivedUpTo();
+                            TestSupport.STATS, changes, null, null)).changesReceivedUpTo();
                 } while (received < seq);
             }
             t.writer.barrier(Duration.ofSeconds(60));
