@@ -12,7 +12,10 @@ import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
-/** Controller settings, bound once at start-up from environment variables (see application.yml and the README). */
+/**
+ * Controller settings, bound once at start-up from environment variables (see controller.yml and
+ * the README). The compact constructor rejects inconsistent values with a message naming the setting.
+ */
 @Validated
 @ConfigurationProperties(prefix = "objectstore")
 public record ControllerProperties(
@@ -24,10 +27,8 @@ public record ControllerProperties(
         @DecimalMin("0") @DecimalMax("1") double staleRatio,
         @Positive double healthIntervalSeconds,
         @Positive double monitorIntervalSeconds,
-        @Positive double pendingTimeoutSeconds,
         @Positive double targetBackoffSeconds,
         @Min(1) int maxStreams,
-        @Positive double commandTtlSeconds,
         @Min(1) int maxCommandsPerWorker,
         @Positive double maxMessageAgeSeconds,
         @DecimalMin("0") @DecimalMax("1") double safeModeThreshold,
@@ -36,7 +37,6 @@ public record ControllerProperties(
         @PositiveOrZero double orphanGcDelaySeconds,
         @DecimalMin("0") @DecimalMax("1") double orphanGcMaxFraction,
         @PositiveOrZero long minFreeBytes,
-        @Positive double fullReportIntervalSeconds,
         @Positive double connectTimeoutSeconds,
         @Positive double readTimeoutSeconds,
         boolean invariantChecks,
@@ -48,14 +48,55 @@ public record ControllerProperties(
         @Positive double uploadCommitWaitSeconds,
         /** How long a download waits for a chunk that is in the database but not yet readable in memory. */
         @PositiveOrZero double downloadSettleWaitSeconds,
-        /** Ledger entries (and, later, cleanup chunks) re-checked per monitor tick. */
+        /** Waiting ops re-checked per monitor tick; cleanup chunks visited per tick. */
         @Min(1) int cleanupBudget,
         /** Chunks visited in the under-replication levels per planner tick. */
         @Min(1) int plannerVisitBudget,
         /** Postponed chunks re-checked per tick. */
         @Min(1) int postponedBudget,
         /** Chunks checked by the rolling invariant check per tick. */
-        @Min(0) int rollingCheckChunks) {
+        @Min(0) int rollingCheckChunks,
+        /** v5 §13: first resend of an unanswered op (replaces PENDING_TIMEOUT). */
+        @Positive double opResendInitialSeconds,
+        /** v5 §13: the resend backoff never exceeds this. */
+        @Positive double opResendMaxSeconds,
+        /** v5 §13: an INSERT op is dropped after this many unanswered attempts (DELETEs never are). */
+        @Min(1) int opMaxInsertAttempts,
+        /** v5 §13: periodic resync of every worker (replaces the worker's FULL_REPORT_INTERVAL). */
+        @Positive double resyncIntervalSeconds,
+        /** v5 §13: ± this fraction of RESYNC_INTERVAL, so workers do not resync in step. */
+        @DecimalMin("0") @DecimalMax("0.9") double resyncJitter,
+        /** v5 §13: periodic and GC-triggered resyncs running at once. */
+        @Min(1) int resyncMaxConcurrent,
+        /** v5 §13: no segment progress for this long → the next attempt. */
+        @Positive double resyncStallTimeoutSeconds,
+        /** v5 §13: how recent a survivor's VERIFY must be for an EXCESS delete. */
+        @Positive double verifyFreshForDeleteSeconds,
+        /** v5 §13: minimum gap between VERIFYs for one copy. */
+        @Positive double verifyResendSeconds) {
+
+    public ControllerProperties {
+        require(chunkSize > 0, "CHUNK_SIZE must be positive");
+        require(replicationFactor > 0, "REPLICATION_FACTOR must be positive");
+        require(opResendInitialSeconds > 0, "OP_RESEND_INITIAL must be positive");
+        require(opResendMaxSeconds > 0, "OP_RESEND_MAX must be positive");
+        require(opResendInitialSeconds <= opResendMaxSeconds, "OP_RESEND_INITIAL (" + opResendInitialSeconds
+                + " s) must not exceed OP_RESEND_MAX (" + opResendMaxSeconds + " s)");
+        require(opMaxInsertAttempts > 0, "OP_MAX_INSERT_ATTEMPTS must be positive");
+        require(resyncIntervalSeconds > 0, "RESYNC_INTERVAL must be positive");
+        require(resyncJitter >= 0 && resyncJitter < 1, "RESYNC_JITTER must be at least 0 and below 1");
+        require(resyncMaxConcurrent > 0, "RESYNC_MAX_CONCURRENT must be positive");
+        require(resyncStallTimeoutSeconds > 0, "RESYNC_STALL_TIMEOUT must be positive");
+        require(verifyFreshForDeleteSeconds > 0, "VERIFY_FRESH_FOR_DELETE must be positive");
+        require(verifyResendSeconds > 0, "VERIFY_RESEND must be positive");
+        require(deadAfterSeconds > staleAfterSeconds, "DEAD_AFTER must be larger than STALE_AFTER");
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            throw new IllegalArgumentException(message);
+        }
+    }
 
     public Duration staleAfter() {
         return seconds(staleAfterSeconds);
@@ -73,16 +114,8 @@ public record ControllerProperties(
         return seconds(monitorIntervalSeconds);
     }
 
-    public Duration pendingTimeout() {
-        return seconds(pendingTimeoutSeconds);
-    }
-
     public Duration targetBackoff() {
         return seconds(targetBackoffSeconds);
-    }
-
-    public Duration commandTtl() {
-        return seconds(commandTtlSeconds);
     }
 
     public Duration maxMessageAge() {
@@ -99,10 +132,6 @@ public record ControllerProperties(
 
     public Duration orphanGcDelay() {
         return seconds(orphanGcDelaySeconds);
-    }
-
-    public Duration fullReportInterval() {
-        return seconds(fullReportIntervalSeconds);
     }
 
     public Duration connectTimeout() {
@@ -123,6 +152,30 @@ public record ControllerProperties(
 
     public Duration downloadSettleWait() {
         return seconds(downloadSettleWaitSeconds);
+    }
+
+    public Duration opResendInitial() {
+        return seconds(opResendInitialSeconds);
+    }
+
+    public Duration opResendMax() {
+        return seconds(opResendMaxSeconds);
+    }
+
+    public Duration resyncInterval() {
+        return seconds(resyncIntervalSeconds);
+    }
+
+    public Duration resyncStallTimeout() {
+        return seconds(resyncStallTimeoutSeconds);
+    }
+
+    public Duration verifyFreshForDelete() {
+        return seconds(verifyFreshForDeleteSeconds);
+    }
+
+    public Duration verifyResend() {
+        return seconds(verifyResendSeconds);
     }
 
     private static Duration seconds(double value) {

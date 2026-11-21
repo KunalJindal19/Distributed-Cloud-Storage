@@ -9,17 +9,18 @@ import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
 /**
- * The {@code pending-timer} thread (v4 §7.4): holds the deadlines of pending copies and of
- * delivered ledger DELETEs in a {@link DelayQueue}; when one passes it queues
- * {@code ExpirePending(id)} or {@code LedgerDeadline(chunk, worker)} for the writer. It never touches
- * cluster state itself, and a deadline whose copy or entry has meanwhile ended does nothing.
+ * The {@code resend-timer} thread (v5 §3.3): holds the resend deadlines of handed-out ops in a
+ * {@link DelayQueue}; when one passes it queues {@code OpDeadline(chunk, worker, version)} for the
+ * writer, which moves the op back to WAITING (same version) if it is still unanswered. Resend timers
+ * only drive retries: no deadline decides correctness, versions do. The timer never touches cluster
+ * state itself, and a deadline whose op has meanwhile ended or changed does nothing.
  */
 @Component
-public class PendingTimer implements SmartLifecycle, ClusterState.DeadlineScheduler {
+public class ResendTimer implements SmartLifecycle, ClusterState.DeadlineScheduler {
 
-    private static final Logger log = LoggerFactory.getLogger(PendingTimer.class);
+    private static final Logger log = LoggerFactory.getLogger(ResendTimer.class);
 
-    private record Deadline(String kind, long id, String chunkId, String workerId, long at) implements Delayed {
+    private record Deadline(String chunkId, String workerId, long version, long at) implements Delayed {
         @Override
         public long getDelay(TimeUnit unit) {
             return unit.convert(at - System.nanoTime(), TimeUnit.NANOSECONDS);
@@ -37,20 +38,15 @@ public class PendingTimer implements SmartLifecycle, ClusterState.DeadlineSchedu
     private volatile Thread thread;
     private volatile boolean running;
 
-    public PendingTimer(ClusterState cluster, ApplyQueue queue) {
+    public ResendTimer(ClusterState cluster, ApplyQueue queue) {
         this.cluster = cluster;
         this.queue = queue;
         cluster.setDeadlineScheduler(this);
     }
 
     @Override
-    public void pendingCopy(long id, long atNanos) {
-        deadlines.add(new Deadline("pending", id, null, null, atNanos));
-    }
-
-    @Override
-    public void ledgerEntry(String chunkId, String workerId, long atNanos) {
-        deadlines.add(new Deadline("ledger", 0, chunkId, workerId, atNanos));
+    public void opDeadline(String chunkId, String workerId, long version, long atNanos) {
+        deadlines.add(new Deadline(chunkId, workerId, version, atNanos));
     }
 
     public int size() {
@@ -63,7 +59,7 @@ public class PendingTimer implements SmartLifecycle, ClusterState.DeadlineSchedu
             return;
         }
         running = true;
-        thread = Thread.ofPlatform().name("pending-timer").daemon(true).start(this::loop);
+        thread = Thread.ofPlatform().name("resend-timer").daemon(true).start(this::loop);
     }
 
     @Override
@@ -83,14 +79,12 @@ public class PendingTimer implements SmartLifecycle, ClusterState.DeadlineSchedu
         while (running) {
             try {
                 Deadline due = deadlines.take();
-                Task task = "pending".equals(due.kind())
-                        ? Task.of("ExpirePending", () -> cluster.expirePending(due.id()))
-                        : Task.of("LedgerDeadline", () -> cluster.ledger().deadline(due.chunkId(), due.workerId(), cluster.now()));
-                queue.put(task);
+                queue.put(Task.of("OpDeadline", () -> cluster.ops().deadline(due.chunkId(), due.workerId(), due.version(),
+                        cluster.now())));
             } catch (InterruptedException e) {
                 return;
             } catch (RuntimeException e) {
-                log.error("[writer] pending-timer failed to queue a deadline", e);
+                log.error("[writer] resend-timer failed to queue a deadline", e);
             }
         }
     }

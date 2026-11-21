@@ -16,6 +16,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import com.objectstore.worker.reporting.ChangeLog;
 import com.objectstore.worker.reporting.WorkerIdentity;
+import com.objectstore.worker.storage.ChunkStore;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicLong;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import tools.jackson.databind.JsonNode;
@@ -24,10 +30,11 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
-/** Drives the worker's internal API over real HTTP, exactly as the controller does. */
+/** Drives the worker's internal API over real HTTP, exactly as the controller does (v5 §4.3). */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"spring.config.name=worker", "worker.id=worker1", "worker.background-enabled=false"})
+        properties = {"spring.config.name=worker", "worker.id=worker1", "worker.background-enabled=false",
+                "worker.server-read-timeout-seconds=1"})
 class WorkerApiTest {
 
     private static final String OBJECT_ID = "3f1c9a52-7d0e-4c1b-9a54-1f2e3d4c5b6a";
@@ -49,12 +56,28 @@ class WorkerApiTest {
     @Autowired
     WorkerIdentity identity;
 
+    @Autowired
+    ChunkStore store;
+
+    /** Operation versions of this test class: even, increasing, above the fence set below. */
+    private static final AtomicLong VERSIONS = new AtomicLong(1000);
+
+    private static long nextVersion() {
+        return VERSIONS.addAndGet(2);
+    }
+
     private final ObjectMapper json = new ObjectMapper();
 
     private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
 
     @BeforeEach
     void emptyTheStore() throws IOException {
+        if (!store.isFenceSet()) {
+            store.adoptFence(1000, null);                        // as the first registration would
+        }
+        for (String chunkId : store.chunkIds()) {
+            store.delete(chunkId, nextVersion(), false, "test");  // versioned deletes empty the index too
+        }
         try (Stream<Path> files = Files.list(dataDir.resolve("chunks"))) {
             for (Path file : files.toList()) {
                 Files.delete(file);
@@ -71,13 +94,14 @@ class WorkerApiTest {
     }
 
     @Test
-    void putStoresTheChunkAndIsIdempotent() throws Exception {
+    void putStoresTheChunkAndARepeatOfTheSameVersionAnswers200() throws Exception {
         byte[] data = bytes(1_048_576, 1);
         String checksum = Checksums.sha256Hex(data);
         String id = chunkId(0);
+        long version = nextVersion();
 
-        HttpResponse<String> created = put(id, data, checksum);
-        HttpResponse<String> repeated = put(id, data, checksum);
+        HttpResponse<String> created = put(id, data, checksum, null, version);
+        HttpResponse<String> repeated = put(id, data, checksum, null, version);
 
         assertThat(created.statusCode()).isEqualTo(201);
         assertThat(created.body()).contains("\"chunk_id\":\"" + id + "\"", "\"size\":1048576", "\"checksum\":\"" + checksum + "\"");
@@ -124,10 +148,10 @@ class WorkerApiTest {
     void edge11_aPutAnswerIsBoundedAndRespectsTheHold() throws Exception {
         changes.ack(changes.lastSeq());
         for (int i = 0; i < 300; i++) {
-            changes.deleted(chunkId(100 + i));
+            changes.deleted(chunkId(100 + i), nextVersion(), "deleted");
         }
         long m = changes.beginHold();
-        changes.deleted(chunkId(999));                                       // above M: held back
+        changes.deleted(chunkId(999), nextVersion(), "deleted");             // above M: held back
         try {
             byte[] data = data(11);
             long acked = m - 300;
@@ -173,15 +197,58 @@ class WorkerApiTest {
     }
 
     @Test
-    void putOfDifferentContentToAnExistingIdIsAConflict() throws Exception {
+    void anOlderVersionIsStaleAndANewerOneReplacesADifferentCopyAfterQuarantiningIt() throws Exception {
         byte[] original = bytes(100, 1);
         byte[] other = bytes(100, 2);
-        put(chunkId(0), original, Checksums.sha256Hex(original));
+        long older = nextVersion();
+        long newer = nextVersion();
+        assertThat(put(chunkId(0), original, Checksums.sha256Hex(original), null, newer).statusCode()).isEqualTo(201);
 
-        HttpResponse<String> response = put(chunkId(0), other, Checksums.sha256Hex(other));
+        HttpResponse<String> stale = put(chunkId(0), other, Checksums.sha256Hex(other), null, older);
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(stale.body()).contains("\"error\":\"stale_version\"");
 
-        assertThat(response.statusCode()).isEqualTo(409);
-        assertThat(response.body()).contains("\"error\":\"conflict\"");
+        HttpResponse<String> replaced = put(chunkId(0), other, Checksums.sha256Hex(other), null, nextVersion());
+        assertThat(replaced.statusCode()).isEqualTo(201);
+        assertThat(Files.readAllBytes(dataDir.resolve("chunks").resolve(chunkId(0)))).isEqualTo(other);
+    }
+
+    @Test
+    void aPutWithoutAValidOpVersionIsABadRequest() throws Exception {
+        byte[] data = bytes(10, 1);
+        HttpResponse<String> missing = http.send(HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId(0)))
+                .header("X-Checksum", Checksums.sha256Hex(data))
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(data)).build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(missing.statusCode()).isEqualTo(400);
+        assertThat(missing.body()).contains("X-Op-Version");
+
+        HttpResponse<String> odd = put(chunkId(0), data, Checksums.sha256Hex(data), null, 1001);
+        assertThat(odd.statusCode()).as("odd versions are worker observations").isEqualTo(400);
+    }
+
+    @Test
+    void aBodyThatDoesNotArriveIsCutOffAfterTheServerReadTimeout() throws Exception {
+        long started = System.nanoTime();
+        try (Socket socket = new Socket("localhost", port)) {
+            socket.setSoTimeout(8000);
+            OutputStream out = socket.getOutputStream();
+            String head = "PUT /internal/chunks/" + chunkId(4) + " HTTP/1.1\r\nHost: localhost\r\n"
+                    + "X-Checksum: " + "a".repeat(64) + "\r\nX-Op-Version: " + nextVersion() + "\r\n"
+                    + "Content-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n";
+            out.write(head.getBytes(StandardCharsets.US_ASCII));
+            out.write(new byte[10]);                                    // 10 of the 1000 bytes, then silence
+            out.flush();
+            InputStream in = socket.getInputStream();
+            byte[] buffer = new byte[256];
+            int read = in.read(buffer);                                 // an answer, or the connection closing
+            double seconds = (System.nanoTime() - started) / 1e9;
+            assertThat(seconds).as("SERVER_READ_TIMEOUT = 1 s applies to the body").isLessThan(6);
+            if (read > 0) {
+                // Tomcat reports the timed-out read as an aborted request: the answer is an error status.
+                assertThat(new String(buffer, 0, read, StandardCharsets.US_ASCII)).matches("(?s)HTTP/1\\.1 [45]\\d\\d.*");
+            }
+        }
+        assertThat(Files.exists(dataDir.resolve("chunks").resolve(chunkId(4)))).isFalse();
     }
 
     @Test
@@ -232,13 +299,12 @@ class WorkerApiTest {
     }
 
     @Test
-    void deleteIsIdempotent() throws Exception {
+    void thereIsNoDeleteEndpointDeletingIsAVersionedCommand() throws Exception {
         byte[] data = bytes(10, 1);
         put(chunkId(0), data, Checksums.sha256Hex(data));
 
-        assertThat(delete(chunkId(0)).statusCode()).isEqualTo(204);
-        assertThat(delete(chunkId(0)).statusCode()).isEqualTo(204);
-        assertThat(get("/internal/chunks/" + chunkId(0)).statusCode()).isEqualTo(404);
+        assertThat(delete(chunkId(0)).statusCode()).isEqualTo(405);
+        assertThat(get("/internal/chunks/" + chunkId(0)).statusCode()).isEqualTo(200);
     }
 
     @Test
@@ -305,8 +371,14 @@ class WorkerApiTest {
     }
 
     private HttpResponse<String> put(String chunkId, byte[] body, String checksum, String changeAck) throws Exception {
+        return put(chunkId, body, checksum, changeAck, nextVersion());
+    }
+
+    private HttpResponse<String> put(String chunkId, byte[] body, String checksum, String changeAck, long version)
+            throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId))
                 .header("X-Checksum", checksum)
+                .header("X-Op-Version", Long.toString(version))
                 .header("Content-Type", "application/octet-stream")
                 .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
         if (changeAck != null) {

@@ -2,8 +2,6 @@ package com.objectstore.controller.cluster;
 
 import com.objectstore.common.ChunkIds;
 import com.objectstore.common.dto.ChunkInfo;
-import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.ClusterState.WorkerState;
 import com.objectstore.controller.config.ControllerProperties;
@@ -34,9 +32,13 @@ import org.springframework.stereotype.Service;
  *       {@code chunks} table in the database.</li>
  * </ol>
  *
- * Differences between disks and the block map are only meaningful while the cluster is
- * quiescent: no copies pending, no commands queued, not in safe mode, nothing in the apply queue,
- * an empty deletion ledger, no report session open and no worker being purged.
+ * Besides, it reports (v5 §8): chunks with fewer than RF available (ALIVE) copies and unrecoverable
+ * ones, chunks with surplus copies, quarantined copies on each worker, orphan copies, and workers
+ * that are STALE, DEAD or have not completed a resync. It never deletes or changes anything.
+ *
+ * <p>Differences between disks and the block map are only meaningful while the cluster is
+ * quiescent: no op pending, no command queued, not in safe mode, nothing in the apply queue, no
+ * resync open and no worker being purged.
  *
  * <p>Order (v4 §5.10): take the namespace lock; queue a {@code Barrier} and wait for it (every
  * namespace task queued before is applied); read the database's chunk table and snapshot the
@@ -54,6 +56,15 @@ public class Fsck {
     public record DiskVsMap(List<String> onDiskNotInMap, List<String> inMapNotOnDisk, List<String> checksumMismatch) {
     }
 
+    /** Chunk-level findings: fewer than RF available copies, none at all, and surplus copies. */
+    public record ChunkFindings(long underReplicated, List<String> unrecoverable, long excess, long pendingQuarantines) {
+    }
+
+    /** A worker that is not a full member right now, and why; or a worker with quarantined copies. */
+    public record WorkerFinding(String workerId, String state, boolean reported, boolean resyncing,
+                                long quarantinedChunks, long quarantinedBytes) {
+    }
+
     public record Result(
             String status,
             ObjectCounts objects,
@@ -61,13 +72,15 @@ public class Fsck {
             long orphansOnDisk,
             List<String> unreachableWorkers,
             List<String> invariantViolations,
-            boolean quiescent) {
+            boolean quiescent,
+            ChunkFindings chunks,
+            List<WorkerFinding> workers) {
     }
 
     private record Snapshot(
             Map<String, String> aliveUrls,
             Map<String, ClusterState.ChunkInfo> chunks,
-            Map<String, Map<String, ReplicaState>> blocks,
+            Map<String, Set<String>> blocks,
             Set<String> pendingUploads) {
     }
 
@@ -151,12 +164,12 @@ public class Fsck {
                 if (!known.checksum().equals(file.checksum())) {
                     checksumMismatch.add(file.chunkId() + "@" + workerId);
                 }
-                if (!snapshot.blocks().getOrDefault(file.chunkId(), Map.of()).containsKey(workerId)) {
+                if (!snapshot.blocks().getOrDefault(file.chunkId(), Set.of()).contains(workerId)) {
                     onDiskNotInMap.add(file.chunkId() + "@" + workerId);
                 }
             }
-            for (Map.Entry<String, Map<String, ReplicaState>> entry : snapshot.blocks().entrySet()) {
-                if (entry.getValue().containsKey(workerId) && !disk.containsKey(entry.getKey())) {
+            for (Map.Entry<String, Set<String>> entry : snapshot.blocks().entrySet()) {
+                if (entry.getValue().contains(workerId) && !disk.containsKey(entry.getKey())) {
                     inMapNotOnDisk.add(entry.getKey() + "@" + workerId);
                 }
             }
@@ -168,9 +181,20 @@ public class Fsck {
             List<String> violations = new ArrayList<>(cluster.checkInvariants());
             violations.addAll(i7);
             ObjectCounts counts = countObjects(totalObjects);
-            boolean quiescent = !cluster.isSafeMode() && cluster.pendingTotal() == 0 && cluster.queuedCommands() == 0
+            boolean quiescent = !cluster.isSafeMode() && cluster.ops().isEmpty() && cluster.queuedCommands() == 0
                     && queue.depth() == 0 && cluster.openSessions() == 0 && !cluster.anyPurging()
-                    && cluster.ledger().isEmpty();
+                    && cluster.resyncingWorkers() == 0;
+            long[] health = cluster.health();
+            ChunkFindings findings = new ChunkFindings(health[1] + health[0], cluster.unrecoverable(100), health[2],
+                    cluster.ops().count(PendingOps.Reason.CORRUPT));
+            List<WorkerFinding> workerFindings = new ArrayList<>();
+            for (WorkerInfo worker : cluster.workersSorted()) {
+                long quarantined = worker.stats == null ? 0 : worker.stats.quarantinedChunks();
+                if (worker.state != WorkerState.ALIVE || !worker.hasReported || worker.resyncing || quarantined > 0) {
+                    workerFindings.add(new WorkerFinding(worker.workerId, worker.state.name(), worker.hasReported,
+                            worker.resyncing, quarantined, worker.stats == null ? 0 : worker.stats.quarantinedBytes()));
+                }
+            }
             DiskVsMap diskVsMap = new DiskVsMap(List.copyOf(onDiskNotInMap), List.copyOf(inMapNotOnDisk),
                     List.copyOf(checksumMismatch));
             String status;
@@ -183,7 +207,8 @@ public class Fsck {
             } else {
                 status = "HEALTHY";
             }
-            Result result = new Result(status, counts, diskVsMap, orphanCount, unreachable, violations, quiescent);
+            Result result = new Result(status, counts, diskVsMap, orphanCount, unreachable, violations, quiescent, findings,
+                    workerFindings);
             log.info("[fsck] {} objects={} under={} corrupt_replicas={} missing={} orphans={} quiescent={}", status,
                     counts.total(), counts.underReplicated(), counts.corruptReplicas(), counts.missing(),
                     result.orphansOnDisk(), quiescent);
@@ -198,11 +223,9 @@ public class Fsck {
                 alive.put(worker.workerId, worker.url);
             }
         }
-        Map<String, Map<String, ReplicaState>> blocks = new HashMap<>();
-        for (Map.Entry<String, Map<String, Replica>> entry : cluster.blocks().entrySet()) {
-            Map<String, ReplicaState> holders = new HashMap<>();
-            entry.getValue().forEach((worker, replica) -> holders.put(worker, replica.state));
-            blocks.put(entry.getKey(), holders);
+        Map<String, Set<String>> blocks = new HashMap<>();
+        for (Map.Entry<String, Map<String, ClusterState.Replica>> entry : cluster.blocks().entrySet()) {
+            blocks.put(entry.getKey(), Set.copyOf(entry.getValue().keySet()));
         }
         return new Snapshot(alive, Map.copyOf(cluster.chunks()), blocks, Set.copyOf(cluster.pendingUploads()));
     }
@@ -244,8 +267,8 @@ public class Fsck {
             } else if (live < rf) {
                 counters[0]++;
             }
-            for (Replica replica : cluster.replicasOf(entry.getKey()).values()) {
-                if (replica.state == ReplicaState.CORRUPT) {
+            for (String workerId : cluster.replicasOf(entry.getKey()).keySet()) {
+                if (cluster.ops().deleteReason(entry.getKey(), workerId) == PendingOps.Reason.CORRUPT) {
                     counters[2]++;
                     corruptReplicas++;
                 }

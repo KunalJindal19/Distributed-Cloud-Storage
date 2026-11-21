@@ -1,12 +1,11 @@
 package com.objectstore.controller.cluster;
 
-import com.objectstore.common.InternalApi;
-import com.objectstore.common.dto.Command;
-import com.objectstore.controller.cluster.ClusterState.PendingCopy;
 import com.objectstore.controller.cluster.ClusterState.Receipt;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
+import com.objectstore.controller.cluster.PendingOps.Kind;
+import com.objectstore.controller.cluster.PendingOps.Op;
+import com.objectstore.controller.cluster.PendingOps.Reason;
 import com.objectstore.controller.cluster.Task.Step;
 import com.objectstore.controller.domain.Chunk;
 import java.util.ArrayList;
@@ -20,12 +19,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * The tasks that change the namespace mirror and the copies that belong to it (v4 §5.6, §5.7,
- * §5.9): {@code CommitObject}, {@code EndUpload}, {@code DeleteObject}, {@code ApplyObjectMirror},
- * plus {@code MarkCorrupt}. They run on the writer, under the write lock, and never touch SQLite:
- * the caller did the database work (under the namespace lock) and passed the rows in. Long ones
- * yield ({@link Step#MORE}) every {@link #STEP_ITEMS} items or at the deadline; the state
- * satisfies every invariant at each yield.
+ * The tasks that change the namespace mirror and the copies and ops that belong to it (v5 §7):
+ * {@code CommitObject}, {@code EndUpload}, {@code DeleteObject}, {@code ApplyObjectMirror}, plus
+ * {@code ReportCorrupt} for a download. They run on the writer, under the write lock, and never touch
+ * SQLite: the caller did the database work (under the namespace lock) and passed the rows in. Long
+ * ones yield ({@link Step#MORE}) every {@link #STEP_ITEMS} items or at the deadline.
  */
 @Component
 public class NamespaceTasks {
@@ -33,8 +31,8 @@ public class NamespaceTasks {
     private static final Logger log = LoggerFactory.getLogger(NamespaceTasks.class);
     static final int STEP_ITEMS = 1000;
 
-    /** A target of an upload: the worker and the epoch it had when the chunk was written to it. */
-    public record Target(String workerId, long epoch) {
+    /** A target of an upload: the worker, its epoch when the chunk was written, and the PUT's version. */
+    public record Target(String workerId, long epoch, long version) {
     }
 
     /** A committed chunk and the targets that acknowledged it. */
@@ -58,11 +56,12 @@ public class NamespaceTasks {
     // ---- uploads ------------------------------------------------------------------------------
 
     /**
-     * {@code CommitObject} (§5.6 step 5): each chunk goes into the mirror; for each target still in
-     * the epoch it was written in, its receipt becomes the replica (OK, or CORRUPT if the checksum
-     * differs, with the receipt's report mark), or it gets an UPLOAD pending copy. A target that
-     * died or re-registered gets nothing (the chunk is under-replicated and is repaired). Finally
-     * the object is no longer pending and its remaining receipts go.
+     * {@code CommitObject} (v5 §7): each chunk goes into the mirror; a target whose RECEIVED is already
+     * applied (its receipt) becomes a replica at the receipt's version; a target whose PUT succeeded
+     * but whose RECEIVED has not been applied yet gets an INSERT {@code UPLOAD} op at that PUT's
+     * version, resolved when the RECEIVED arrives. A target that died or re-registered meanwhile gets
+     * nothing (the chunk is repaired). Then every other receipt of a current epoch becomes a replica
+     * too (a surplus is trimmed later). Finally the object is no longer pending.
      */
     public Task commitObject(String objectId, List<CommittedChunk> chunks) {
         int[] cursor = {0};
@@ -75,8 +74,6 @@ public class NamespaceTasks {
                 Chunk chunk = entry.chunk();
                 cluster.putChunk(chunk.chunkId(), new ClusterState.ChunkInfo(chunk.objectId(), chunk.index(), chunk.size(),
                         chunk.checksum()));
-                // The targets first, in placement order: a receipt becomes the replica, otherwise
-                // an UPLOAD pending copy (if the target is still in the epoch it was written in).
                 for (Target target : entry.targets()) {
                     items++;
                     WorkerInfo worker = cluster.worker(target.workerId());
@@ -87,12 +84,9 @@ public class NamespaceTasks {
                         refused[0]++;
                         continue;
                     }
-                    cluster.addUploadPending(chunk.chunkId(), target.workerId());
+                    cluster.ops().upload(chunk.chunkId(), target.workerId(), target.version());
                     awaited[0]++;
                 }
-                // Then every other receipt of a worker's current epoch: proof that it holds the bytes
-                // too (a target whose PUT answer was lost and that the upload replaced). A surplus is
-                // trimmed later.
                 Map<String, Receipt> others = cluster.receipts().get(chunk.chunkId());
                 for (String workerId : others == null ? List.<String>of() : List.copyOf(others.keySet())) {
                     items++;
@@ -106,7 +100,7 @@ public class NamespaceTasks {
             cluster.endUpload(objectId);
             if (refused[0] > 0) {
                 log.warn("[upload] object={}: {} copies not recorded because their worker died or re-registered meanwhile; "
-                        + "the monitor will re-replicate", objectId, refused[0]);
+                        + "the planner will re-replicate", objectId, refused[0]);
             }
             if (awaited[0] > 0) {
                 log.debug("[upload] object={}: {} copies await their RECEIVED", objectId, awaited[0]);
@@ -115,10 +109,7 @@ public class NamespaceTasks {
         });
     }
 
-    /**
-     * Turns the worker's receipt for a committed chunk into its replica (OK, or CORRUPT if the
-     * checksum differs, with the receipt's report mark). A receipt of an earlier epoch is dropped.
-     */
+    /** Turns the worker's receipt for a committed chunk into its replica (or a CORRUPT delete). */
     private boolean recordReceipt(Chunk chunk, String workerId) {
         Receipt receipt = cluster.removeReceipt(chunk.chunkId(), workerId);
         WorkerInfo worker = cluster.worker(workerId);
@@ -126,28 +117,36 @@ public class NamespaceTasks {
             return false;
         }
         boolean intact = chunk.checksum().equals(receipt.checksum) && chunk.size() == receipt.size;
-        Replica replica = cluster.addReplica(chunk.chunkId(), workerId, intact ? ReplicaState.OK : ReplicaState.CORRUPT);
-        replica.mark = receipt.seenInSession;
-        cluster.removePending(chunk.chunkId(), workerId);
+        if (!intact) {
+            cluster.ops().ensure(chunk.chunkId(), workerId, Reason.CORRUPT);
+            return true;
+        }
+        Replica replica = cluster.addReplica(chunk.chunkId(), workerId, receipt.version);
+        if (replica != null) {
+            replica.mark = receipt.seenInSession;
+        }
+        Op op = cluster.ops().get(chunk.chunkId(), workerId);
+        if (op != null && op.kind() == Kind.INSERT && receipt.version >= op.version()) {
+            cluster.ops().complete(op);
+        }
         return true;
     }
 
     /**
-     * {@code EndUpload} (§5.6 step 6): an upload that did not commit. Its chunks are garbage: a
-     * DELETE ({@code upload_failed}) goes to every worker it wrote or may have written to, and
-     * its receipts and pending state go.
+     * {@code EndUpload}: an upload that did not commit is never visible. Its chunks are garbage and
+     * {@code ensure(DELETE, UPLOAD_FAILED)} goes to exactly the pairs it attempted.
      */
     public Task endUpload(String objectId, List<Attempt> attempts) {
         int[] cursor = {0};
         return Task.steps("EndUpload", deadline -> {
             if (cursor[0] == 0) {
-                cluster.addGarbage(objectId);
+                cluster.addGarbage(objectId, Reason.UPLOAD_FAILED);
             }
             int items = 0;
             while (cursor[0] < attempts.size()) {
                 Attempt attempt = attempts.get(cursor[0]++);
-                if (cluster.worker(attempt.workerId()) != null && cluster.chunk(attempt.chunkId()) == null) {
-                    cluster.ledger().request(attempt.chunkId(), attempt.workerId(), DeletionLedger.UPLOAD_FAILED);
+                if (cluster.chunk(attempt.chunkId()) == null) {
+                    cluster.ops().ensure(attempt.chunkId(), attempt.workerId(), Reason.UPLOAD_FAILED);
                 }
                 if (stepDone(++items, deadline) && cursor[0] < attempts.size()) {
                     return Step.MORE;
@@ -161,49 +160,46 @@ public class NamespaceTasks {
     // ---- deletes ------------------------------------------------------------------------------
 
     /**
-     * {@code DeleteObject} (§5.7 step 3): the object is garbage; for each chunk, every queued
-     * (undelivered) command for it is cancelled, a DELETE ({@code object_deleted}) goes to every
-     * holder (any state) and every pending target, and the chunk is forgotten.
+     * {@code DeleteObject} (v5 §7): the object is garbage; {@code ensure(DELETE, OBJECT_DELETED)} goes
+     * to every holder and every INSERT target of each chunk (superseding any other op on the pair),
+     * and the chunk is forgotten. Physical deletion is asynchronous; repeated DELETEs are harmless.
      */
     public Task deleteObject(String objectId, List<String> chunkIds) {
         int[] cursor = {0};
-        int[] commands = {0};
+        int[] deletions = {0};
         boolean[] started = {false};
         return Task.namespace("DeleteObject", objectId, deadline -> {
             if (!started[0]) {
-                cluster.addGarbage(objectId);
+                cluster.addGarbage(objectId, Reason.OBJECT_DELETED);
                 started[0] = true;
             }
-            if (cursor[0] < chunkIds.size()) {           // one batch per step
+            if (cursor[0] < chunkIds.size()) {
                 int end = Math.min(chunkIds.size(), cursor[0] + STEP_ITEMS);
-                commands[0] += forget(chunkIds.subList(cursor[0], end), "object_deleted");
+                deletions[0] += forget(chunkIds.subList(cursor[0], end));
                 cursor[0] = end;
                 if (cursor[0] < chunkIds.size()) {
                     return Step.MORE;
                 }
             }
-            log.info("[api] deleted object={}; {} copies to delete (ledger)", objectId, commands[0]);
+            log.info("[api] deleted object={}; {} copies to delete", objectId, deletions[0]);
             return Step.DONE;
         });
     }
 
-    /**
-     * Forgets a batch of chunks: their queued copies are cancelled, their excess/corrupt deletions
-     * become namespace deletions, every holder (any state) and every pending target gets a ledger
-     * DELETE, and the chunks are removed.
-     */
-    private int forget(List<String> chunkIds, String reason) {
-        cluster.cancelReplicatesFor(new HashSet<>(chunkIds));
+    /** Forgets a batch of chunks: a DELETE for every holder and INSERT target, then the mirror rows go. */
+    private int forget(List<String> chunkIds) {
         int deletions = 0;
         for (String chunkId : chunkIds) {
-            cluster.ledger().chunkRemoved(chunkId, reason);
             Set<String> holders = new LinkedHashSet<>(cluster.replicasOf(chunkId).keySet());
-            for (PendingCopy copy : cluster.pendingOf(chunkId)) {
-                holders.add(copy.target());          // a copy on its way may land
+            for (Op op : cluster.ops().opsFor(chunkId)) {
+                if (op.kind() == Kind.INSERT) {
+                    holders.add(op.workerId);          // a copy on its way may land
+                }
             }
             for (String workerId : holders) {
-                cluster.ledger().request(chunkId, workerId, reason);
-                deletions++;
+                if (cluster.ops().ensure(chunkId, workerId, Reason.OBJECT_DELETED) != null) {
+                    deletions++;
+                }
             }
             cluster.removeChunk(chunkId);
         }
@@ -213,9 +209,9 @@ public class NamespaceTasks {
     // ---- reconciling after a failed namespace task ---------------------------------------------
 
     /**
-     * {@code ApplyObjectMirror} (§5.9): makes the mirror of one object match the rows read from
-     * the database: missing chunks are added (with no copies yet: they get repaired), chunks no
-     * longer in the namespace are removed as {@code DeleteObject} does.
+     * {@code ApplyObjectMirror}: makes the mirror of one object match the rows read from the
+     * database: missing chunks are added (with no copies yet: they get repaired), chunks no longer in
+     * the namespace are forgotten as {@code DeleteObject} does.
      */
     public Task applyObjectMirror(String objectId, List<Chunk> rows) {
         return Task.of("ApplyObjectMirror", () -> {
@@ -236,10 +232,10 @@ public class NamespaceTasks {
                     stale.add(chunkId);
                 }
             }
-            forget(stale, "object_deleted");
             if (rows.isEmpty()) {
-                cluster.addGarbage(objectId);
+                cluster.addGarbage(objectId, Reason.OBJECT_DELETED);
             }
+            forget(stale);
             cluster.endUpload(objectId);
             cluster.increment("namespace_reconciled");
             log.warn("[writer] reconciled object={} with the namespace: {} chunks added, {} removed", objectId, added,
@@ -249,17 +245,21 @@ public class NamespaceTasks {
 
     // ---- downloads ------------------------------------------------------------------------------
 
-    /** {@code MarkCorrupt}: a read proved a copy bad; it becomes CORRUPT if it is still OK in the same epoch. */
-    public Task markCorrupt(String workerId, long epoch, String chunkId, String reason) {
-        return Task.of("MarkCorrupt", () -> {
+    /**
+     * {@code ReportCorrupt}: a download found that the worker's copy (generation {@code gen}, read in
+     * {@code epoch}) does not match the namespace checksum: {@code ensure(DELETE, CORRUPT)}, if it is
+     * still the same copy. A copy corrupted in transit is retried by the download, never reported.
+     */
+    public Task reportCorrupt(String workerId, long epoch, String chunkId, long gen, String reason) {
+        return Task.of("ReportCorrupt", () -> {
             WorkerInfo worker = cluster.worker(workerId);
             Replica replica = cluster.replica(chunkId, workerId);
-            if (worker == null || worker.epoch != epoch || worker.isDead() || replica == null
-                    || replica.state != ReplicaState.OK) {
+            if (worker == null || worker.epoch != epoch || worker.isDead() || replica == null || replica.gen != gen) {
                 return;
             }
-            cluster.markCorrupt(chunkId, workerId);
-            log.warn("[integrity] chunk={} worker={} -> CORRUPT ({})", chunkId, workerId, reason);
+            if (cluster.ops().ensure(chunkId, workerId, Reason.CORRUPT) != null) {
+                log.warn("[integrity] chunk={} worker={} -> quarantine ({})", chunkId, workerId, reason);
+            }
         });
     }
 }

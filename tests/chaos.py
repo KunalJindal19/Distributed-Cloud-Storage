@@ -15,10 +15,10 @@ the cluster converges and that nothing acknowledged was lost:
   4. every deleted object answers 404 and none of its chunks is on any worker's disk;
   5. invariant_violations == 0;
   6. the event-driven core is clean: index_mismatches, writer_task_failures and namespace_reconciled
-     are 0, the apply queue is empty, the deletion ledger is empty, no report session is open.
+     are 0, the apply queue is empty, no op is pending (DELETEs included), no resync is open.
 
-It runs with FULL_REPORT_INTERVAL = 300 (the default): there is no frequent full report to fall
-back on, so deletions and orphans must converge through the deletion ledger and the one-time report
+It runs with RESYNC_INTERVAL = 3600 (the default): there is no frequent resync to fall
+back on, so deletions and orphans must converge through the versioned ops and the one-time resync
 request when orphan GC becomes allowed.
 
 Standard library only. Usage:
@@ -47,7 +47,7 @@ if not os.path.exists(os.path.join(ROOT, "docker-compose.yml")) and os.path.exis
 BASE = os.environ.get("BASE_URL", "http://localhost:8000")
 API = BASE + "/api/v1"
 WORKERS = ["worker1", "worker2", "worker3", "worker4"]
-NETWORK = "objectstore_objectstore-net"
+NETWORK = os.environ.get("COMPOSE_PROJECT_NAME", "objectstore") + "_objectstore-net"  # follows the Compose project
 COMPOSE = ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.chaos.yml"]
 RETRY_FOR = 180  # seconds a client keeps retrying one operation
 
@@ -410,11 +410,11 @@ def verify(results):
     checks.append(("invariant_violations == 0", violations == 0, violations))
     core = {name: counters.get(name, 0) for name in ("index_mismatches", "writer_task_failures", "namespace_reconciled")}
     checks.append(("index_mismatches, writer_task_failures, namespace_reconciled == 0", not any(core.values()), core))
-    ledger = final.get("ledger", {})
-    idle = {"apply_queue_depth": final.get("apply_queue_depth"), "ledger": ledger,
+    ops = final.get("ops", {}).get("by_state", {})
+    idle = {"apply_queue_depth": final.get("apply_queue_depth"), "ops": ops, "resyncing": final.get("resyncing"),
             "report_sessions_open": final.get("report_sessions_open")}
-    checks.append(("apply queue empty, deletion ledger empty, no report session open",
-                   final.get("apply_queue_depth") == 0 and sum(ledger.values()) == 0
+    checks.append(("apply queue empty, no pending op, no resync open",
+                   final.get("apply_queue_depth") == 0 and sum(ops.values()) == 0 and final.get("resyncing") == 0
                    and final.get("report_sessions_open") == 0, idle))
     checks.append(("no data problems observed by the clients", not problems, problems[:5]))
     return checks

@@ -3,12 +3,11 @@ package com.objectstore.controller.cluster;
 import static com.objectstore.controller.cluster.TestSupport.chunk;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import java.util.List;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 
-/** Block 15 (v4 §7.3 step 1, §7.6): safe mode's O(1) counter matches a scan in every transition. */
+/** Safe mode's O(1) counter matches a scan in every transition. */
 class SafeModeTest {
 
     private static long scan(ClusterState cluster) {
@@ -31,9 +30,9 @@ class SafeModeTest {
             int kind = random.nextInt(6);
             cluster.write(() -> {
                 switch (kind) {
-                    case 0, 1 -> cluster.addReplica(chunkId, workerId, ReplicaState.OK);
+                    case 0, 1 -> cluster.addReplica(chunkId, workerId, 0);
                     case 2 -> cluster.removeReplica(chunkId, workerId);
-                    case 3 -> cluster.markCorrupt(chunkId, workerId);
+                    case 3 -> cluster.ops().ensure(chunkId, workerId, PendingOps.Reason.CORRUPT);
                     case 4 -> {
                         if (cluster.chunk(chunkId) == null) {
                             cluster.putChunk(chunkId, new ClusterState.ChunkInfo(TestSupport.OBJECT, 0, 10, TestSupport.SUM));
@@ -41,7 +40,7 @@ class SafeModeTest {
                             cluster.removeChunk(chunkId);
                         }
                     }
-                    default -> cluster.setReplicaState(chunkId, workerId, ReplicaState.OK);
+                    default -> cluster.addReplica(chunkId, workerId, 2L * random.nextInt(1000));
                 }
             });
             assertThat(cluster.read(cluster::safeCount)).as("after op %d", op).isEqualTo(scan(cluster));
@@ -61,7 +60,7 @@ class SafeModeTest {
         assertThat(cluster.write(safeMode::evaluate)).isTrue();
         assertThat(cluster.read(cluster::safeCount)).isEqualTo(1).isEqualTo(scan(cluster));
 
-        t.fullReport("worker1", t.fake("worker1").boot, chunk(0), chunk(1));
+        t.ibr("worker1", t.received("worker1", chunk(1), t.local("worker1")));
         assertThat(cluster.read(cluster::safeCount)).isEqualTo(2).isEqualTo(scan(cluster));
         assertThat(cluster.write(safeMode::evaluate)).as("the extension has not passed").isTrue();
         Thread.sleep((long) (t.properties.safeModeExtensionSeconds() * 1000) + 50);

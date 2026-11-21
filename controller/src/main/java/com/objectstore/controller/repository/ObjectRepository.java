@@ -203,4 +203,14 @@ public class ObjectRepository {
                 .query(String.class)
                 .list();
     }
+
+    /** Objects whose upload started but never committed (their chunks are upload-failed garbage). */
+    public List<String> uncommittedUploadIds() {
+        return jdbc.sql("SELECT object_id FROM upload_intents").query(String.class).list();
+    }
+
+    /** Objects that were deleted (their chunks are deleted-object garbage). */
+    public List<String> deletedObjectIds() {
+        return jdbc.sql("SELECT object_id FROM deleted_objects").query(String.class).list();
+    }
 }
