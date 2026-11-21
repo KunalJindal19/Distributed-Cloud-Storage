@@ -2,7 +2,6 @@ package com.objectstore.controller.objects;
 
 import com.objectstore.controller.cluster.ClusterState;
 import com.objectstore.controller.cluster.ClusterState.Replica;
-import com.objectstore.controller.cluster.ClusterState.ReplicaState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.cluster.ClusterState.WorkerState;
 import com.objectstore.controller.config.ControllerProperties;
@@ -33,10 +32,11 @@ public class PlacementPolicy {
     /**
      * A worker may receive new data if it is ALIVE (or STALE while more than STALE_RATIO of the
      * non-DEAD workers are STALE, HDFS's stale ratio: otherwise a network blip would stop all
-     * writes), has sent a full report, and has at least MIN_FREE_BYTES free.
+     * writes), has completed a resync and is not resyncing now (v5 §5.2), and has at least
+     * MIN_FREE_BYTES free.
      */
     public boolean isWriteEligible(WorkerInfo worker) {
-        if (worker.isDead() || !worker.hasReported) {
+        if (worker.isDead() || !worker.hasReported || worker.resyncing) {
             return false;
         }
         if (worker.state == WorkerState.STALE && !staleRatioExceeded()) {
@@ -96,9 +96,10 @@ public class PlacementPolicy {
     }
 
     /**
-     * Which holder of a chunk should send the repair copy: an OK copy on an ALIVE, reported
-     * worker that has fewer than MAX_STREAMS copies in flight and did not recently fail with
-     * this chunk. Prefer the least busy source, then one without a recent data error, then by id.
+     * Which holder of a chunk should send the repair copy: a copy with no pending DELETE on an ALIVE,
+     * reported worker (a resyncing one may still send) with a free stream and room in its queue, that
+     * did not recently fail with this chunk. Prefer the least busy source, then one without a recent
+     * data error, then by id.
      */
     public Optional<String> chooseSource(String chunkId) {
         return chooseSource(chunkId, worker -> true);
@@ -109,64 +110,52 @@ public class PlacementPolicy {
         long recent = properties.targetBackoff().toNanos();
         long now = cluster.now();
         List<String> candidates = new ArrayList<>();
-        for (Map.Entry<String, Replica> entry : cluster.replicasOf(chunkId).entrySet()) {
-            WorkerInfo worker = cluster.worker(entry.getKey());
-            if (entry.getValue().state == ReplicaState.OK && worker != null && worker.state == WorkerState.ALIVE
-                    && worker.hasReported && cluster.pendingFrom(worker.workerId) < properties.maxStreams()
-                    && worker.commands.size() < properties.maxCommandsPerWorker()     // never drop a command
-                    && !cluster.recentlyFailed(chunkId, worker.workerId) && allowed.test(worker.workerId)) {
-                candidates.add(worker.workerId);
+        for (String workerId : cluster.replicasOf(chunkId).keySet()) {
+            WorkerInfo worker = cluster.worker(workerId);
+            if (worker != null && worker.state == WorkerState.ALIVE && worker.hasReported
+                    && !cluster.ops().hasDelete(chunkId, workerId)
+                    && cluster.ops().streamsOf(workerId) < properties.maxStreams()
+                    && worker.commands.size() < properties.maxCommandsPerWorker()
+                    && !cluster.recentlyFailed(chunkId, workerId) && allowed.test(workerId)) {
+                candidates.add(workerId);
             }
         }
         return candidates.stream().min(Comparator
-                .comparingInt((String w) -> cluster.pendingFrom(w))
+                .comparingInt((String w) -> cluster.ops().streamsOf(w))
                 .thenComparingInt(w -> cluster.worker(w).lastDataError != 0 && now - cluster.worker(w).lastDataError < recent ? 1 : 0)
                 .thenComparing(w -> w));
     }
 
     /**
-     * Where a repair copy goes: a write-eligible worker that holds no copy of the chunk in any
-     * state, is not already a pending target for it, and did not recently fail with it. Prefer
+     * Where a repair copy goes (v5 §6.3): an ALIVE, reported, non-resyncing, write-eligible worker
+     * that does not hold the chunk, has no op on the pair and did not recently fail with it. Prefer
      * the worker with the fewest copies (held plus inbound), then by id.
      */
     public Optional<String> chooseTarget(String chunkId) {
         List<String> candidates = new ArrayList<>();
         for (WorkerInfo worker : writeEligibleWorkers()) {
             String id = worker.workerId;
-            boolean pendingTarget = cluster.pendingOf(chunkId).stream().anyMatch(p -> p.target().equals(id));
-            if (cluster.replica(chunkId, id) == null && !pendingTarget && !cluster.recentlyFailed(chunkId, id)) {
+            if (worker.state == WorkerState.ALIVE && cluster.replica(chunkId, id) == null
+                    && cluster.ops().get(chunkId, id) == null && !cluster.recentlyFailed(chunkId, id)) {
                 candidates.add(id);
             }
         }
         return candidates.stream().min(Comparator
-                .comparingInt((String w) -> cluster.chunksOn(w).size() + cluster.pendingTo(w))
+                .comparingInt((String w) -> cluster.chunksOn(w).size() + cluster.ops().insertsTo(w))
                 .thenComparing(w -> w));
     }
 
     /**
-     * Which surplus copies to remove: never a worker that is currently the source of a pending
-     * copy of this chunk, never so many that fewer than RF live copies remain; the busiest
-     * worker first (highest id breaks ties), which pulls the load back towards even.
+     * Which surplus copy an EXCESS delete removes (v5 §6.4): preferably one without fresh VERIFY
+     * credit; among those the busiest worker (highest id breaks ties), which pulls the load back
+     * towards even.
      */
-    public List<String> chooseExcess(String chunkId, int count) {
-        Set<String> sources = new java.util.HashSet<>();
-        for (ClusterState.PendingCopy copy : cluster.pendingOf(chunkId)) {
-            if (copy.source() != null) {
-                sources.add(copy.source());
-            }
-        }
-        List<String> live = new ArrayList<>(cluster.live(chunkId));
-        live.removeIf(sources::contains);
-        live.sort(Comparator.comparingInt((String w) -> cluster.chunksOn(w).size()).thenComparing(w -> w).reversed());
-        int removable = Math.min(count, cluster.live(chunkId).size() - properties.replicationFactor());
-        List<String> chosen = new ArrayList<>();
-        for (String worker : live) {
-            if (chosen.size() >= removable) {
-                break;
-            }
-            chosen.add(worker);
-        }
-        return chosen;
+    public Optional<String> chooseVictim(String chunkId) {
+        List<String> holders = new ArrayList<>(cluster.replicasOf(chunkId).keySet());
+        return holders.stream().min(Comparator
+                .comparingInt((String w) -> cluster.freshForDelete(cluster.replica(chunkId, w), cluster.worker(w)) ? 1 : 0)
+                .thenComparing(Comparator.comparingInt((String w) -> cluster.chunksOn(w).size()).reversed())
+                .thenComparing(Comparator.<String>naturalOrder().reversed()));
     }
 
     /** Alive workers, for the insufficient-workers pre-check of an upload. */

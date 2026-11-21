@@ -67,15 +67,16 @@ check "no worker went DEAD" sh -c "! docker logs --since 30s controller 2>&1 | g
 wait_for 30 healthy
 check "the cluster is healthy" healthy
 
-section "AC-6.6 a corrupted copy is found by the scanner within 12 s, kept on disk, never served"
+section "AC-6.6 (v5) a corrupted copy is found by the scanner within 12 s, quarantined (kept on disk), never served"
 CHUNK="$OBJ-00000"; HOLDER=$(meta "$OBJ" | jq -r '.chunks[0].locations[0].worker_id')
 corrupt_chunk "$HOLDER" "$CHUNK"; t0=$(now)
-wait_for 20 sh -c "[ \"\$(curl -fsS $API/objects/$OBJ/metadata | jq -r '.chunks[0].locations[] | select(.worker_id==\"$HOLDER\") | .status')\" = CORRUPT ]"
-say "  CORRUPT after $(since "$t0") s"
-check "the copy on $HOLDER is CORRUPT within 12 s" python3 -c "import sys; sys.exit(0 if float('$(since "$t0")') <= 13 else 1)"
-check "the corrupt file is still on disk" file_exists "$HOLDER" "$CHUNK"
+# Wait for the controller to learn of the quarantine (DELETED(corrupt) → the "quarantined" event). Not
+# "HOLDER gone from the locations": the repair may put a new copy on HOLDER itself within a second.
+wait_for 20 sh -c "[ \$(curl -fsS $API/cluster/status | jq --arg c '$CHUNK' --arg w '$HOLDER' '[.repair_log[] | select(.event==\"quarantined\" and .chunk_id==\$c and .source==\$w)] | length') -ge 1 ]"
+say "  quarantined, and known to the controller, after $(since "$t0") s"
+check "the copy on $HOLDER is quarantined within 12 s" python3 -c "import sys; sys.exit(0 if float('$(since "$t0")') <= 13 else 1)"
+check "the corrupt bytes are kept in /data/quarantine" sh -c "docker exec $HOLDER ls /data/quarantine | grep -q '^$CHUNK\\.'"
 check "a download is byte-identical" download_matches "$OBJ" "$WORK/a.bin"
-# Block 6 has no repair yet; from block 7 on the copy is replaced, then deleted. Wait until healthy.
 wait_for 60 healthy || true
 
 section "AC-6.8 controller restart: safe mode, writes refused, reads work, safe mode ends"
@@ -115,7 +116,7 @@ section "AC-6.9 wiping the controller's volume: workers refuse it and keep every
 before=$(for w in worker1 worker2 worker3 worker4; do docker exec $w sh -c 'ls /data/chunks | grep -v "\.meta$"'; done | sort | sha256sum 2>/dev/null || true)
 count_before=$(for w in worker1 worker2 worker3 worker4; do docker exec $w sh -c 'ls /data/chunks | grep -vc "\.meta$"'; done | paste -sd+ - | bc)
 docker compose down > /dev/null 2>&1
-docker volume rm objectstore_controller_data > /dev/null
+docker volume rm "${PROJECT}_controller_data" > /dev/null
 docker compose up -d > /dev/null 2>&1
 wait_for 60 curl -fsS -m 2 "$BASE_URL/health"; sleep 10
 check "the workers log cluster_id_mismatch" sh -c "docker logs worker1 2>&1 | grep -q cluster_id_mismatch"

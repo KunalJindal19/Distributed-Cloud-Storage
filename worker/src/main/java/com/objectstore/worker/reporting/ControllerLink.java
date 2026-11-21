@@ -7,6 +7,7 @@ import com.objectstore.common.dto.HeartbeatRequest;
 import com.objectstore.common.dto.HeartbeatResponse;
 import com.objectstore.common.dto.RegisterRequest;
 import com.objectstore.common.dto.RegisterResponse;
+import com.objectstore.common.dto.Resync;
 import com.objectstore.common.dto.ReportEntry;
 import com.objectstore.common.dto.ReportSegment;
 import com.objectstore.common.dto.SegmentAck;
@@ -14,6 +15,7 @@ import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.worker.commands.CommandExecutor;
 import com.objectstore.worker.config.WorkerProperties;
 import com.objectstore.worker.storage.ChunkStore;
+import com.objectstore.worker.storage.FailStop;
 import com.objectstore.worker.storage.VersionFile;
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -33,34 +35,37 @@ import tools.jackson.databind.ObjectMapper;
 
 /**
  * The worker's one connection to the controller (thread {@code link}; HDFS's
- * {@code BPServiceActor}): registration, heartbeats carrying the change stream, and full-report
- * segments.
+ * {@code BPServiceActor}): registration, heartbeats carrying the change stream, and the segments of
+ * fenced resyncs (v5 §5.3).
  *
  * <pre>
  * loop:
+ *   fail-stopped → no heartbeats (the process is exiting)
  *   not registered → attempt++, M = changeLog.beginHold(), register(attempt, change_seq = M)
- *        ok → adopt the cluster id durably, ack(M), start a full report with baseline M (the hold is reused)
+ *        ok → adopt the cluster id durably, ack(M), adopt the registration fence {floor} (a floor not above
+ *             the current fence is a controller history going backwards: fail-stop), report attempt 1 with
+ *             baseline M (the hold is reused)
  *        cluster_id_mismatch / duplicate_worker → endHold, wait 60 s;   other failure → endHold, wait 2 s
- *   change log overflowed → abandon any report in progress, start a new one
- *   report requested (controller flag, or FULL_REPORT_INTERVAL since the last one) and none in progress → start one
- *   heartbeat: changes = suffix(acked, MAX_CHANGES_PER_MESSAGE), plus the current un-acknowledged segment
- *        200 → ack(changes_received_up_to); a matching segment_ack advances the report (the last one ends the hold);
- *              commands go to the executor unless the heartbeat was ignored as a duplicate
- *        404 / stale_boot → not registered (any report in progress is abandoned)
+ *   heartbeat: changes = suffix(acked, MAX_CHANGES_PER_MESSAGE), the current un-acknowledged segment, and
+ *        resync_wanted = overflow (the change log overflowed) or tombstones (more than TOMBSTONE_MAX)
+ *        200 → ack(changes_received_up_to); resync {t0, a} → a new fence or a newer attempt starts a listing;
+ *              segment_ack ok advances the listing (the last one ends the hold), done ends it, stale abandons it
+ *              (unless the reply asks for a new attempt); commands go to the executor unless the heartbeat
+ *              was ignored as a duplicate
+ *        404 / stale_boot → not registered (any listing in progress is abandoned)
  *        too_old → resent once at once with a fresh sent_at
  *   sleep: HEARTBEAT_MIN_GAP_MS when changes or segments wait, else HEARTBEAT_INTERVAL; a new change
  *          wakes the link early, but never before HEARTBEAT_MIN_GAP_MS
  * </pre>
  *
- * <p><b>Full reports.</b> The entries come from the store's in-memory index plus its known-bad set,
- * sorted by chunk id, in segments of REPORT_SEGMENT_SIZE, each tagged with the report id (a fresh
- * UUID per report), its index, {@code last}, and {@code baseline = M}. An empty store sends one
- * empty segment with {@code last = true}. Segments are stop-and-wait: segment i+1 leaves only after
- * segment i was acknowledged. A request that arrives while a report is in progress is ignored.
+ * <p><b>A resync {t0, a}.</b> A new fence ({@code t0} above the current one): every stripe is taken
+ * (mutations in progress finish), the fence is set, the tombstones it covers go, {@code M = beginHold}
+ * (heartbeat resync), the stripes are released, and the listing is built from the index without
+ * locks. The same fence with a newer attempt: {@code beginHold} a new M and list again. An older
+ * fence or attempt is ignored. The worker never starts a listing on its own: the controller decides.
  *
- * <p><b>Hold-back.</b> While a report with baseline M is in progress, no change numbered above M
- * leaves the worker, on any channel. {@link ChangeLog#suffix} enforces it, so callers cannot get it
- * wrong. The listing is taken after {@code beginHold}, so it reflects every change up to M.
+ * <p><b>Hold-back.</b> While a listing with baseline M is in progress, no change numbered above M
+ * leaves the worker, on any channel ({@link ChangeLog#suffix}).
  *
  * <p>Only this thread touches the link state; the fields below need no locking.
  */
@@ -84,13 +89,14 @@ public class ControllerLink implements Runnable {
     private final ChangeLog changes;
     private final VersionFile version;
     private final CommandExecutor executor;
+    private final FailStop failStop;
     private final Environment environment;
     private final ObjectMapper json;
 
     // Written only by the link thread; volatile so the state printer can read them.
     private volatile long acked;              // the controller's "received" for this process
-    private volatile Report report;           // the full report in progress, or null
-    private boolean reportRequested;          // by the controller, and not yet started
+    private volatile Report report;           // the resync listing in progress, or null
+    private int currentAttempt;               // the newest attempt started for the current fence
     private volatile long lastReportCompletedNanos;
     private volatile long lastSentNanos;
     private long controllerDownSince;
@@ -100,7 +106,7 @@ public class ControllerLink implements Runnable {
 
     public ControllerLink(WorkerProperties properties, WorkerIdentity identity, ControllerClients clients,
                           ChunkStore store, ChangeLog changes, VersionFile version, CommandExecutor executor,
-                          Environment environment, ObjectMapper json) {
+                          FailStop failStop, Environment environment, ObjectMapper json) {
         this.properties = properties;
         this.identity = identity;
         this.clients = clients;
@@ -108,6 +114,7 @@ public class ControllerLink implements Runnable {
         this.changes = changes;
         this.version = version;
         this.executor = executor;
+        this.failStop = failStop;
         this.environment = environment;
         this.json = json;
     }
@@ -152,12 +159,12 @@ public class ControllerLink implements Runnable {
         return done == 0 ? -1 : System.nanoTime() - done;
     }
 
-    /** "segment 2 of 5, baseline #14" for the report in progress, or null. */
+    /** "fence 4398046511106 attempt 1, segment 2 of 5, baseline #14" for the listing in progress, or null. */
     public String reportProgress() {
         Report current = report;
         return current == null ? null
-                : "report " + current.shortId() + " segment " + (current.index + 1) + " of " + current.segmentCount
-                        + ", baseline #" + current.baseline;
+                : "fence " + current.floor + " attempt " + current.attempt + ", segment " + (current.index + 1) + " of "
+                        + current.segmentCount + ", baseline #" + current.baseline;
     }
 
     /** The id of the full report in progress, or null (for tests). */
@@ -182,24 +189,16 @@ public class ControllerLink implements Runnable {
     }
 
     private void step() throws InterruptedException {
+        if (failStop.failed()) {
+            Thread.sleep(properties.heartbeatInterval());     // fail-stopped: no heartbeats while the process exits
+            return;
+        }
         if (!identity.isRegistered()) {
             Duration wait = register();
             if (!identity.isRegistered()) {
                 Thread.sleep(wait);
             }
             return;
-        }
-        if (changes.takeOverflow()) {
-            if (report != null) {
-                log.warn("[link] change log overflowed during full report {}; abandoning it", report.shortId());
-                report = null;
-                reportInProgress = null;
-                changes.endHold();
-            }
-            startReport("change log overflow");
-        }
-        if (report == null && (reportRequested || periodicReportDue())) {
-            startReport(reportRequested ? "requested by the controller" : "periodic");
         }
         boolean delivered = heartbeat();
         pause(delivered);
@@ -227,16 +226,26 @@ public class ControllerLink implements Runnable {
                 log.warn("[link] registration attempt {}: unexpected answer {}", attempt, response);
                 return REGISTER_RETRY;
             }
+            if (store.isFenceSet() && response.floor() <= store.fence()) {
+                changes.endHold();
+                log.error("[link] CRITICAL registration fence {} is not above this worker's fence {}: the controller's "
+                        + "version history went backwards; never adopting it", response.floor(), store.fence());
+                failStop.trigger("-", "registration fence " + response.floor() + " <= fence " + store.fence(), null);
+                return REGISTER_REFUSED_RETRY;
+            }
             // The cluster id is recorded durably before anything else is sent.
             version.adopt(response.clusterId());
             changes.ack(baseline);
             acked = baseline;
             identity.setRegistered(true);
             controllerReachable();
-            log.info("[link] registered as {} url={} boot={} cluster={} state={} attempt={} change_seq={}",
+            log.info("[link] registered as {} url={} boot={} cluster={} state={} attempt={} change_seq={} fence={}",
                     properties.id(), url, identity.bootId().substring(0, 8), response.clusterId(), response.state(),
-                    attempt, baseline);
-            openReport(baseline, "registration");  // reuses the hold taken for the registration
+                    attempt, baseline, response.floor());
+            store.adoptFence(response.floor(), null);       // the registration reuses the hold taken above
+            changes.clearOverflow();
+            currentAttempt = response.attempt();
+            openReport(response.floor(), response.attempt(), baseline, "registration");
             return Duration.ZERO;
         } catch (HttpClientErrorException e) {
             changes.endHold();
@@ -260,47 +269,74 @@ public class ControllerLink implements Runnable {
 
     private void unregister() {
         identity.setRegistered(false);
-        if (report != null) {
-            log.info("[link] abandoning full report {}", report.shortId());
-            report = null;
-            reportInProgress = null;
-        }
+        abandonReport("registering again");
         changes.endHold();
     }
 
-    // ---- full reports ------------------------------------------------------------------------
+    // ---- resync listings --------------------------------------------------------------------
 
-    private boolean periodicReportDue() {
-        return lastReportCompletedNanos != 0
-                && System.nanoTime() - lastReportCompletedNanos >= properties.fullReportInterval().toNanos();
+    /** A resync {t0, a} from the controller (v5 §5.3). */
+    private void resync(Resync resync) {
+        long t0 = resync.t0();
+        int attempt = resync.attempt();
+        if (!store.isFenceSet() || t0 > store.fence()) {
+            abandonReport("a new fence arrived");
+            long baseline = store.adoptFence(t0, changes::beginHold);   // under every stripe
+            changes.clearOverflow();
+            currentAttempt = attempt;
+            openReport(t0, attempt, baseline, "resync");
+        } else if (t0 == store.fence() && attempt > currentAttempt) {
+            abandonReport("a newer attempt arrived");
+            long baseline = changes.beginHold();
+            changes.clearOverflow();
+            currentAttempt = attempt;
+            openReport(t0, attempt, baseline, "new attempt");
+        }
+        // an older fence, or an attempt already started: nothing to do
     }
 
-    private void startReport(String reason) {
-        openReport(changes.beginHold(), reason);
-    }
-
-    /** The listing is taken after the hold began, so it reflects every change up to {@code baseline}. */
-    private void openReport(long baseline, String reason) {
+    /** The listing is taken after the hold began (and after the fence), so it covers every change up to {@code baseline}. */
+    private void openReport(long floor, int attempt, long baseline, String reason) {
         List<ReportEntry> entries = store.reportEntries();
-        report = new Report(baseline, entries, Math.max(1, properties.reportSegmentSize()));
+        report = new Report(floor, attempt, baseline, entries, Math.max(1, properties.reportSegmentSize()));
         reportInProgress = report.id;
-        reportRequested = false;
-        log.info("[link] full report {} started ({}): {} chunks in {} segments, baseline {}", report.shortId(), reason,
-                entries.size(), report.segmentCount, baseline);
+        log.info("[link] resync listing {} started ({}): fence {} attempt {}: {} chunks in {} segments, baseline {}",
+                report.shortId(), reason, floor, attempt, entries.size(), report.segmentCount, baseline);
     }
 
-    private void segmentAcknowledged(SegmentAck ack) {
+    private void abandonReport(String why) {
+        if (report != null) {
+            log.info("[link] resync listing {} abandoned ({})", report.shortId(), why);
+            report = null;
+            reportInProgress = null;
+        }
+    }
+
+    private void finishReport() {
+        changes.endHold();
+        lastReportCompletedNanos = System.nanoTime();
+        reportsCompleted++;
+        log.info("[link] resync listing {} done: fence {} attempt {}, {} chunks, baseline {}", report.shortId(),
+                report.floor, report.attempt, report.entries.size(), report.baseline);
+        report = null;
+        reportInProgress = null;
+    }
+
+    /** What the controller did with the segment it acknowledges. */
+    private void segmentAcknowledged(SegmentAck ack, boolean newAttemptAsked) {
         if (report == null || ack == null || !report.id.equals(ack.reportId()) || ack.index() != report.index) {
             return;
         }
-        if (report.isLast()) {
-            changes.endHold();
-            lastReportCompletedNanos = System.nanoTime();
-            reportsCompleted++;
-            log.info("[link] full report {} done: {} chunks, baseline {}", report.shortId(), report.entries.size(),
-                    report.baseline);
-            report = null;
-            reportInProgress = null;
+        String status = ack.status() == null ? InternalApi.SEGMENT_OK : ack.status();
+        if (InternalApi.SEGMENT_DONE.equals(status)) {
+            finishReport();
+        } else if (InternalApi.SEGMENT_STALE.equals(status)) {
+            if (!newAttemptAsked) {
+                abandonReport("the controller answered stale");
+                changes.endHold();
+            }
+        } else if (report.isLast()) {
+            finishReport();
         } else {
             report.index++;
             long delay = SEGMENT_DELAY_FOR_TESTS.getOrDefault(properties.id(), 0L);
@@ -315,10 +351,11 @@ public class ControllerLink implements Runnable {
         long seq = identity.nextHeartbeatSeq();
         List<Change> items = changes.suffix(acked, properties.maxChangesPerMessage());
         ReportSegment segment = report != null && report.isReady() ? report.current() : null;
-        boolean reportWasOpen = report != null;
+        String resyncWanted = changes.isOverflowed() ? InternalApi.RESYNC_OVERFLOW
+                : store.tombstoneCount() > properties.tombstoneMax() ? InternalApi.RESYNC_TOMBSTONES : null;
         for (int tries = 0; tries < 2; tries++) {
             HeartbeatRequest request = new HeartbeatRequest(properties.id(), identity.bootId(), seq,
-                    InternalApi.nowSeconds(), store.stats(executor.activeTransfers()), items, segment);
+                    InternalApi.nowSeconds(), store.stats(executor.activeTransfers()), items, segment, resyncWanted);
             lastSentNanos = System.nanoTime();
             try {
                 HeartbeatResponse response = clients.lifeline().post()
@@ -333,7 +370,7 @@ public class ControllerLink implements Runnable {
                     return false;                        // test hook: the reply "never arrived"
                 }
                 if (response != null) {
-                    handle(response, reportWasOpen);
+                    handle(response);
                 }
                 return true;
             } catch (HttpClientErrorException e) {
@@ -359,23 +396,19 @@ public class ControllerLink implements Runnable {
         return false;
     }
 
-    private void handle(HeartbeatResponse response, boolean reportWasOpen) {
+    private void handle(HeartbeatResponse response) {
         long received = response.changesReceivedUpTo();
         if (received <= changes.lastSeq()) {
             changes.ack(received);
             acked = received;
         }
-        segmentAcknowledged(response.segmentAck());
+        segmentAcknowledged(response.segmentAck(), response.resync() != null);
+        if (response.resync() != null) {
+            resync(response.resync());                    // the fence first, then the commands
+        }
         if (response.ignored() == null && response.commands() != null) {
             for (Command command : response.commands()) {
                 executor.submit(command);
-            }
-        }
-        if (response.requestFullReport()) {
-            if (reportWasOpen) {
-                log.debug("[link] report request ignored: a full report is in progress");
-            } else {
-                reportRequested = true;
             }
         }
     }
@@ -457,9 +490,11 @@ public class ControllerLink implements Runnable {
         return root.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
-    /** A full report in progress: the listing, split into stop-and-wait segments. */
+    /** A resync listing in progress: the entries, split into stop-and-wait segments. */
     private static final class Report {
         final String id = UUID.randomUUID().toString();
+        final long floor;
+        final int attempt;
         final long baseline;
         final List<ReportEntry> entries;
         final int segmentSize;
@@ -467,7 +502,9 @@ public class ControllerLink implements Runnable {
         int index;                       // the current, not yet acknowledged, segment
         long readyAtNanos = Long.MIN_VALUE;
 
-        Report(long baseline, List<ReportEntry> entries, int segmentSize) {
+        Report(long floor, int attempt, long baseline, List<ReportEntry> entries, int segmentSize) {
+            this.floor = floor;
+            this.attempt = attempt;
             this.baseline = baseline;
             this.entries = entries;
             this.segmentSize = segmentSize;
@@ -485,7 +522,7 @@ public class ControllerLink implements Runnable {
         ReportSegment current() {
             int from = Math.min(entries.size(), index * segmentSize);
             int to = Math.min(entries.size(), from + segmentSize);
-            return new ReportSegment(id, index, isLast(), baseline, List.copyOf(entries.subList(from, to)));
+            return new ReportSegment(id, floor, attempt, index, isLast(), baseline, List.copyOf(entries.subList(from, to)));
         }
 
         String shortId() {

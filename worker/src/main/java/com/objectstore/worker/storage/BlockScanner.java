@@ -11,16 +11,16 @@ import org.springframework.stereotype.Component;
  *
  * <ol>
  *   <li><b>Reconciles</b> the store's index with the chunk directory (names only): a chunk file
- *       copied in by hand is indexed and reported {@code received}; an indexed chunk whose file
- *       was deleted by hand is dropped and reported {@code deleted} ({@link ChunkStore#reconcile()}).</li>
+ *       placed by hand is indexed at an odd local version and reported {@code RECEIVED(odd)}; an
+ *       indexed chunk whose file was deleted by hand is reported {@code DELETED(odd, missing)}
+ *       ({@link ChunkStore#reconcile()}).</li>
  *   <li><b>Verifies</b> every indexed chunk against its sidecar, reading at most
- *       SCAN_MAX_BYTES_PER_SEC (a token bucket refilled each second). A chunk that fails and is
- *       not already known bad becomes known bad and is reported {@code bad}, exactly once; one
- *       that verifies again (its file was replaced) is no longer known bad.</li>
+ *       SCAN_MAX_BYTES_PER_SEC (a token bucket refilled each second), outside the stripe. A chunk that
+ *       fails is quarantined under its stripe after a re-check ({@code DELETED(odd, corrupt)}); the
+ *       controller then repairs it from a good copy.</li>
  * </ol>
  *
- * The controller replaces a bad copy and only afterwards orders its deletion. The scanner itself
- * never deletes anything.
+ * The scanner never deletes bytes: a quarantined copy is kept for diagnosis.
  */
 @Component
 public class BlockScanner implements Runnable {
@@ -73,20 +73,10 @@ public class BlockScanner implements Runnable {
                 continue; // deleted meanwhile
             }
             bucket.acquire(entry.size());
-            Optional<Boolean> ok = store.verify(chunkId);
+            Optional<Boolean> ok = store.scan(chunkId);
             if (ok.isPresent() && !ok.get()) {
-                ok = store.verifyLocked(chunkId); // not a write in progress?
-            }
-            if (ok.isEmpty()) {
-                continue; // gone: the next reconciliation reports it
-            }
-            if (!ok.get()) {
                 failed++;
-                if (store.markBad(chunkId, "scanner")) {
-                    log.warn("[scanner] CORRUPT chunk={} (data does not match its sidecar); reported bad", chunkId);
-                }
-            } else if (store.clearBad(chunkId)) {
-                log.info("[scanner] chunk={} verifies again (its file was replaced)", chunkId);
+                log.warn("[scanner] CORRUPT chunk={} (data does not match its sidecar); quarantined", chunkId);
             }
         }
         return failed;
