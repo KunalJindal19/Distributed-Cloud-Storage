@@ -104,7 +104,11 @@
 
 <script>
 "use strict";
-const POLL_MS = 2000;
+// The status is polled every 0.5 s. At 2 s it ran in step with the workers' 2 s heartbeats and kept
+// sampling the same point of their cycle, so "last heartbeat" looked frozen for several seconds.
+const POLL_MS = 500;
+const PLACEMENT_EVERY = 4;      // the chunk grid (two more requests) every 4th poll: every 2 s
+let polls = 0;
 const $ = (id) => document.getElementById(id);
 
 /** el("td", {class: "num"}, "text" | Node, ...) -- all text goes through text nodes, never innerHTML. */
@@ -257,8 +261,10 @@ async function refresh() {
   try {
     const status = await getJson("/api/v1/cluster/status");
     const workers = renderStatus(status);
-    const newest = (await getJson("/api/v1/objects?limit=1")).items[0];
-    renderPlacement(newest ? await getJson(`/api/v1/objects/${newest.object_id}/metadata`).catch(() => null) : null, workers);
+    if (polls++ % PLACEMENT_EVERY === 0) {
+      const newest = (await getJson("/api/v1/objects?limit=1")).items[0];
+      renderPlacement(newest ? await getJson(`/api/v1/objects/${newest.object_id}/metadata`).catch(() => null) : null, workers);
+    }
     $("banner").style.display = "none";
     $("updated").textContent = "last updated " + new Date().toLocaleTimeString();
   } catch (error) {

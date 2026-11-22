@@ -270,7 +270,7 @@ Names and metadata are always inserted as text, never as HTML.
 
 ### Dashboard
 
-<http://localhost:8000/dashboard> polls the status every 2 s: a safe-mode banner; KPIs (objects,
+<http://localhost:8000/dashboard> polls the status every 0.5 s (the chunk grid every 2 s; a 2 s poll ran in step with the 2 s heartbeats and made "last heartbeat" look frozen): a safe-mode banner; KPIs (objects,
 chunks, copies, under-replicated, copies on their way, missing chunks, corrupt and excess copies,
 invariant violations); worker cards (ALIVE green, STALE amber, DEAD red; process id, last
 heartbeat, copies, free space, queued commands, copies being sent, fence and resync attempt,
