@@ -75,6 +75,9 @@ objectstore:
   resync-stall-timeout-seconds: ${RESYNC_STALL_TIMEOUT:60}
   verify-fresh-for-delete-seconds: ${VERIFY_FRESH_FOR_DELETE:3600}
   verify-resend-seconds: ${VERIFY_RESEND:60}
+  # A client's object delete sends its chunk deletes straight to the holders (DELETE /internal/chunks/{id})
+  # instead of waiting for their heartbeats; heartbeat replies remain the fallback. false: replies only.
+  direct-object-deletes: ${DIRECT_OBJECT_DELETES:true}
   # Showcase output (docker-compose.showcase.yml): every message to and from the workers, and the
   # cluster state every N seconds. Off by default.
   trace-messages: ${TRACE_MESSAGES:off}

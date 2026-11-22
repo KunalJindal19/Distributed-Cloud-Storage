@@ -3,6 +3,7 @@ package com.objectstore.worker;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.objectstore.common.Checksums;
+import com.objectstore.common.dto.ChangeType;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -299,12 +300,75 @@ class WorkerApiTest {
     }
 
     @Test
-    void thereIsNoDeleteEndpointDeletingIsAVersionedCommand() throws Exception {
+    void aVersionedDeleteRemovesTheCopyReportsItAndARepeatIsHarmless() throws Exception {
         byte[] data = bytes(10, 1);
-        put(chunkId(0), data, Checksums.sha256Hex(data));
+        String id = chunkId(0);
+        put(id, data, Checksums.sha256Hex(data));
+        long version = nextVersion();
 
-        assertThat(delete(chunkId(0)).statusCode()).isEqualTo(405);
-        assertThat(get("/internal/chunks/" + chunkId(0)).statusCode()).isEqualTo(200);
+        HttpResponse<String> deleted = delete(id, version, "cmd-1", null);
+        HttpResponse<String> repeated = delete(id, version, "cmd-1", null);
+
+        assertThat(deleted.statusCode()).isEqualTo(204);
+        assertThat(repeated.statusCode()).as("the same version again is a repeat").isEqualTo(204);
+        assertThat(Files.exists(dataDir.resolve("chunks").resolve(id))).isFalse();
+        assertThat(Files.exists(dataDir.resolve("chunks").resolve(id + ".meta"))).isFalse();
+        assertThat(store.index()).doesNotContainKey(id);
+        assertThat(get("/internal/chunks/" + id).statusCode()).isEqualTo(404);
+        assertThat(changes.suffix(0, 100_000)).as("reported exactly like the DELETE command")
+                .anyMatch(c -> c.type() == ChangeType.DELETED && c.chunkId().equals(id) && c.version() == version);
+    }
+
+    /** The v4 double delete, over the endpoint: a delayed old DELETE cannot destroy the newer copy. */
+    @Test
+    void aDeleteOlderThanTheCopyIsStaleAndTheNewerCopySurvives() throws Exception {
+        byte[] data = bytes(10, 1);
+        String id = chunkId(0);
+        put(id, data, Checksums.sha256Hex(data));
+        long first = nextVersion();
+        assertThat(delete(id, first, "cmd-old", null).statusCode()).isEqualTo(204);
+        assertThat(put(id, data, Checksums.sha256Hex(data)).statusCode()).as("repaired at a newer version")
+                .isEqualTo(201);
+
+        HttpResponse<String> late = delete(id, first, "cmd-old", null);     // the old request, arriving late
+
+        assertThat(late.statusCode()).isEqualTo(409);
+        assertThat(late.body()).contains("stale_version");
+        assertThat(Files.readAllBytes(dataDir.resolve("chunks").resolve(id))).isEqualTo(data);
+        assertThat(changes.suffix(0, 100_000)).as("the controller learns it from CMD_FAILED(stale), with the cmd id")
+                .anyMatch(c -> c.type() == ChangeType.CMD_FAILED && c.chunkId().equals(id) && c.version() == first
+                        && "stale".equals(c.reason()) && "cmd-old".equals(c.cmdId()));
+    }
+
+    @Test
+    void aDeleteWithoutAValidVersionIsRejectedAndChangesNothing() throws Exception {
+        byte[] data = bytes(10, 1);
+        String id = chunkId(0);
+        put(id, data, Checksums.sha256Hex(data));
+
+        HttpResponse<String> unversioned = http.send(HttpRequest.newBuilder(uri("/internal/chunks/" + id)).DELETE().build(),
+                HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> odd = delete(id, 1001, null, null);
+
+        assertThat(unversioned.statusCode()).as("an unversioned delete is exactly the v4 bug").isEqualTo(400);
+        assertThat(unversioned.body()).contains("X-Op-Version");
+        assertThat(odd.statusCode()).as("odd versions are worker observations").isEqualTo(400);
+        assertThat(get("/internal/chunks/" + id).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void aCorruptReasonQuarantinesTheCopyInsteadOfDeletingIt() throws Exception {
+        byte[] data = bytes(10, 1);
+        String id = chunkId(0);
+        put(id, data, Checksums.sha256Hex(data));
+
+        assertThat(delete(id, nextVersion(), null, "corrupt").statusCode()).isEqualTo(204);
+
+        assertThat(store.isQuarantined(id)).isTrue();
+        assertThat(get("/internal/chunks/" + id).statusCode()).isNotEqualTo(200);
+        try (Stream<Path> files = Files.list(store.quarantineDir())) {
+            assertThat(files.map(f -> f.getFileName().toString())).anyMatch(name -> name.startsWith(id + "."));
+        }
     }
 
     @Test
@@ -395,9 +459,16 @@ class WorkerApiTest {
         return http.send(HttpRequest.newBuilder(uri(path)).GET().build(), HttpResponse.BodyHandlers.ofByteArray());
     }
 
-    private HttpResponse<String> delete(String chunkId) throws Exception {
-        return http.send(
-                HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId)).DELETE().build(),
-                HttpResponse.BodyHandlers.ofString());
+    private HttpResponse<String> delete(String chunkId, long version, String cmdId, String reason) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri("/internal/chunks/" + chunkId))
+                .header("X-Op-Version", Long.toString(version))
+                .DELETE();
+        if (cmdId != null) {
+            request.header("X-Cmd-Id", cmdId);
+        }
+        if (reason != null) {
+            request.header("X-Reason", reason);
+        }
+        return http.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }
 }

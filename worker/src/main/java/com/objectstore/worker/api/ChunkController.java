@@ -12,6 +12,7 @@ import com.objectstore.worker.config.WorkerProperties;
 import com.objectstore.worker.reporting.ChangeLog;
 import com.objectstore.worker.reporting.WorkerIdentity;
 import com.objectstore.worker.storage.ChunkStore;
+import com.objectstore.worker.storage.ChunkStore.DeleteOutcome;
 import com.objectstore.worker.storage.ChunkStore.PutOutcome;
 import com.objectstore.worker.storage.ChunkStore.StoredChunk;
 import jakarta.servlet.http.HttpServletRequest;
@@ -24,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -33,8 +35,9 @@ import org.springframework.web.bind.annotation.RestController;
 
 /**
  * The worker side of the internal data path: store a chunk (the controller's upload PUT and the
- * PUT of a transfer from another worker), retrieve a chunk, and list the disk for fsck. Deleting is
- * a versioned command delivered in heartbeat replies, not an endpoint.
+ * PUT of a transfer from another worker), retrieve a chunk, delete a chunk (the controller's direct
+ * DELETE when a client deletes an object), and list the disk for fsck. PUT and DELETE are both
+ * versioned: they go through the same version check as the commands in heartbeat replies.
  */
 @RestController
 public class ChunkController {
@@ -105,6 +108,39 @@ public class ChunkController {
         } finally {
             store.endIncoming(chunkId, version);
         }
+    }
+
+    /**
+     * Deletes the copy as of the version in {@code X-Op-Version}: exactly the versioned delete the
+     * DELETE command runs ({@link ChunkStore#delete}), so a delayed or repeated request can never
+     * delete a newer copy. 204 when deleted, or when this repeats the delete at the current version;
+     * 409 {@code stale_version} when the version is not newer than the copy or the fence (nothing
+     * changes); 400 without a valid version or chunk id; 500 when a disk error stopped it before
+     * anything was removed; 503 while shutting down or after a fail-stop. {@code X-Reason: corrupt}
+     * quarantines the bytes instead of deleting them. Every result also goes to the change stream
+     * ({@code DELETED(v)} or {@code CMD_FAILED}, with {@code X-Cmd-Id}), exactly as for the command,
+     * so the controller learns it the same way whichever path delivered the delete.
+     */
+    @DeleteMapping(InternalApi.CHUNK_PATH)
+    public ResponseEntity<Void> deleteChunk(
+            @PathVariable String chunkId,
+            @RequestHeader(value = InternalApi.OP_VERSION_HEADER, required = false) String versionHeader,
+            @RequestHeader(value = InternalApi.CMD_ID_HEADER, required = false) String cmdId,
+            @RequestHeader(value = InternalApi.REASON_HEADER, required = false) String reason) {
+        long version = parseVersion(versionHeader);
+        boolean corrupt = reason != null && InternalApi.REASON_CORRUPT.equals(reason.trim());
+        DeleteOutcome outcome = store.delete(chunkId, version, corrupt, cmdId);
+        log.info("[store] delete chunk={} v={} reason={} via DELETE endpoint ({})", chunkId, version,
+                reason == null ? "-" : reason.trim(), outcome.name().toLowerCase(Locale.ROOT));
+        return switch (outcome) {
+            case DELETED, REPEAT -> ResponseEntity.noContent().build();
+            case STALE -> throw ApiException.conflict(ErrorCodes.STALE_VERSION, "version " + version + " of chunk "
+                    + chunkId + " is not newer than this worker's record or fence");
+            case IO_ERROR -> throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, ErrorCodes.INTERNAL_ERROR,
+                    "a disk error stopped the delete of " + chunkId + " before anything was removed", null);
+            case REFUSED -> throw ApiException.unavailable(ErrorCodes.SERVICE_UNAVAILABLE,
+                    "this worker is shutting down or has stopped after a disk error");
+        };
     }
 
     static long parseVersion(String header) {

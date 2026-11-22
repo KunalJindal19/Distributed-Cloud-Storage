@@ -162,6 +162,19 @@ public class MessageTrace {
         }
     }
 
+    /** A direct {@code DELETE /internal/chunks/{chunk_id}} (a client's object delete). */
+    public void deleteChunk(String workerId, String chunkId, long version) {
+        if (enabled()) {
+            log.info("[msg] → {}  DEL CHUNK   {} v{}", pad(workerId), chunk(chunkId), version);
+        }
+    }
+
+    public void deleteAnswer(String workerId, String chunkId, String outcome) {
+        if (enabled()) {
+            log.info("[msg] ← {}  DEL ANSWER  {} {}", pad(workerId), chunk(chunkId), outcome);
+        }
+    }
+
     public void putAnswer(String workerId, String chunkId, List<Change> piggyback, String failure) {
         if (!enabled()) {
             return;

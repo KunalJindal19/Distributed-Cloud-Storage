@@ -277,4 +277,23 @@ class PendingOpsTest {
         });
         t.assertNoViolations();
     }
+
+    @Test
+    void anUndeliveredDeleteGoesBackAtTheSameVersionButOnlyIfNothingChangedMeanwhile() {
+        TestSupport t = new TestSupport();
+        t.knowChunk(chunk(0));
+        t.join("worker1", chunk(0));
+        Op op = t.cluster.write(() -> t.cluster.ops().ensure(chunk(0), "worker1", Reason.OBJECT_DELETED));
+        long version = op.version();
+        t.cluster.write(() -> t.cluster.takeDeletes(t.cluster.worker("worker1"), java.util.Set.of(chunk(0)), 50));
+
+        t.cluster.write(() -> t.cluster.ops().undelivered(chunk(0), "worker1", version + 2));   // another version
+        assertThat(op.state()).as("not this op: unchanged").isEqualTo(State.SENT);
+
+        t.cluster.write(() -> t.cluster.ops().undelivered(chunk(0), "worker1", version));
+        assertThat(op.state()).isEqualTo(State.QUEUED);
+        assertThat(op.version()).isEqualTo(version);
+        assertThat(t.handOut("worker1")).extracting(Command::version).containsExactly(version);
+        t.assertNoViolations();
+    }
 }

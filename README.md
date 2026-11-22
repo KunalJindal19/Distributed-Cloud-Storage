@@ -47,13 +47,31 @@ restore the replication factor, and survives its own crash at any instruction.
 ## Quick start
 
 **Prerequisites:** Docker Engine or Docker Desktop with Compose v2, plus `bash`, `curl`, `make` and
-`jq`. A JDK is **not** needed: everything is built inside Docker. (Python 3 is needed only for the
-chaos test and the showcase.)
+`jq`. A JDK is **not** needed. (Python 3 is needed only for the chaos test and the showcase.)
+
+**On any machine (Intel/AMD or ARM), with the published images:**
 
 ```bash
-make up          # build the images, start 6 containers, wait until all are healthy
-make demo        # run the seven demonstrations; ends with "7/7 PASS"
+docker compose up -d --wait   # downloads kunaljindal19/objectstore-{controller,worker,client}:<version>
+make demo                     # run the seven demonstrations; ends with "7/7 PASS"
 ```
+
+Nothing is built: `docker-compose.yml` names the exact image version, published for `linux/amd64` and
+`linux/arm64`, so every machine runs the same code. A machine that ran an older release cannot reuse
+its old images by mistake, because each release has its own version.
+
+**To build from your own checkout instead** (when you change the code):
+
+```bash
+make up          # = docker compose -f docker-compose.yml -f docker-compose.build.yml up --build -d --wait
+```
+
+**Publishing a new release** (maintainers): bump `OBJECTSTORE_VERSION` in `docker-compose.yml` (the
+default after `:-`, used in three places), then `docker login` and `make publish`, which builds the
+three images for both architectures and pushes them. It refuses to overwrite a version that is
+already published. Commit the bumped `docker-compose.yml`, so anyone who pulls the code gets the new
+images. `OBJECTSTORE_REPO` and `OBJECTSTORE_VERSION` can also be set in the environment to use other
+images.
 
 Then open the dashboard at <http://localhost:8000/dashboard>, or store something yourself:
 
@@ -66,12 +84,18 @@ make fsck                                                # end-to-end consistenc
 
 | Command | What it does |
 |---|---|
-| `make up` | `docker compose up --build -d --wait`, then prints the container table |
+| `make up` | build from this checkout and start (`docker compose -f docker-compose.yml -f docker-compose.build.yml up --build -d --wait`), then print the container table |
+| `make pull` / `make publish` | download the published images / build both architectures and push them (see above) |
 | `make down` / `make down-v` | stop the containers keeping all data / wiping all data |
 | `make ps` / `make logs` / `make status` / `make fsck` | container table / all logs / cluster status JSON / fsck |
 | `make stop W=worker2` / `make start W=worker2` | stop a worker (it goes STALE, then DEAD) / bring it back |
 | `make pause W=worker2` / `make unpause W=worker2` | freeze a worker (STALE only, if short) |
+| `make where O=<object_id>` | each chunk of an object and the two workers holding it (the ids the commands below need) |
 | `make corrupt W=worker3 C=<chunk_id>` | overwrite 4 bytes inside a stored chunk file |
+| `make corrupt-meta W=worker3 C=<chunk_id>` | write a wrong checksum into a chunk's `.meta` file (the data is untouched) |
+| `make rmchunk W=worker2 C=<chunk_id>` | delete a stored copy (data and `.meta`), as a lost disk would |
+| `make rmmeta W=worker2 C=<chunk_id>` | delete only a chunk's `.meta` file, so the copy can no longer be verified |
+| `make quarantine W=worker2` | list the copies a worker has quarantined |
 | `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
 | `make showcase` | a guided tour of the inner state: messages, chunk placement, `worker2` stopped and started ([below](#showcase-the-inner-state-on-the-console)) |
 | `make app` | open the web client, <http://localhost:8000/app> |
@@ -357,10 +381,12 @@ copy's state (`OK`, `CORRUPT`, `EXCESS`), `worker_status` the worker's (`ALIVE`,
 - **PATCH metadata**: a string sets a key, `null` removes it; only the metadata tables change.
   Keys: 1–64 characters from `A-Z a-z 0-9 _ . -`; values: strings of at most 1024 characters; at
   most 64 keys. Anything else is `400 invalid_metadata`. `503 safe_mode` in safe mode.
-- **DELETE**: `204`; the namespace row is deleted durably and every known copy gets a DELETE
-  command (workers delete the files with their next heartbeat, within ~2 s), and so does the target
-  of any copy still on its way; each is a pending op with its own version, sent again until the
-  worker confirms it. Copies the controller could not know about (on a DEAD worker) become garbage
+- **DELETE**: `204`; the namespace row is deleted durably and every known copy gets a versioned
+  DELETE op, and so does the target of any copy still on its way. Right after the `204` (the client
+  never waits for it) the controller sends each one straight to its holder with
+  `DELETE /internal/chunks/{chunk_id}`, as an upload sends its chunks with `PUT`, so the files go
+  within milliseconds. A holder that is resyncing, STALE or unreachable gets its deletes in heartbeat
+  replies instead; each op is sent again (same version) until the worker confirms it. Copies the controller could not know about (on a DEAD worker) become garbage
   and are collected from the worker's changes or its resync when it returns.
   `404` if unknown, `503 safe_mode` in safe mode.
 - **List**: `limit` 1–500 (default 50), `offset` ≥ 0; newest first; `{items, total, limit, offset}`.
@@ -452,10 +478,19 @@ timers only drive retries).
 | `POST` | `/internal/workers/heartbeat` | controller | Liveness and statistics, the worker's next changes, at most one resync segment and a resync request; receive commands, acknowledgements and resync instructions |
 | `PUT` | `/internal/chunks/{chunk_id}` | worker | Install a copy at a version (the controller's upload, or another worker's transfer); the controller's PUT also acknowledges and collects changes |
 | `GET` | `/internal/chunks/{chunk_id}` | worker | Retrieve a chunk, verified against its `.meta` |
+| `DELETE` | `/internal/chunks/{chunk_id}` | worker | Delete a copy at a version: the same versioned delete as the DELETE command; used by the controller for a client's object delete |
 | `GET` | `/internal/workers/{worker_id}/chunks` | worker | Every chunk on disk with a freshly computed checksum (fsck) |
 
-There is no DELETE endpoint any more: deleting is a versioned command (below). There are no separate
-report endpoints: change runs and resync listings both travel on heartbeats.
+There are no separate report endpoints: change runs and resync listings both travel on heartbeats.
+
+**DELETE** (headers `X-Op-Version: <v>`, required, an even controller version; optional `X-Cmd-Id`,
+and `X-Reason: corrupt` to quarantine instead of delete) runs exactly the versioned delete of the DELETE
+command → `204` deleted, or a repeat of the current version · `409 stale_version` (not newer than the
+copy or the fence: nothing changes, so a delayed or replayed DELETE can never delete a newer copy) ·
+`400` missing or odd version (an unversioned delete is exactly the v4 double-delete bug) · `500` a disk
+error before anything was removed · `503` shutting down or fail-stopped. Every result is also logged
+in the change stream (`DELETED(v)` or `CMD_FAILED`), so the controller learns it exactly as for the
+command.
 
 **PUT** (raw bytes; headers `X-Op-Version: <v>` (required, an even controller version) and
 `X-Checksum: <sha256>` (the namespace checksum); from the controller also `X-Change-Ack:
@@ -607,7 +642,12 @@ Every repair, upload copy and deletion is a **pending op** in the controller's `
   dropped after `OP_MAX_INSERT_ATTEMPTS` (the planner re-plans), a DELETE never is.
 - **MarkDead** drops every op targeting the worker and re-sources the REPAIRs it was sending.
 
-**Commands** in heartbeat replies (no expiry: versions decide what is stale):
+**Commands** in heartbeat replies (no expiry: versions decide what is stale). One exception: the
+DELETEs of a client's object delete are taken from the holders' queues as soon as they exist, under
+the same hand-out rule, and sent directly with `DELETE /internal/chunks/{chunk_id}`
+(`ObjectDeleteSender`); a call that certainly did not arrive puts the op back for the next heartbeat
+reply, and one that may have arrived is left to the resend timer (`DIRECT_OBJECT_DELETES=false` turns
+this off):
 
 ```json
 {"cmd_id": "…", "type": "REPLICATE", "chunk_id": "…", "expected_checksum": "…", "target_url": "http://worker3:8003", "version": 1099511627858}
@@ -673,6 +713,7 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `RESYNC_STALL_TIMEOUT` | 60 | controller | no segment progress for this long → the next report attempt |
 | `VERIFY_FRESH_FOR_DELETE` | 3600 | controller | how recent a survivor's VERIFY must be before a surplus copy is deleted |
 | `VERIFY_RESEND` | 60 | controller | minimum gap between VERIFYs of one copy |
+| `DIRECT_OBJECT_DELETES` | true | controller | a client's object delete sends its chunk deletes straight to the holders (`DELETE /internal/chunks/{id}`); `false`: heartbeat replies only |
 | `TARGET_BACKOFF` | 30 | controller | after a failed copy, avoid that (chunk, target) pair for this long |
 | `MAX_STREAMS` | 2 | controller | copies in flight per source worker |
 | `MAX_COMMANDS_PER_WORKER` | 1000 | controller | queue cap; never exceeded and nothing is dropped (ops wait) |
@@ -1647,7 +1688,7 @@ violation; run the demo from a clean stack, or under another Compose project as 
 | 3 | Object id; name, size, type, created/modified time, checksum, chunk count, chunk information and locations; custom metadata | namespace tables; `ObjectViewAssembler` | `GET …/metadata`, demo 4 |
 | 4 | 1 MB chunks, unique ids, order kept; 2 copies on different workers, spread; detect and restore lost replication | `UploadService`, `PlacementPolicy`, `ReplicationPlanner` | demos 2, 3, 5, 6 |
 | 5 | The six client endpoints, JSON, binary with the right content type, status codes with JSON errors | `ObjectsController`, `GlobalExceptionHandler` | all demos |
-| 6 | Internal APIs: register, heartbeat, PUT/GET chunk, list a worker's chunks (extended with resyncs); deletion is a versioned command | `InternalWorkersController`, worker `ChunkController` | logs; scenario scripts |
+| 6 | Internal APIs: register, heartbeat, PUT/GET/DELETE chunk (PUT and DELETE versioned), list a worker's chunks (extended with resyncs) | `InternalWorkersController`, worker `ChunkController`, `ObjectDeleteSender` | logs; scenario scripts |
 | 7 | Detect unavailable workers; keep serving; detect and restore replication; `docker stop/start worker2` | `Registry`, `ChangeApplier`, `ReplicationPlanner`, worker `ControllerLink`/`CommandExecutor` | demo 5 |
 | 8 | Detect corruption, never return it when a good copy exists, restore; intentional corruption | worker `ChunkStore` + `BlockScanner`, `DownloadService`, `ReplicationPlanner` | demo 6 |
 | 9 | Build, start and interact instructions | this README, `Makefile`, `oscli`, `demo.sh` | Quick start |
@@ -1713,7 +1754,8 @@ silent, contradicted each other, or did not fit the chosen stack:
 | Topic | Decision | Reason |
 |---|---|---|
 | The `CORRUPT` copy state of v2–v4 | Gone. A copy that fails verification is quarantined by the worker at once (`DELETED(corrupt)`); a copy the controller proves wrong (checksum ≠ namespace) leaves the map at once and gets `DELETE(CORRUPT)`, which makes the worker quarantine it. The API's `corrupt` location status and `replicas.corrupt` now mean "quarantine pending". | v5 §4.5. The public API keeps its fields and meanings for clients. |
-| The worker's `DELETE /internal/chunks/{id}` endpoint | Removed (`405`); deleting is only a versioned `DELETE` command | An unversioned delete is exactly the v4 double-delete bug; nothing outside the worker used it after v4's upload rollback became ledger DELETEs. |
+| The worker's `DELETE /internal/chunks/{id}` endpoint | Kept, but **versioned**: `X-Op-Version` is required and goes through the same check as the DELETE command (`409 stale_version` for anything not newer than the copy or the fence) | An unversioned delete is exactly the v4 double-delete bug. With the version it is as safe as the command. |
+| A client's object delete | Sent directly to each holder with `DELETE /internal/chunks/{id}` right after the `204`, like an upload's PUTs; heartbeat replies only for holders that are resyncing, STALE or unreachable, and as the fallback | The files go at once instead of with the next heartbeat. Only the delivery changes: the ops, their versions, the hand-out rule (taken through the same `takeCommands` rule), the resend timer and the completion from the change stream are the same, so nothing new can go wrong; surplus, corrupt and garbage deletes keep the heartbeat path (a surplus DELETE is re-checked at hand-out). |
 | `FULL_REPORT_INTERVAL`, `PENDING_TIMEOUT`, `COMMAND_TTL` | Removed; replaced by `RESYNC_INTERVAL` (controller-driven), `OP_RESEND_INITIAL` / `OP_RESEND_MAX` and versions | v5 §13. Commands need no expiry: a late one is either `STALE` or still the newest. |
 | Garbage reasons | `upload_failed` for chunks of an upload intent, `object_deleted` for a deletion tombstone, `orphan` for chunks nobody can account for | The worker's `DELETE` reason is visible in its log; only `orphan` is subject to the safety valve. |
 | `STALE_RATIO` | Kept for writes | v4 behaviour (uploads keep working when most workers are STALE). A STALE worker is still never a survivor of an EXCESS delete and never a repair target. |

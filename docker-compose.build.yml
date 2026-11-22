@@ -1,0 +1,27 @@
+# Build the images from this checkout instead of downloading them (what "make up" and "make build" use):
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build -d --wait
+# The images get the same names and version as the published ones, so scripts that run plain
+# "docker compose" afterwards use these local builds. Only worker1 builds the worker image; the
+# other three workers use it (building it four times in parallel makes Docker fail to tag it).
+services:
+  controller:
+    build:
+      context: .
+      target: controller
+    pull_policy: build
+  worker1:
+    build:
+      context: .
+      target: worker
+    pull_policy: build
+  worker2:
+    pull_policy: never
+  worker3:
+    pull_policy: never
+  worker4:
+    pull_policy: never
+  client:
+    build:
+      context: .
+      target: client
+    pull_policy: build

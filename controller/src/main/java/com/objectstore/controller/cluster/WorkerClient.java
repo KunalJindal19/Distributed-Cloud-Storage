@@ -77,6 +77,26 @@ public class WorkerClient {
         });
     }
 
+    /**
+     * {@code DELETE /internal/chunks/{chunk_id}} at operation {@code version}, with the command's id and
+     * reason. Returns the HTTP status the worker answered with (204 deleted or a repeat, 409 stale,
+     * 400, 500, 503, ...); throws {@link WorkerException} without a status when no answer came.
+     */
+    public int deleteChunk(String workerUrl, String chunkId, long version, String cmdId, String reason) {
+        return call(workerUrl, () -> {
+            RestClient.RequestHeadersSpec<?> spec = chunks.delete()
+                    .uri(workerUrl + InternalApi.CHUNK_PATH, chunkId)
+                    .header(InternalApi.OP_VERSION_HEADER, Long.toString(version));
+            if (cmdId != null) {
+                spec = spec.header(InternalApi.CMD_ID_HEADER, cmdId);
+            }
+            if (reason != null) {
+                spec = spec.header(InternalApi.REASON_HEADER, reason);
+            }
+            return spec.exchange((request, response) -> response.getStatusCode().value());
+        });
+    }
+
     /** {@code GET /internal/chunks/{chunk_id}}. The caller classifies and verifies the result. */
     public FetchedChunk getChunk(String workerUrl, String chunkId) {
         return call(workerUrl, () -> chunks.get()
