@@ -26,6 +26,9 @@ class LedgerSystemTest extends ClusterTest {
     @Override
     void configure(InProcessCluster cluster) {
         cluster.controllerSetting("objectstore.resync-interval-seconds", "3600");
+        // These tests are about deletes delivered in heartbeat replies (lost replies, resends, holders that
+        // were down); DirectDeleteSystemTest covers the direct DELETE /internal/chunks/{id} path.
+        cluster.controllerSetting("objectstore.direct-object-deletes", "false");
     }
 
     @AfterEach

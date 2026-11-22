@@ -530,6 +530,21 @@ public final class PendingOps {
         return true;
     }
 
+    /**
+     * A command taken for direct delivery that certainly did not reach the worker (the connection
+     * failed, or the worker refused it without acting): the op goes back to WAITING at the same
+     * version and is queued again, so the worker's next heartbeat reply carries it. Nothing happens
+     * if the op has meanwhile ended, changed version or moved on.
+     */
+    public void undelivered(String chunkId, String workerId, long version) {
+        Op op = get(chunkId, workerId);
+        if (op == null || op.version != version || op.state != State.SENT) {
+            return;
+        }
+        toWaiting(op);
+        tryQueue(op);
+    }
+
     /** Back to WAITING with the same version: its queued command (if any) is withdrawn. */
     public void toWaiting(Op op) {
         if (op.state == State.WAITING) {
