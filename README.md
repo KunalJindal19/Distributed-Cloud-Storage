@@ -173,7 +173,7 @@ until the controller acknowledges it. It knows nothing about objects.
 | `.meta` checksum file per block; DataNode verifies on read and transfer | `<chunk_id>.meta`; the worker verifies on GET and before every REPLICATE |
 | DataNode block scanner (rate-limited, with disk/index reconciliation); `reportBadBlocks` | worker scanner: at most one pass per 10 s, reading at most 32 MiB/s; a bad copy is quarantined and reported `DELETED(corrupt)`; the controller orders `DELETE(CORRUPT)` when a read or listing proves a copy does not match the namespace |
 | Disk checker; the DataNode shuts down on volume failure | worker disk check every 30 s; on failure the process exits, goes DEAD and is repaired |
-| RedundancyMonitor over `LowRedundancyBlocks` priority queues | the planner every 3 s over levels `(L, P)` (live copies, pending INSERT ops; any RF), kept up to date on every change, with exact weighted quotas and round-robin per level |
+| RedundancyMonitor over `LowRedundancyBlocks` priority queues | the planner every 1 s (`MONITOR_INTERVAL`) over levels `(L, P)` (live copies, pending INSERT ops; any RF), kept up to date on every change, with exact weighted quotas and round-robin per level |
 | PendingReconstructionBlocks with a time-out | pending ops (one per chunk and worker, with a version) and the `resend-timer` thread: resent with the same version after 15 s, doubling to 240 s; a REPAIR is dropped after `OP_MAX_INSERT_ATTEMPTS` (5) sends and planned again elsewhere |
 | Generation stamps | operation versions: `(term << 40) \| (seq << 1)`, the term persisted and incremented at every controller start |
 | `DNA_TRANSFER`: DataNode copies directly to DataNode | `REPLICATE` command in the heartbeat reply; the worker PUTs to the target worker |
@@ -270,7 +270,7 @@ Names and metadata are always inserted as text, never as HTML.
 
 ### Dashboard
 
-<http://localhost:8000/dashboard> polls the status every 2 s: a safe-mode banner; KPIs (objects,
+<http://localhost:8000/dashboard> polls the status every 0.5 s (the chunk grid every 2 s; a 2 s poll ran in step with the 2 s heartbeats and made "last heartbeat" look frozen): a safe-mode banner; KPIs (objects,
 chunks, copies, under-replicated, copies on their way, missing chunks, corrupt and excess copies,
 invariant violations); worker cards (ALIVE green, STALE amber, DEAD red; process id, last
 heartbeat, copies, free space, queued commands, copies being sent, fence and resync attempt,
@@ -665,7 +665,7 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `DEAD_AFTER` | 12 | controller | silence → DEAD |
 | `STALE_RATIO` | 0.5 | controller | above this fraction of STALE workers, stop avoiding STALE workers for writes |
 | `HEALTH_INTERVAL` | 1 | controller | liveness check period |
-| `MONITOR_INTERVAL` | 3 | controller | replication monitor period |
+| `MONITOR_INTERVAL` | 1 (Compose; 3 in `controller.yml`) | controller | replication monitor (planner) period |
 | `OP_RESEND_INITIAL` / `OP_RESEND_MAX` | 15 / 240 | controller | an unanswered op is resent (same version) after `min(INITIAL · 2^attempts, MAX)`; replaces `PENDING_TIMEOUT` |
 | `OP_MAX_INSERT_ATTEMPTS` | 5 | controller | an unanswered copy (INSERT) is dropped and re-planned after this many sends; DELETEs are never dropped |
 | `RESYNC_INTERVAL` / `RESYNC_JITTER` | 3600 / 0.1 | controller | periodic fenced resync of every worker, ± the jitter; replaces `FULL_REPORT_INTERVAL` |
@@ -817,7 +817,7 @@ docker stop worker2
 |---|---|
 | ~6 s of silence | `worker2` is **STALE**: avoided for reads and writes, but its copies still count; nothing is re-replicated (a GC pause or a network blip must not trigger mass copying) |
 | ~12 s of silence | **DEAD**: `[registry] worker2 DEAD after 12.0s - N replicas removed, M pending ops dropped`; `under_replicated` > 0; downloads keep working from the other copies |
-| within ~3 s | the monitor orders copies, each a REPAIR op with its own version: `[monitor] REPLICATE chunk=… copies=1 worker1->worker4 v=…` |
+| within ~1 s | the monitor orders copies, each a REPAIR op with its own version: `[monitor] REPLICATE chunk=… copies=1 worker1->worker4 v=…` |
 | within ~2 s more | the source picks the command up with its heartbeat and copies the chunk **directly to the target**: `[cmd] replicate ok chunk=…` in the source's log; the target's `RECEIVED` change confirms it: `[monitor] copied …` |
 
 ```bash
@@ -892,7 +892,7 @@ which sets `TRACE_MESSAGES=all` on the controller and `STATE_PRINT_INTERVAL=10` 
    worker2's copy again; every chunk ends with exactly two copies;
 5. uploads one more file (worker2 takes copies again) and runs `fsck` (HEALTHY).
 
-Re-copying is paced by the planner (`MAX_STREAMS=2` copies in flight per source, a tick every 3 s,
+Re-copying is paced by the planner (`MAX_STREAMS=2` copies in flight per source, a tick every `MONITOR_INTERVAL`,
 about 1.5 copies/s). On a store that already holds a lot (after `make chaos`, a worker holds ~850
 copies) step 3 moves on once the showcase files have two copies again and says the rest continues
 in the background; `make down-v` first gives a quick run. To go back to quiet logs: `make up`.
