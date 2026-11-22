@@ -43,11 +43,12 @@ public class ObjectService {
     private final ApplyQueue queue;
     private final Writer writer;
     private final ControllerProperties properties;
+    private final ObjectDeleteSender deleteSender;
 
     public ObjectService(ObjectRepository objects, ChunkRepository chunks, ObjectViewAssembler views,
                          MetadataValidator metadataValidator, ClusterState cluster, SafeMode safeMode, Clock clock,
                          NamespaceLock namespaceLock, NamespaceTasks namespaceTasks, ApplyQueue queue, Writer writer,
-                         ControllerProperties properties) {
+                         ControllerProperties properties, ObjectDeleteSender deleteSender) {
         this.objects = objects;
         this.chunks = chunks;
         this.views = views;
@@ -60,6 +61,7 @@ public class ObjectService {
         this.queue = queue;
         this.writer = writer;
         this.properties = properties;
+        this.deleteSender = deleteSender;
     }
 
     /** System and custom metadata, including chunk locations. No worker is contacted. */
@@ -113,9 +115,10 @@ public class ObjectService {
     public void delete(String objectId) {
         safeMode.requireWritable();
         Task task;
+        List<Chunk> chunkRows;
         namespaceLock.lock();
         try {
-            List<Chunk> chunkRows = chunks.findChunksByObject(objectId);
+            chunkRows = chunks.findChunksByObject(objectId);
             if (!objects.delete(objectId, clock.instant())) {
                 throw notFound(objectId);
             }
@@ -135,6 +138,10 @@ public class ObjectService {
         } finally {
             namespaceLock.unlock();
         }
+        // Once the task has created the versioned DELETEs, send them straight to the holders through
+        // DELETE /internal/chunks/{id} (like the upload's PUTs) rather than waiting for their heartbeats.
+        // In the background: the 204 below never waits for the workers.
+        deleteSender.sendWhenApplied(task, objectId, chunkRows.stream().map(Chunk::chunkId).toList());
         try {
             writer.await(task, properties.uploadCommitWait());
         } catch (java.util.concurrent.TimeoutException e) {

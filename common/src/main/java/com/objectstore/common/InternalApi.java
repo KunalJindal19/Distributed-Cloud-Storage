@@ -8,8 +8,15 @@ public final class InternalApi {
      * checksum in the worker's sidecar.
      */
     public static final String CHECKSUM_HEADER = "X-Checksum";
-    /** On a chunk PUT (required): the operation version the copy is installed at (v5 §4.3). */
+    /**
+     * On a chunk PUT or DELETE (required): the operation version the copy is installed or deleted at
+     * (v5 §4.3, §4.4).
+     */
     public static final String OP_VERSION_HEADER = "X-Op-Version";
+    /** On a chunk DELETE (optional): the controller's command id, reported back in a {@code CMD_FAILED}. */
+    public static final String CMD_ID_HEADER = "X-Cmd-Id";
+    /** On a chunk DELETE (optional): the delete reason; {@code corrupt} quarantines the copy instead. */
+    public static final String REASON_HEADER = "X-Reason";
     /**
      * On the controller's chunk PUTs: {@code <boot_id>:<n>}, the last change of that worker process
      * the controller has received. The worker forgets changes up to {@code n} and answers with the
