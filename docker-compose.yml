@@ -5,8 +5,14 @@
 #   4 workers     - DataNodes: one persistent volume each, reachable only inside the network
 #   1 client      - a ready-to-use CLI container (curl, jq and the oscli command)
 #
-# Start:  docker compose up --build -d --wait    (or: make up)
+# Start:  docker compose up -d --wait            downloads the published images from Docker Hub
+#         make up                                 builds the images from this checkout instead
+#                                                 (adds docker-compose.build.yml)
 # Stop:   docker compose down                    (data is kept; add -v to wipe it)
+#
+# Images: ${OBJECTSTORE_REPO}/objectstore-{controller,worker,client}:${OBJECTSTORE_VERSION}, published for
+# linux/amd64 and linux/arm64 by "make publish". Every release gets a new version, so a machine can
+# never keep running an old image under the tag a newer checkout asks for.
 # Chaos:  docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d   (fault injection on)
 
 name: objectstore
@@ -21,10 +27,8 @@ x-common-environment: &common-environment
   FAULT_DUP_RATE: "0"
 
 # All four workers run the same image; they differ only in WORKER_ID, PORT and their volume.
-# worker1 builds it (see below); the others only use it, so it is built once.
 x-worker: &worker
-  image: objectstore-worker:1.0.0
-  pull_policy: never               # never look for it in a registry: it is built locally by worker1
+  image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-worker:${OBJECTSTORE_VERSION:-5.0.0}
   depends_on:
     controller:
       condition: service_healthy
@@ -63,10 +67,7 @@ x-worker-environment: &worker-environment
 
 services:
   controller:
-    build:
-      context: .
-      target: controller
-    image: objectstore-controller:1.0.0
+    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-controller:${OBJECTSTORE_VERSION:-5.0.0}
     container_name: controller
     hostname: controller
     restart: unless-stopped
@@ -103,6 +104,7 @@ services:
       RESYNC_STALL_TIMEOUT: "60"     # no segment progress for this long: the next report attempt
       VERIFY_FRESH_FOR_DELETE: "3600" # how recent a survivor's VERIFY must be before a surplus copy is deleted
       VERIFY_RESEND: "60"            # minimum gap between VERIFYs of one copy
+      DIRECT_OBJECT_DELETES: "true"  # a client delete sends DELETE /internal/chunks/{id} to the holders at once
       INVARIANT_CHECKS: "1"            # the rolling invariant check, every planner tick
       PLANNER_VISIT_BUDGET: "2000"   # chunks visited in the under-replication levels per tick
       POSTPONED_BUDGET: "1000"       # postponed chunks re-checked per tick
@@ -126,10 +128,6 @@ services:
   # container_name is fixed so that "docker stop worker2" / "docker start worker2" work as written.
   worker1:
     <<: *worker
-    build:                           # builds objectstore-worker:1.0.0 for all four workers
-      context: .
-      target: worker
-    pull_policy: build
     container_name: worker1
     hostname: worker1
     environment:
@@ -175,10 +173,7 @@ services:
   # A client inside the network. It only knows the controller's address.
   # The project directory is mounted at /work so files can be uploaded from / downloaded to it.
   client:
-    build:
-      context: .
-      target: client
-    image: objectstore-client:1.0.0
+    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-client:${OBJECTSTORE_VERSION:-5.0.0}
     container_name: client
     hostname: client
     init: true

@@ -183,4 +183,31 @@ class ClusterStateTest {
         assertThat(cluster.counter("index_mismatches")).isZero();
         assertThat(cluster.read(() -> cluster.levels().levelOf(chunk(0)))).isEqualTo(cluster.levels().levelFor(1, 0));
     }
+
+    /** Direct delivery of a client delete takes only that object's deletes; everything else waits for heartbeats. */
+    @Test
+    void takeDeletesTakesOnlyTheGivenChunksDeletesAndNothingFromAStaleWorker() {
+        t.knowChunk(chunk(0));
+        t.knowChunk(chunk(5));
+        t.join("worker1", chunk(0), chunk(5));
+        cluster.write(() -> {
+            cluster.ops().ensure(chunk(0), "worker1", Reason.OBJECT_DELETED);
+            cluster.ops().ensure(chunk(5), "worker1", Reason.ORPHAN);
+        });
+
+        List<Command> taken = cluster.write(() -> cluster.takeDeletes(cluster.worker("worker1"), java.util.Set.of(chunk(0)), 50));
+
+        assertThat(taken).extracting(Command::chunkId).containsExactly(chunk(0));
+        assertThat(t.op(chunk(0), "worker1").state()).isEqualTo(PendingOps.State.SENT);
+        assertThat(t.handOut("worker1")).extracting(Command::chunkId).as("the other delete still goes in a reply")
+                .containsExactly(chunk(5));
+
+        t.knowChunk(chunk(6));
+        t.join("worker2", chunk(6));
+        cluster.write(() -> cluster.ops().ensure(chunk(6), "worker2", Reason.OBJECT_DELETED));
+        cluster.write(() -> cluster.worker("worker2").state = WorkerState.STALE);
+        assertThat(cluster.write(() -> cluster.takeDeletes(cluster.worker("worker2"), java.util.Set.of(chunk(6)), 50)))
+                .as("a STALE worker gets its deletes in heartbeat replies").isEmpty();
+        t.assertNoViolations();
+    }
 }

@@ -31,4 +31,23 @@ public class WorkerException extends RuntimeException {
     public boolean isConflict() {
         return status != null && status == 409;
     }
+
+    /**
+     * True if the request certainly never reached the worker: the connection was refused, could not
+     * be opened in time, or the host could not be resolved. A time-out or a lost answer after the
+     * request was sent is not that: the worker may have acted on it.
+     */
+    public boolean neverSent() {
+        if (status != null) {
+            return false;
+        }
+        for (Throwable t = getCause(); t != null; t = t.getCause() == t ? null : t.getCause()) {
+            if (t instanceof java.net.ConnectException || t instanceof java.net.http.HttpConnectTimeoutException
+                    || t instanceof java.net.UnknownHostException
+                    || t instanceof java.nio.channels.UnresolvedAddressException) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

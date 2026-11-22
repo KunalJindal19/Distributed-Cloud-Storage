@@ -4,7 +4,9 @@
 # The Maven build runs once in a shared stage; each runtime image only receives its own jar.
 
 # ---- build: compile and package all modules -------------------------------------------------
-FROM maven:3.9-eclipse-temurin-21 AS build
+# Runs on the machine's own architecture even when building for another one ("make publish" builds
+# linux/amd64 and linux/arm64): the jars are the same for both, so Maven never runs under emulation.
+FROM --platform=$BUILDPLATFORM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /workspace
 
 COPY pom.xml ./

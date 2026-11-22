@@ -1121,20 +1121,7 @@ public class ClusterState {
                     return CommandQueue.Decision.TAKE;
                 }
                 case InternalApi.COMMAND_DELETE -> {
-                    Op op = ops.byCommand(command.cmdId());
-                    if (op == null || op.state() != PendingOps.State.QUEUED) {
-                        return CommandQueue.Decision.DROP;
-                    }
-                    if (worker.resyncing) {
-                        return CommandQueue.Decision.KEEP;
-                    }
-                    if (op.reason() == Reason.EXCESS && !survivorsValid(op)) {
-                        ops.dropAtHandOut(op, "a survivor is no longer verified at hand-out");
-                        increment("excess_dropped_at_handout");
-                        return CommandQueue.Decision.DROP;              // the drain removes the command
-                    }
-                    ops.delivered(op);
-                    return CommandQueue.Decision.TAKE;
+                    return handOutDelete(worker, command);
                 }
                 case InternalApi.COMMAND_VERIFY -> {
                     if (worker.resyncing) {
@@ -1154,6 +1141,49 @@ public class ClusterState {
                 }
             }
         }, MAX_COMMANDS_PER_HEARTBEAT);
+    }
+
+    /**
+     * The hand-out rule for one queued DELETE, shared by heartbeat replies and direct delivery: a
+     * command whose op is gone or no longer queued is dropped; nothing goes to a resyncing worker
+     * (it stays queued); an EXCESS delete is checked once more and dropped if a survivor is no longer
+     * verified; otherwise the op becomes SENT and its resend deadline is armed.
+     */
+    private CommandQueue.Decision handOutDelete(WorkerInfo worker, Command command) {
+        Op op = ops.byCommand(command.cmdId());
+        if (op == null || op.state() != PendingOps.State.QUEUED) {
+            return CommandQueue.Decision.DROP;
+        }
+        if (worker.resyncing) {
+            return CommandQueue.Decision.KEEP;
+        }
+        if (op.reason() == Reason.EXCESS && !survivorsValid(op)) {
+            ops.dropAtHandOut(op, "a survivor is no longer verified at hand-out");
+            increment("excess_dropped_at_handout");
+            return CommandQueue.Decision.DROP;              // the drain removes the command
+        }
+        ops.delivered(op);
+        return CommandQueue.Decision.TAKE;
+    }
+
+    /**
+     * Takes up to {@code max} queued DELETE commands for the given chunks from one worker's queue,
+     * for direct delivery through {@code DELETE /internal/chunks/{chunk_id}} (a client's object
+     * delete). The same rule as a heartbeat reply applies to each ({@link #handOutDelete}), and only
+     * a worker that is ALIVE, has completed a resync, is not resyncing and not being purged gets any:
+     * for every other worker the commands stay queued for its heartbeat replies. Every other command
+     * in the queue is left where it is. Must be called under the write lock.
+     */
+    public List<Command> takeDeletes(WorkerInfo worker, Set<String> chunkIds, int max) {
+        if (worker == null || !isCurrent(worker) || worker.purging || worker.url == null) {
+            return List.of();
+        }
+        return worker.commands.drain(command -> {
+            if (!InternalApi.COMMAND_DELETE.equals(command.type()) || !chunkIds.contains(command.chunkId())) {
+                return CommandQueue.Decision.KEEP;
+            }
+            return handOutDelete(worker, command);
+        }, max);
     }
 
     public int queuedCommands() {
