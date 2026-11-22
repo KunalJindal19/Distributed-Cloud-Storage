@@ -1,0 +1,13 @@
+services:
+  controller:
+    environment:
+      CONNECT_TIMEOUT: "8"        # wait for worker2's delayed TCP handshake
+      READ_TIMEOUT: "3"           # gives up on worker2's PUT before its 5 s-late answer arrives
+      STALE_AFTER: "15"           # a heartbeat 5-7 s old is not silence any more
+      DEAD_AFTER: "30"
+  worker2:
+    environment:
+      HEARTBEAT_HTTP_TIMEOUT: "12"
+      SERVER_READ_TIMEOUT: "60"   # a 1 MB body takes ~25 s to arrive at a 3 s delay
+      CONNECT_TIMEOUT: "8"
+      READ_TIMEOUT: "30"
