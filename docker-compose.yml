@@ -20,10 +20,11 @@ x-common-environment: &common-environment
   FAULT_DROP_RATE: "0"
   FAULT_DUP_RATE: "0"
 
+# All four workers run the same image; they differ only in WORKER_ID, PORT and their volume.
+# worker1 builds it (see below); the others only use it, so it is built once.
 x-worker: &worker
-  build:
-    context: .
-    target: worker
+  image: objectstore-worker:1.0.0
+  pull_policy: never               # never look for it in a registry: it is built locally by worker1
   depends_on:
     controller:
       condition: service_healthy
@@ -71,7 +72,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 5s
     ports:
-      - "${CONTROLLER_PORT:-8000}:8000"
+      - "${CONTROLLER_PORT:-9000}:8000"
     environment:
       <<: *common-environment
       PORT: "8000"
@@ -82,7 +83,7 @@ services:
       DEAD_AFTER: "12"               # silence -> DEAD (copies forgotten and re-replicated)
       STALE_RATIO: "0.5"             # above this fraction of STALE workers, write to them anyway
       HEALTH_INTERVAL: "1"
-      MONITOR_INTERVAL: "3"          # replication monitor period
+      MONITOR_INTERVAL: "1"          # replication monitor (planner) period
       OP_RESEND_INITIAL: "15"        # an unanswered op is resent after this (same version), then backing off
       OP_RESEND_MAX: "240"           # ... up to this
       OP_MAX_INSERT_ATTEMPTS: "5"    # an unanswered copy is dropped and re-planned after this many sends
@@ -125,6 +126,10 @@ services:
   # container_name is fixed so that "docker stop worker2" / "docker start worker2" work as written.
   worker1:
     <<: *worker
+    build:                           # builds objectstore-worker:1.0.0 for all four workers
+      context: .
+      target: worker
+    pull_policy: build
     container_name: worker1
     hostname: worker1
     environment:
