@@ -64,6 +64,10 @@ x-worker-environment: &worker-environment
   SCAN_INTERVAL: "10"              # block scanner: at most one pass per this many seconds
   SCAN_MAX_BYTES_PER_SEC: "33554432" # block scanner read rate limit (32 MiB/s)
   DISK_CHECK_INTERVAL: "30"        # volume probe period (s)
+  # The most one worker stores (its chunks + quarantine), e.g. 10GB, 500MB (binary units); 0 = no cap
+  # (then a worker offers all the free space of the disk its volume is on). Override per run with
+  # STORAGE_CAPACITY=20GB make up, or per worker in that worker's environment.
+  STORAGE_CAPACITY: "${STORAGE_CAPACITY:-10GB}"
 
 services:
   controller:

@@ -258,7 +258,8 @@ function renderStatus(status) {
                   ? `${w.fence} · resyncing, attempt ${w.attempt}` : String(w.fence)),
               el("dt", {}, "last heartbeat"), el("dd", {}, w.last_seen_s_ago.toFixed(1) + " s ago"),
               el("dt", {}, "chunk copies"), el("dd", {}, w.chunk_count),
-              el("dt", {}, "free space"), el("dd", {}, w.stats ? bytes(w.stats.free_bytes) : "?"),
+              el("dt", {}, "storage"), el("dd", {}, w.stats
+                  ? `${bytes(w.stats.used_bytes)} used · ${bytes(w.stats.free_bytes)} free` : "?"),
               el("dt", {}, "quarantined"), el("dd", {}, w.stats
                   ? `${w.stats.quarantined_chunks || 0} copies · ${bytes(w.stats.quarantined_bytes || 0)}` : "?"),
               el("dt", {}, "tombstones"), el("dd", {}, w.stats ? (w.stats.tombstones || 0) : "?"),
