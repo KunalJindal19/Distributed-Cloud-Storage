@@ -50,6 +50,28 @@ public class ClusterStatusService {
         return new Health((int) (h[1] + h[0]), (int) h[2], (int) h[0], h[3], h[4], h[5]);
     }
 
+    /**
+     * What any signed-in client may know about the cluster (the web client's status chip): whether
+     * writes are possible and whether data is unavailable. {@code objects}: the caller's own count.
+     */
+    public record HealthSummary(boolean safeMode, int workersReady, int workersTotal, int replicationFactor,
+                                int missingChunks, int underReplicated, long objects) {
+    }
+
+    public HealthSummary summary(long visibleObjects) {
+        return cluster.read(() -> {
+            Health health = health();
+            int ready = 0;
+            for (WorkerInfo worker : cluster.workers().values()) {
+                if (worker.state == ClusterState.WorkerState.ALIVE && worker.hasReported) {
+                    ready++;
+                }
+            }
+            return new HealthSummary(cluster.isSafeMode(), ready, cluster.workers().size(),
+                    properties.replicationFactor(), health.missing(), health.underReplicated(), visibleObjects);
+        });
+    }
+
     public ClusterStatusResponse status() {
         long objectCount = objects.count();
         Map<String, Double> lockMaxHold = cluster.takeLockMaxHoldMs();   // reset by reading

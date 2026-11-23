@@ -5,7 +5,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT"
-BASE_URL="${BASE_URL:-http://localhost:8000}"
+BASE_URL="${BASE_URL:-http://localhost:${CONTROLLER_PORT:-9000}}"
 API="$BASE_URL/api/v1"
 WORK="$ROOT/.demo/scenarios"
 REL=".demo/scenarios"   # the same directory relative to the project: what ./oscli (in the client container) can see
@@ -15,6 +15,14 @@ MIB=1048576
 # docker-compose.yml), so a run under another project never touches the default project's volumes.
 PROJECT="${COMPOSE_PROJECT_NAME:-objectstore}"
 NETWORK="${PROJECT}_objectstore-net"
+# Every request is made as the admin account, which sees every object: curl reads $CURL_HOME/.curlrc,
+# ./oscli reads OSCLI_EMAIL and OSCLI_PASSWORD (README "Accounts").
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@gmail.com}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
+export OSCLI_EMAIL="$ADMIN_EMAIL" OSCLI_PASSWORD="$ADMIN_PASSWORD"
+export CURL_HOME="$ROOT/.demo/curl"
+mkdir -p "$CURL_HOME"
+printf 'user = "%s:%s"\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" > "$CURL_HOME/.curlrc"
 FAILED=0
 PASSED=0
 
