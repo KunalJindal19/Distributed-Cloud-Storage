@@ -49,7 +49,7 @@ class CommandExecutorTest {
                 base.maxChangesPerMessage(), base.maxChangesPerPutAnswer(), base.reportSegmentSize(),
                 base.scanIntervalSeconds(), base.scanMaxBytesPerSec(), base.diskCheckIntervalSeconds(),
                 base.connectTimeoutSeconds(), base.readTimeoutSeconds(), base.tombstoneMax(), queueMax,
-                base.serverReadTimeoutSeconds(), base.shutdownDrainTimeoutSeconds(), false, false);
+                base.serverReadTimeoutSeconds(), base.shutdownDrainTimeoutSeconds(), base.storageCapacity(), false, false);
         changes = new ChangeLog(properties);
         store = TestSupport.openStore(properties, changes);
         executor = new CommandExecutor(store, changes, new ControllerClients(RestClient.builder(), properties),

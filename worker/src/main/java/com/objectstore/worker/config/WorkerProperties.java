@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Positive;
 import java.nio.file.Path;
 import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.util.unit.DataSize;
 import org.springframework.validation.annotation.Validated;
 
 /**
@@ -46,6 +47,11 @@ public record WorkerProperties(
         @Positive double serverReadTimeoutSeconds,
         /** On shutdown, how long mutations in progress may take to finish. */
         @Positive double shutdownDrainTimeoutSeconds,
+        /**
+         * The most this worker stores: its chunk copies plus its quarantine. It reports and accepts
+         * no more free space than that leaves (and never more than the volume has). 0: no cap.
+         */
+        @NotNull DataSize storageCapacity,
         /** Exit the process after a fail-stop (false only in in-process tests). */
         boolean exitOnFailStop,
         /** Switches every background loop off (register, heartbeat, scanner, disk check); tests only. */
@@ -59,6 +65,9 @@ public record WorkerProperties(
                 || serverReadTimeoutSeconds <= 0 || shutdownDrainTimeoutSeconds <= 0) {
             throw new IllegalArgumentException("HEARTBEAT_HTTP_TIMEOUT, TOMBSTONE_MAX, EXECUTOR_QUEUE_MAX, "
                     + "SERVER_READ_TIMEOUT and SHUTDOWN_DRAIN_TIMEOUT must be positive");
+        }
+        if (storageCapacity != null && storageCapacity.isNegative()) {
+            throw new IllegalArgumentException("STORAGE_CAPACITY must be 0 (no cap) or positive, e.g. 10GB");
         }
     }
 

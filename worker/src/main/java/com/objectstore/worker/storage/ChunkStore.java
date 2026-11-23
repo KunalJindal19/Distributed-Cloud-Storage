@@ -180,6 +180,8 @@ public class ChunkStore {
     private final AtomicLong quarantinedChunks = new AtomicLong();
     private final AtomicLong quarantinedBytes = new AtomicLong();
     private final AtomicLong quarantineNumber = new AtomicLong();
+    /** STORAGE_CAPACITY in bytes (chunks + quarantine); 0: no cap, only the volume's free space counts. */
+    private final long capacity;
     private volatile long fence;
     private volatile boolean fenceSet;
     private volatile Faults faults = Faults.NONE;
@@ -188,6 +190,7 @@ public class ChunkStore {
     public ChunkStore(WorkerProperties properties, ChangeLog changes, FailStop failStop, MutationGuard guard) {
         this.chunkDir = properties.chunkDir().toAbsolutePath().normalize();
         this.quarantineDir = properties.quarantineDir().toAbsolutePath().normalize();
+        this.capacity = properties.storageCapacity().toBytes();
         this.changes = changes;
         this.failStop = failStop;
         this.guard = guard;
@@ -271,6 +274,15 @@ public class ChunkStore {
         }
         log.info("[store] chunk directory {} ready with {} chunks ({} bytes); {} quarantined copies ({} bytes)",
                 chunkDir, chunkCount.get(), usedBytes.get(), quarantinedChunks.get(), quarantinedBytes.get());
+        if (capacity > 0) {
+            long stored = usedBytes.get() + quarantinedBytes.get();
+            if (stored > capacity) {
+                log.warn("[store] STORAGE_CAPACITY is {} bytes but {} are already stored: this worker takes no new"
+                        + " copies (it still serves and deletes the ones it has)", capacity, stored);
+            } else {
+                log.info("[store] STORAGE_CAPACITY {} bytes: {} stored, {} left", capacity, stored, capacity - stored);
+            }
+        }
     }
 
     // ---- versions and the fence ----------------------------------------------------------------
@@ -373,9 +385,17 @@ public class ChunkStore {
         if (!actual.equals(expectedChecksum)) {
             throw new ChecksumMismatchException(expectedChecksum, actual);
         }
-        long free = freeBytes();
-        if (free < data.length + WRITE_HEADROOM) {
-            throw new InsufficientStorageException(data.length + WRITE_HEADROOM, free);
+        long onVolume = volumeFreeBytes();
+        if (onVolume < data.length + WRITE_HEADROOM) {
+            throw new InsufficientStorageException(data.length + WRITE_HEADROOM, onVolume);
+        }
+        if (capacity > 0) {
+            // A copy already held (a repeat, a re-verify) needs no new room under the cap.
+            Entry held = index.get(chunkId);
+            long room = capacityLeft() + (held == null ? 0 : held.size());
+            if (room < data.length) {
+                throw new InsufficientStorageException(data.length, room);
+            }
         }
         if (!guard.enter()) {
             throw new UnavailableException("this worker is shutting down");
@@ -952,13 +972,29 @@ public class ChunkStore {
         return quarantineIfBad(chunkId, entry.version(), null) ? Optional.of(false) : Optional.empty();
     }
 
-    /** O(1): the index's running totals and the volume's free space. Never walks the disk. */
+    /** O(1): the index's running totals and the free space ({@link #freeBytes}). Never walks the disk. */
     public WorkerStats stats(int activeTransfers) {
         return new WorkerStats(chunkCount.get(), usedBytes.get(), freeBytes(), activeTransfers,
                 quarantinedChunks.get(), quarantinedBytes.get(), tombstones.size());
     }
 
+    /**
+     * The free space this worker reports and writes against: the volume's, and with a STORAGE_CAPACITY
+     * no more than the capacity minus what it stores (chunks + quarantine). Never negative.
+     */
     public long freeBytes() {
+        return Math.min(volumeFreeBytes(), capacityLeft());
+    }
+
+    /** Room left under STORAGE_CAPACITY; {@code Long.MAX_VALUE} without a cap. */
+    private long capacityLeft() {
+        if (capacity <= 0) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(0, capacity - usedBytes.get() - quarantinedBytes.get());
+    }
+
+    private long volumeFreeBytes() {
         try {
             FileStore store = Files.getFileStore(chunkDir);
             return store.getUsableSpace();

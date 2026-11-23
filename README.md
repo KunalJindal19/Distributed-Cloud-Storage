@@ -103,7 +103,7 @@ make fsck                                                # end-to-end consistenc
 | `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
 | `make showcase` | a guided tour of the inner state: messages, chunk placement, `worker2` stopped and started ([below](#showcase-the-inner-state-on-the-console)) |
 | `make app` | open the web client, <http://localhost:9000/app> |
-| `make test` | 310 unit and in-process system tests (local Maven, or a Maven container) |
+| `make test` | 312 unit and in-process system tests (local Maven, or a Maven container) |
 | `make test-scale` | the scale test: 500,000 chunks, 8 workers, no HTTP (about a minute) |
 | `make scenarios` | the acceptance-criteria scripts against Docker (about 15 minutes; wipes data) |
 | `make chaos` | the chaos test: 5 minutes of load and disruption with network faults, then convergence checks |
@@ -826,6 +826,7 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `SCAN_INTERVAL` | 10 | worker | at most one block scanner pass per this many seconds |
 | `SCAN_MAX_BYTES_PER_SEC` | 33554432 | worker | block scanner read rate limit (32 MiB/s, a token bucket refilled each second) |
 | `DISK_CHECK_INTERVAL` | 30 | worker | volume probe period |
+| `STORAGE_CAPACITY` | 10GB (compose; `0` = no cap) | worker | the most one worker stores (chunk copies + quarantine), e.g. `500MB`, `20GB` (binary units). The worker reports no more free space than the cap leaves (and never more than its disk has), so the controller stops placing copies on it below `MIN_FREE_BYTES`, and a PUT beyond the cap answers 507. Copies already there are still served and deleted; a cap below what is stored only stops new copies |
 | `HEARTBEAT_HTTP_TIMEOUT` | 3 | worker | heartbeat request time-out (below `STALE_AFTER`) |
 | `CONNECT_TIMEOUT` | 2 | both | HTTP connect time-out |
 | `READ_TIMEOUT` | 10 | both | HTTP read time-out for chunk transfers |
@@ -1636,7 +1637,7 @@ where v5 changed the behaviour)
 |---|---|
 | Wrong volume mounted (`VERSION` names another worker) | The worker refuses to register; its data is untouched; its health check fails. |
 | Two containers with the same `WORKER_ID` | Boot-id flips are detected → `ERROR [registry] duplicate WORKER_ID` and 409 `duplicate_worker` for 60 s. |
-| Disk full | PUT answers 507 → pipeline recovery / repair back-off; the worker is not a target while it has less than `MIN_FREE_BYTES`. |
+| Disk full (or `STORAGE_CAPACITY` reached) | PUT answers 507 → pipeline recovery / repair back-off; the worker is not a target while it has less than `MIN_FREE_BYTES`. |
 | Volume unwritable, or an fsync fails | The disk check fails or the store fail-stops → the worker exits → DEAD → repair; Docker restarts it and it resyncs. |
 | One listing would delete many "orphans" (a bug, a wrong database) | The safety valve refuses the GC and logs an ERROR. Chunks of failed uploads and deleted objects are not affected: they are known garbage. |
 | `.meta` damaged | The copy is quarantined, like corrupt data, and the chunk repaired. |
