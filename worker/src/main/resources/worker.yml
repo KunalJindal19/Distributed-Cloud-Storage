@@ -48,6 +48,8 @@ worker:
   executor-queue-max: ${EXECUTOR_QUEUE_MAX:500}
   server-read-timeout-seconds: ${SERVER_READ_TIMEOUT:20}
   shutdown-drain-timeout-seconds: ${SHUTDOWN_DRAIN_TIMEOUT:3}
+  # The most this worker stores (chunks + quarantine), e.g. 10GB or 500MB (binary units); 0: no cap.
+  storage-capacity: ${STORAGE_CAPACITY:0}
   exit-on-fail-stop: true
   background-enabled: true
 

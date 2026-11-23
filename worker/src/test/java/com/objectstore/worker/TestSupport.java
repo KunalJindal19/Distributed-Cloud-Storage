@@ -9,6 +9,7 @@ import com.objectstore.worker.storage.ChunkStore;
 import java.nio.file.Path;
 import java.util.List;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.util.unit.DataSize;
 
 /** Shared helpers for the worker's unit tests. */
 public final class TestSupport {
@@ -20,9 +21,14 @@ public final class TestSupport {
     }
 
     public static WorkerProperties properties(Path dataDir, long scanBytesPerSec, int changeLogMax) {
+        return properties(dataDir, scanBytesPerSec, changeLogMax, DataSize.ofBytes(0));
+    }
+
+    /** With a STORAGE_CAPACITY ({@code 0}: no cap). */
+    public static WorkerProperties properties(Path dataDir, long scanBytesPerSec, int changeLogMax, DataSize capacity) {
         return new WorkerProperties("worker1", dataDir, "http://controller:8000", "", 1_048_576,
                 2, 3, 250, changeLogMax, 2000, 256, 2000, 10, scanBytesPerSec, 30, 2, 10,
-                100_000, 500, 20, 3, false, false);
+                100_000, 500, 20, 3, capacity, false, false);
     }
 
     public static WorkerProperties properties(Path dataDir) {

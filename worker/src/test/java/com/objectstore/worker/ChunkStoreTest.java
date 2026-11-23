@@ -31,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.util.unit.DataSize;
 
 /** The worker as a versioned store (v5 §4): the version check, tombstones, the fence, quarantine, install order. */
 class ChunkStoreTest {
@@ -195,6 +196,38 @@ class ChunkStoreTest {
         assertThat(store.beginIncoming(CHUNK_A, v(2))).isTrue();
         store.endIncoming(CHUNK_A, v(1));
         assertThat(store.beginIncoming(CHUNK_A, v(1))).isTrue();
+    }
+
+    @Test
+    void storageCapacityCapsTheFreeSpaceAndRefusesCopiesBeyondIt() throws IOException {
+        properties = TestSupport.properties(dataDir, 1L << 30, 10_000, DataSize.ofBytes(2500));
+        store = newStore(true);
+        String chunkC = CHUNK_A.substring(0, CHUNK_A.length() - 1) + "2";
+        byte[] a = bytes(1000, 1);
+        byte[] b = bytes(1000, 2);
+        byte[] c = bytes(1000, 3);
+        assertThat(store.freeBytes()).isEqualTo(2500);
+
+        assertThat(store.put(CHUNK_A, v(1), a, Checksums.sha256Hex(a))).isEqualTo(PutOutcome.CREATED);
+        assertThat(store.put(CHUNK_B, v(1), b, Checksums.sha256Hex(b))).isEqualTo(PutOutcome.CREATED);
+        assertThat(store.freeBytes()).isEqualTo(500);
+        assertThat(store.stats(0).freeBytes()).as("what the heartbeat reports").isEqualTo(500);
+
+        assertThatThrownBy(() -> store.put(chunkC, v(1), c, Checksums.sha256Hex(c)))
+                .as("507: over the cap").isInstanceOf(ChunkStore.InsufficientStorageException.class);
+        assertThat(filesIn(chunkDir)).doesNotContain(chunkC);
+        // A copy it already holds needs no new room: a re-verify still succeeds at the cap.
+        assertThat(store.put(CHUNK_A, v(2), a, Checksums.sha256Hex(a))).isEqualTo(PutOutcome.REVERIFIED);
+
+        assertThat(store.delete(CHUNK_B, v(2), false, "cmd")).isEqualTo(DeleteOutcome.DELETED);
+        assertThat(store.freeBytes()).isEqualTo(1500);
+        assertThat(store.put(chunkC, v(1), c, Checksums.sha256Hex(c))).isEqualTo(PutOutcome.CREATED);
+    }
+
+    @Test
+    void withoutACapTheFreeSpaceIsTheVolumes() throws IOException {
+        long volume = Files.getFileStore(chunkDir).getUsableSpace();
+        assertThat(store.freeBytes()).isBetween(volume - (64L << 20), volume + (64L << 20));
     }
 
     // ---- deleting -------------------------------------------------------------------------------------

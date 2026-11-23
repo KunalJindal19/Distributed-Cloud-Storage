@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.util.unit.DataSize;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -139,7 +140,8 @@ class ControllerLinkTest {
     private void start(int changeLogMax, int tombstoneMax) throws IOException {
         stub = new Stub();
         WorkerProperties properties = new WorkerProperties("worker1", dataDir, stub.url(), "http://127.0.0.1:1", 1_048_576,
-                0.05, 1, 10, changeLogMax, 2000, 256, 1, 10, 1L << 30, 30, 1, 2, tombstoneMax, 500, 20, 3, false, false);
+                0.05, 1, 10, changeLogMax, 2000, 256, 1, 10, 1L << 30, 30, 1, 2, tombstoneMax, 500, 20, 3,
+                DataSize.ofBytes(0), false, false);
         // Three chunks already on disk: start-up recovery indexes them at version 0.
         Files.createDirectories(properties.chunkDir());
         for (int i = 0; i < 3; i++) {
