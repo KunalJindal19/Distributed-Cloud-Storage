@@ -23,6 +23,7 @@ restore the replication factor, and survives its own crash at any instruction.
 | Stack | Java 21, Spring Boot 4.1, Maven, SQLite (controller namespace) |
 
 **Contents:**
+[How to run](#how-to-run) ·
 [Quick start](#quick-start) ·
 [Architecture](#architecture) ·
 [HDFS mapping](#what-is-re-created-from-hdfs) ·
@@ -43,6 +44,41 @@ restore the replication factor, and survives its own crash at any instruction.
 [Troubleshooting](#troubleshooting)
 
 ---
+
+## How to run
+
+You need Docker (Docker Desktop, or Docker Engine with Compose v2). In this folder:
+
+```bash
+docker compose up -d --wait     # first time: downloads the images; returns when everything is healthy
+```
+
+Then open the **web client** in a browser and sign in as the **admin**:
+
+| | |
+|---|---|
+| Web client (GUI) | <http://localhost:9000/app> |
+| Admin email | `admin@gmail.com` |
+| Admin password | `admin123` |
+
+On the sign-in page, enter the admin email and password and press **Sign in**. Other users can
+press **Create account** to register; each of them sees only their own objects, while the admin
+sees everyone's.
+
+| Page | Address | Who can open it |
+|---|---|---|
+| Web client: upload, browse, preview, download, edit metadata, delete | <http://localhost:9000/app> | any account |
+| Cluster dashboard: workers, chunk placement, object inspector, fsck | <http://localhost:9000/dashboard>, or **Cluster dashboard ↗** in the web client's top bar | the admin only |
+
+The API needs the same sign-in, for example with `curl`:
+
+```bash
+curl -u admin@gmail.com:admin123 http://localhost:9000/api/v1/objects
+curl -u admin@gmail.com:admin123 -F file=@samples/sample.jpg http://localhost:9000/api/v1/objects
+```
+
+To stop: `docker compose down` (stored data is kept; `docker compose down -v` deletes it). To use
+another admin password, start with `ADMIN_PASSWORD=<new password> docker compose up -d --wait`.
 
 ## Quick start
 
@@ -73,9 +109,8 @@ already published. Commit the bumped `docker-compose.yml`, so anyone who pulls t
 images. `OBJECTSTORE_REPO` and `OBJECTSTORE_VERSION` can also be set in the environment to use other
 images.
 
-Then sign in to the web client at <http://localhost:9000/app>: create an account, or use the admin
-account `admin@gmail.com` / `admin123` (change it with `ADMIN_PASSWORD`, see [Accounts](#accounts)).
-Or store something yourself:
+Then sign in to the web client at <http://localhost:9000/app> (see [How to run](#how-to-run)), or
+store something from the command line:
 
 ```bash
 ./oscli register alice@example.com                       # once; asks for a password (8+ characters)
