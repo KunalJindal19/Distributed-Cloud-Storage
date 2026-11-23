@@ -10,16 +10,26 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-/** A small HTTP client for the controller's public and internal API, used by the system tests. */
+/**
+ * A small HTTP client for the controller's public and internal API, used by the system tests. It
+ * signs every request in as the admin unless created for another account ({@link #as}).
+ */
 public final class Api {
 
+    /** The admin account of the in-process controller (InProcessCluster sets the password). */
+    public static final String ADMIN_EMAIL = "admin@gmail.com";
+    public static final String ADMIN_PASSWORD = "system-test-admin-password";
+
     private final String base;
+    private final String authorization;
     private final HttpClient http = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(2))
@@ -27,7 +37,38 @@ public final class Api {
     private final JsonMapper json = JsonMapper.builder().build();
 
     public Api(String base) {
+        this(base, basic(ADMIN_EMAIL, ADMIN_PASSWORD));
+    }
+
+    /** {@code authorization}: the Authorization header of every request, or null for none. */
+    public Api(String base, String authorization) {
         this.base = base;
+        this.authorization = authorization;
+    }
+
+    /** The same controller, signed in as another account (HTTP Basic). */
+    public Api as(String email, String password) {
+        return new Api(base, basic(email, password));
+    }
+
+    /** The same controller with another Authorization header (null: none). */
+    public Api withAuthorization(String header) {
+        return new Api(base, header);
+    }
+
+    public static String basic(String email, String password) {
+        return "Basic " + Base64.getEncoder().encodeToString((email + ":" + password).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Any request; {@code headers} are added to (and may replace) the account's Authorization header. */
+    public HttpResponse<String> request(String method, String path, String body, Map<String, String> headers) {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri(path)).method(method,
+                body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body));
+        if (body != null) {
+            request.header("Content-Type", "application/json");
+        }
+        headers.forEach(request::setHeader);
+        return send(request, HttpResponse.BodyHandlers.ofString());
     }
 
     public JsonNode json(String text) {
@@ -138,6 +179,9 @@ public final class Api {
     }
 
     private <T> HttpResponse<T> send(HttpRequest.Builder request, HttpResponse.BodyHandler<T> handler) {
+        if (authorization != null && request.build().headers().firstValue("Authorization").isEmpty()) {
+            request.header("Authorization", authorization);
+        }
         try {
             return http.send(request.timeout(Duration.ofSeconds(30)).build(), handler);
         } catch (IOException e) {

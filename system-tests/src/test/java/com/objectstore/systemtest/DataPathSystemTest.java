@@ -35,7 +35,11 @@ class DataPathSystemTest extends ClusterTest {
     }
 
     @Test
-    void withTooFewWorkersLeftTheUploadFailsCleanlyAndItsLeftoversAreCollected() {
+    void withTooFewWorkersLeftTheUploadFailsCleanlyAndItsLeftoversAreCollected() throws InterruptedException {
+        // Past the one-time "orphan GC allowed" resyncs (ORPHAN_GC_DELAY = 2 s here): a resyncing worker
+        // rightly takes no new writes, and the upload below needs both remaining workers.
+        Thread.sleep(2500);
+        await().atMost(PATIENCE).pollInterval(Duration.ofMillis(50)).until(() -> api.status().get("resyncing").asInt() == 0);
         cluster.stopWorker("worker3");
         cluster.stopWorker("worker4");
         await().atMost(PATIENCE).until(() -> api.workerState("worker4").equals("DEAD") && api.workerState("worker3").equals("DEAD"));

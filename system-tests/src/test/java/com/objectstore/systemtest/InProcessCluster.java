@@ -109,6 +109,7 @@ public final class InProcessCluster implements AutoCloseable {
         settings.put("server.port", String.valueOf(controllerPort));
         settings.put("server.shutdown", "immediate");
         settings.put("objectstore.db-path", dbFile.toString());
+        settings.put("objectstore.auth.admin-password", Api.ADMIN_PASSWORD);
         settings.putAll(controllerOverrides);
         controller = start(ControllerApplication.class, ControllerApplication.CONFIG_NAME, settings);
     }

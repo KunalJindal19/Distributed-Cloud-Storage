@@ -12,17 +12,26 @@
 # container. Nothing waits for a fixed time: every wait polls until the expected state is reached
 # (or a generous time-out expires), so the script is as fast as the system and never flaky.
 #
-# Environment: BASE_URL (default http://localhost:8000), VICTIM (worker to stop, default worker2).
+# Environment: BASE_URL (default http://localhost:$CONTROLLER_PORT, i.e. 9000), VICTIM (worker to stop, default worker2),
+# ADMIN_EMAIL / ADMIN_PASSWORD (the admin account, default admin@gmail.com / admin123).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-BASE_URL="${BASE_URL:-http://localhost:8000}"
+BASE_URL="${BASE_URL:-http://localhost:${CONTROLLER_PORT:-9000}}"
 API="$BASE_URL/api/v1"
 VICTIM="${VICTIM:-worker2}"
 WORKERS=(worker1 worker2 worker3 worker4)
 WORK=".demo"            # inside the project directory, so the client container can see it too
 MIB=1048576
+# Every request is made as the admin account, which sees every object: curl reads $CURL_HOME/.curlrc,
+# ./oscli reads OSCLI_EMAIL and OSCLI_PASSWORD (README "Accounts").
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@gmail.com}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
+export OSCLI_EMAIL="$ADMIN_EMAIL" OSCLI_PASSWORD="$ADMIN_PASSWORD"
+export CURL_HOME="$PWD/.demo/curl"
+mkdir -p "$CURL_HOME"
+printf 'user = "%s:%s"\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" > "$CURL_HOME/.curlrc"
 
 # ---- tools ---------------------------------------------------------------------------------
 
@@ -372,7 +381,7 @@ check "the controller detected that the replication factor is no longer maintain
 oscli download "$FAIL_ID" "$WORK/failure.during" | jq -c '{bytes, etag_match}' | indent
 check "the object is still served, from the remaining copies, and is identical" cmp -s "$WORK/failure.bin" "$WORK/failure.during"
 
-step "Automatic re-replication: the monitor (every 3 s) orders a surviving holder to copy each chunk directly to another worker"
+step "Automatic re-replication: the monitor (every $(status | jq -r .config.monitor_interval) s) orders a surviving holder to copy each chunk directly to another worker"
 wait_until 60 "no chunk is under-replicated any more" no_chunk_under_replicated
 repair_events copied "$FAIL_ID" | indent
 SAMPLE=$(status | jq -r --arg p "$FAIL_ID" '[.repair_log[] | select(.event == "copied" and (.chunk_id | startswith($p)))][0] | "\(.chunk_id) \(.source)"')
