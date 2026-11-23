@@ -23,6 +23,8 @@
   .banner { display: none; color: #fff; padding: 10px 14px; border-radius: 8px; font-weight: 600; margin-bottom: 14px; }
   #banner { background: var(--bad); }
   #safemode { background: var(--warn); }
+  #signin { background: var(--info); }
+  #signin a { color: #fff; }
   .grid { display: grid; gap: 12px; }
   .kpis { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .workers { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
@@ -62,6 +64,35 @@
   #fsck-result dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 0; }
   #fsck-result dt { color: var(--muted); }
   #fsck-result dd { margin: 0; overflow-wrap: anywhere; }
+
+  /* ---- admin gate ---- */
+  .gate { max-width: 440px; margin: 40px auto; }
+  .gate h2 { margin-top: 0; }
+  .gate p { color: var(--muted); margin: 0 0 14px; }
+  .gate label { display: block; font-size: 14px; color: var(--muted); font-weight: 600; margin: 10px 0 4px; }
+  input[type=text], input[type=email], input[type=password], select {
+    font: inherit; font-size: 15px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: #fff; color: var(--ink); min-width: 0; }
+  .gate input { width: 100%; }
+  .gate button { margin-top: 14px; width: 100%; }
+  .error { color: var(--bad); font-size: 14px; margin-top: 8px; }
+  button.secondary { background: #fff; color: var(--accent); }
+
+  /* ---- object inspector ---- */
+  .inspect-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .inspect-form input { flex: 1 1 320px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .inspect-form select { flex: 1 1 260px; }
+  .facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; margin: 10px 0 4px; }
+  .facts dt { color: var(--muted); }
+  .facts dd { margin: 0; overflow-wrap: anywhere; }
+  h3.sub { font-size: 15px; margin: 18px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .ver { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .ops { white-space: normal; font-size: 14px; color: var(--muted); min-width: 220px; }
+  .tag.UNDER_REPLICATED { background: var(--warn-bg); color: var(--warn); }
+  .tag.MISSING { background: var(--bad-bg); color: var(--bad); }
+  .tag.SURPLUS, .tag.del { background: var(--idle-bg); color: var(--idle); }
+  .tag.incoming { background: var(--info-bg); color: var(--info); }
+  .meta-chip { display: inline-block; background: var(--idle-bg); border-radius: 6px; padding: 1px 7px; margin: 0 4px 4px 0; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -71,8 +102,31 @@
     <span class="muted" id="config">connecting&hellip;</span>
     <span class="muted" id="updated"></span>
     <a href="/app" style="font-size:15px">Open the web client →</a>
+    <span class="muted" id="account"></span>
+    <button type="button" class="secondary" id="signout" hidden>Sign out</button>
   </header>
   <div class="banner" id="banner">controller unreachable &mdash; retrying every 2 s</div>
+
+  <!-- Shown instead of the dashboard to anyone who is not signed in as the admin. -->
+  <section class="card gate" id="gate" hidden>
+    <form id="gate-signin" hidden novalidate>
+      <h2>Admin sign-in</h2>
+      <p>The dashboard shows the whole cluster, including every client's objects, so only the admin may open it.</p>
+      <label for="gate-email">Email</label>
+      <input id="gate-email" type="email" autocomplete="username" value="admin@gmail.com" required>
+      <label for="gate-password">Password</label>
+      <input id="gate-password" type="password" autocomplete="current-password" required>
+      <div class="error" id="gate-error" hidden></div>
+      <button type="submit" id="gate-submit">Sign in</button>
+    </form>
+    <div id="gate-denied" hidden>
+      <h2>Admin only</h2>
+      <p id="gate-denied-text"></p>
+      <button type="button" id="gate-switch">Sign in as the admin</button>
+    </div>
+  </section>
+
+  <div id="dash" hidden>
   <div class="banner" id="safemode">SAFE MODE &mdash; waiting for the workers' resyncs; writes are refused and nothing is repaired or deleted</div>
 
   <section class="grid kpis" id="kpis"></section>
@@ -86,10 +140,17 @@
   <h2>Workers</h2>
   <section class="grid workers" id="workers"></section>
 
-  <h2>Chunk placement of the newest object</h2>
+  <h2>Object inspector</h2>
   <section class="card">
-    <div class="muted" id="object">no objects stored yet</div>
-    <div class="scroll"><table id="placement"></table></div>
+    <form class="inspect-form" id="inspect-form">
+      <input type="text" id="object-id" placeholder="object id (empty: the newest object)" spellcheck="false" autocomplete="off"
+             aria-label="object id">
+      <button type="submit">Show</button>
+      <button type="button" class="secondary" id="newest-btn">Newest object</button>
+      <select id="recent" aria-label="recent objects"><option value="">recent objects…</option></select>
+    </form>
+    <div id="object" class="muted">no objects stored yet</div>
+    <div id="object-details"></div>
   </section>
 
   <h2>fsck <button id="fsck-button" type="button">Run fsck</button></h2>
@@ -100,6 +161,7 @@
     <table id="repairs"></table>
     <div class="empty" id="no-repairs">nothing has needed repairing yet</div>
   </section>
+  </div>
 </main>
 
 <script>
@@ -217,61 +279,252 @@ function renderStatus(status) {
   return workers;
 }
 
-function renderPlacement(object, workers) {
-  if (!object) {
-    $("object").textContent = "no objects stored yet";
-    $("placement").replaceChildren();
-    return;
-  }
+const WORKER_LETTER = {OK: "OK", CORRUPT: "C", EXCESS: "E"};
+
+/** The object inspector: everything the controller knows about one object (GET /api/v1/admin/objects/{id}). */
+function renderInspection(x) {
+  const o = x.object;
+  const degraded = Object.entries(x.chunks_by_health).some(([h, n]) => h !== "OK" && n > 0);
   $("object").replaceChildren(
-      el("b", {}, object.name), ` · ${object.size.toLocaleString()} bytes · ${object.content_type} · `,
-      el("code", {}, object.object_id), " · replication ",
-      el("span", {class: "tag " + (object.replication_ok ? "OK" : "C")}, object.replication_ok ? "OK" : "DEGRADED"));
-  const state = Object.fromEntries(workers.map((w) => [w.worker_id, w.state]));
-  const letter = {OK: "OK", CORRUPT: "C", EXCESS: "E"};
-  const header = el("tr", {}, el("th", {}, "#"), el("th", {}, "chunk"), el("th", {}, "bytes"),
-      ...workers.map((w) => el("th", {style: "text-align:center"}, w.worker_id)));
-  const rows = object.chunks.map((chunk) => {
-    const byWorker = Object.fromEntries(chunk.locations.map((l) => [l.worker_id, l]));
-    return el("tr", {},
-        el("td", {class: "num"}, chunk.index),
-        el("td", {class: "mono"}, "…" + chunk.chunk_id.slice(-12)),
-        el("td", {class: "num"}, chunk.size.toLocaleString()),
-        ...workers.map((w) => {
-          const location = byWorker[w.worker_id];
-          if (!location) return el("td", {class: "cell"}, "");
-          const short = letter[location.status] || location.status;
-          const live = state[w.worker_id] !== "DEAD";
-          return el("td", {class: "cell"}, el("span",
-              {class: "tag " + (live ? short : "down"), title: location.status + " on a " + state[w.worker_id] + " worker"},
-              short));
-        }));
-  });
-  $("placement").replaceChildren(header, ...rows);
-  if (!object.chunks.length) $("placement").replaceChildren(el("tr", {}, el("td", {class: "empty"}, "empty object: no chunks")));
+      el("b", {}, o.name), ` · ${o.owner || "no owner"} · ${o.size.toLocaleString()} bytes · ${o.content_type} · `,
+      el("code", {}, o.object_id), " · replication ",
+      el("span", {class: "tag " + (degraded ? "DEGRADED" : "OK")}, degraded ? "DEGRADED" : "OK"));
+  const metadata = Object.entries(o.custom_metadata || {});
+  const health = Object.entries(x.chunks_by_health).map(([h, n]) => el("span", {class: "tag " + h, style: "margin-right:6px"}, `${h} ${n}`));
+  const facts = el("dl", {class: "facts"},
+      el("dt", {}, "object id"), el("dd", {class: "mono"}, o.object_id),
+      el("dt", {}, "owner"), el("dd", {}, o.owner || "–"),
+      el("dt", {}, "size"), el("dd", {}, `${o.size.toLocaleString()} bytes (${bytes(o.size)}) in ${o.chunk_count} chunk(s)`),
+      el("dt", {}, "content type"), el("dd", {}, o.content_type),
+      el("dt", {}, "SHA-256"), el("dd", {class: "mono"}, o.checksum),
+      el("dt", {}, "created / updated"), el("dd", {}, `${o.created_at} / ${o.updated_at}`),
+      el("dt", {}, "custom metadata"), el("dd", {}, ...(metadata.length
+          ? metadata.map(([k, v]) => el("span", {class: "meta-chip"}, `${k} = ${v}`)) : ["none"])),
+      el("dt", {}, "chunks"), el("dd", {}, ...(health.length ? health : ["none"])),
+      el("dt", {}, "replication factor"), el("dd", {}, x.replication_factor));
+
+  // What each worker holds of this object.
+  const perWorker = el("table", {},
+      el("tr", {}, ...["worker", "state", "copies", "OK · corrupt · surplus", "bytes held", "copies on their way here", "deletes pending here"]
+          .map((h) => el("th", {}, h))),
+      ...x.workers.map((w) => el("tr", {},
+          el("td", {}, w.worker_id),
+          el("td", {}, el("span", {class: "pill " + w.state}, w.state),
+              w.resyncing ? " resyncing" : "", w.has_reported || w.state === "DEAD" ? "" : " (not reported)"),
+          el("td", {class: "num"}, w.copies),
+          el("td", {class: "num"}, `${w.ok} · ${w.corrupt} · ${w.excess}`),
+          el("td", {class: "num"}, bytes(w.bytes)),
+          el("td", {class: "num"}, w.incoming),
+          el("td", {class: "num"}, w.deleting))));
+
+  // Every chunk: its copies on every worker, and the operations pending on it.
+  const columns = x.workers.map((w) => w.worker_id);
+  const chunkTable = el("table", {},
+      el("tr", {}, el("th", {}, "#"), el("th", {}, "chunk"), el("th", {}, "bytes"), el("th", {}, "SHA-256"),
+          el("th", {}, "copies"), el("th", {}, "health"),
+          ...columns.map((id) => el("th", {style: "text-align:center"}, id)), el("th", {}, "pending operations")),
+      ...x.chunks.map((c) => {
+        const copies = Object.fromEntries(c.copies.map((k) => [k.worker_id, k]));
+        const ops = c.ops;
+        return el("tr", {},
+            el("td", {class: "num"}, c.index),
+            el("td", {class: "mono", title: c.chunk_id}, "…" + c.chunk_id.slice(-12)),
+            el("td", {class: "num"}, c.size.toLocaleString()),
+            el("td", {class: "mono", title: c.checksum}, c.checksum.slice(0, 12) + "…"),
+            el("td", {class: "num", title: "good copies (no pending corrupt delete) / live copies; " + x.replication_factor + " wanted"},
+                `${c.good} / ${c.live}`),
+            el("td", {}, el("span", {class: "tag " + c.health}, c.health), c.level ? el("span", {class: "ver"}, "level " + c.level) : ""),
+            ...columns.map((id) => {
+              const copy = copies[id];
+              const marks = [];
+              if (copy) {
+                const short = WORKER_LETTER[copy.status] || copy.status;
+                marks.push(el("span", {class: "tag " + (copy.worker_state === "DEAD" ? "down" : short),
+                    title: `${copy.status} copy on a ${copy.worker_state} worker · version ${copy.version_label} (${copy.version})` +
+                        ` · ${copy.verified ? "fresh VERIFY credit" : "no fresh VERIFY credit"}`}, short));
+                marks.push(el("span", {class: "ver"}, copy.version_label + (copy.verified ? " ✓" : "")));
+              }
+              for (const op of ops.filter((op) => op.worker_id === id)) {
+                const incoming = op.kind === "INSERT";
+                marks.push(el("span", {class: "tag " + (incoming ? "incoming" : "del"), style: "margin-top:3px",
+                    title: `${op.kind} ${op.reason} · ${op.state} · version ${op.version_label}` +
+                        (op.source ? ` · from ${op.source}` : "") + ` · attempt ${op.attempts} · ${op.age_seconds.toFixed(1)} s old`},
+                    incoming ? "↓ copy" : "✕ " + op.reason.toLowerCase()));
+              }
+              return el("td", {class: "cell"}, ...marks);
+            }),
+            el("td", {class: "ops"}, ops.length ? ops.map((op) => (op.kind === "INSERT"
+                ? `copy → ${op.worker_id}${op.source ? " from " + op.source : ""}`
+                : `delete (${op.reason.toLowerCase()}) on ${op.worker_id}`) + ` · ${op.state} · ${op.version_label}`).join("; ") : "none"));
+      }));
+  $("object-details").replaceChildren(facts,
+      el("h3", {class: "sub"}, "Copies by worker"), el("div", {class: "scroll"}, perWorker),
+      el("h3", {class: "sub"}, "Chunks"),
+      el("div", {class: "muted", style: "font-size:14px;margin-bottom:6px"},
+          "OK: a copy · C: corrupt, being quarantined · E: surplus, being deleted · its version t<term>.<n>, or \"from disk\" " +
+          "if the worker found it on disk at start-up (✓ = fresh VERIFY credit) · " +
+          "↓ copy: a copy on its way to that worker · ✕: a delete pending there. Hover for details."),
+      el("div", {class: "scroll"}, chunkTable));
+  if (!x.chunks.length) $("object-details").append(el("div", {class: "empty"}, "empty object: no chunks"));
 }
 
+/** GET with the session cookie of the web client (the same origin); errors carry the HTTP status. */
 async function getJson(path) {
   const response = await fetch(path, {cache: "no-store"});
-  if (!response.ok) throw new Error(path + " -> " + response.status);
+  if (!response.ok) {
+    let detail = "";
+    try { detail = (await response.json()).detail || ""; } catch {}
+    throw Object.assign(new Error(detail || path + " -> " + response.status), {status: response.status});
+  }
   return response.json();
 }
+
+let account = null;            // the signed-in admin
+let polling = false;
+let inspected = null;          // the object id the inspector is pinned to; null: the newest object
+
+/** POST JSON; the header is what a cookie-authenticated change must carry. */
+async function postJson(path, body) {
+  const response = await fetch(path, {method: "POST", cache: "no-store",
+      headers: {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"},
+      body: body == null ? undefined : JSON.stringify(body)});
+  if (!response.ok) {
+    let detail = "";
+    try { detail = (await response.json()).detail || ""; } catch {}
+    throw Object.assign(new Error(detail || path + " -> " + response.status), {status: response.status});
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+/** Shows the sign-in form ("signin") or the "admin only" message ("denied") instead of the dashboard. */
+function showGate(kind, text) {
+  account = null;
+  $("dash").hidden = true;
+  $("gate").hidden = false;
+  $("gate-signin").hidden = kind !== "signin";
+  $("gate-denied").hidden = kind !== "denied";
+  $("signout").hidden = kind !== "denied";
+  $("config").textContent = "";
+  $("updated").textContent = "";
+  if (kind === "denied") $("gate-denied-text").textContent = text;
+  if (kind === "signin") { $("gate-error").hidden = !text; $("gate-error").textContent = text || ""; $("gate-password").focus(); }
+}
+
+/** Who is signed in decides what the page shows; only the admin gets the dashboard. */
+async function boot() {
+  try {
+    account = await getJson("/api/v1/auth/me");
+  } catch (error) {
+    if (error.status === 401) { showGate("signin"); return; }
+    $("banner").style.display = "block";
+    setTimeout(boot, 2000);
+    return;
+  }
+  $("banner").style.display = "none";
+  if (!account.admin) {
+    const email = account.email;
+    showGate("denied", `You are signed in as ${email}, which is not the admin. The dashboard shows every ` +
+        "client's objects and the cluster's inner state, so only the admin may open it.");
+    $("account").textContent = "signed in as " + email;
+    return;
+  }
+  $("account").textContent = "signed in as " + account.email + " (admin)";
+  $("signout").hidden = false;
+  $("gate").hidden = true;
+  $("dash").hidden = false;
+  const deepLink = new URLSearchParams(location.search).get("object");
+  if (deepLink) { inspected = deepLink; $("object-id").value = deepLink; }
+  loadRecent();
+  if (!polling) { polling = true; refresh(); }
+}
+
+/** The 25 newest objects of every client, to pick one without typing its id. */
+async function loadRecent() {
+  try {
+    const page = await getJson("/api/v1/objects?limit=25");
+    const select = $("recent");
+    const chosen = select.value;
+    select.replaceChildren(el("option", {value: ""}, page.items.length ? `recent objects (${page.total} in all)…` : "no objects yet"),
+        ...page.items.map((o) => el("option", {value: o.object_id}, `${o.name} · ${o.owner || "–"} · ${o.object_id.slice(0, 8)}`)));
+    select.value = chosen;
+  } catch {}
+}
+
+async function inspect() {
+  let id = inspected;
+  if (!id) {
+    const newest = (await getJson("/api/v1/objects?limit=1")).items[0];
+    if (!newest) {
+      $("object").textContent = "no objects stored yet";
+      $("object-details").replaceChildren();
+      return;
+    }
+    id = newest.object_id;
+  }
+  try {
+    renderInspection(await getJson(`/api/v1/admin/objects/${encodeURIComponent(id)}`));
+  } catch (error) {
+    if (error.status !== 404) throw error;
+    $("object").replaceChildren("No object with the id ", el("code", {}, id), " (never stored, or deleted).");
+    $("object-details").replaceChildren();
+  }
+}
+
+function pin(id) {
+  inspected = id || null;
+  $("object-id").value = id || "";
+  const url = new URL(location.href);
+  if (id) url.searchParams.set("object", id); else url.searchParams.delete("object");
+  history.replaceState(null, "", url);
+  inspect().catch(() => {});
+}
+
+$("inspect-form").addEventListener("submit", (e) => { e.preventDefault(); pin($("object-id").value.trim()); });
+$("newest-btn").addEventListener("click", () => { $("recent").value = ""; pin(null); });
+$("recent").addEventListener("change", () => { if ($("recent").value) pin($("recent").value); });
+
+$("gate-signin").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("gate-submit").disabled = true;
+  try {
+    await postJson("/api/v1/auth/login", {email: $("gate-email").value.trim(), password: $("gate-password").value});
+    $("gate-password").value = "";
+    await boot();
+  } catch (error) {
+    $("gate-error").hidden = false;
+    $("gate-error").textContent = error.message;
+  } finally {
+    $("gate-submit").disabled = false;
+  }
+});
+$("gate-switch").addEventListener("click", async () => {
+  try { await postJson("/api/v1/auth/logout"); } catch {}
+  showGate("signin");
+});
+$("signout").addEventListener("click", async () => {
+  try { await postJson("/api/v1/auth/logout"); } catch {}
+  showGate("signin");
+});
 
 async function refresh() {
   try {
     const status = await getJson("/api/v1/cluster/status");
-    const workers = renderStatus(status);
+    renderStatus(status);
     if (polls++ % PLACEMENT_EVERY === 0) {
-      const newest = (await getJson("/api/v1/objects?limit=1")).items[0];
-      renderPlacement(newest ? await getJson(`/api/v1/objects/${newest.object_id}/metadata`).catch(() => null) : null, workers);
+      await inspect();
+      if (polls % (PLACEMENT_EVERY * 5) === 1) loadRecent();
     }
     $("banner").style.display = "none";
     $("updated").textContent = "last updated " + new Date().toLocaleTimeString();
   } catch (error) {
+    if (error.status === 401 || error.status === 403) {     // signed out, or no longer the admin
+      polling = false;
+      boot();
+      return;
+    }
     $("banner").style.display = "block";
-  } finally {
-    setTimeout(refresh, POLL_MS);
   }
+  setTimeout(refresh, POLL_MS);
 }
 
 async function runFsck() {
@@ -311,7 +564,7 @@ async function runFsck() {
 }
 
 $("fsck-button").addEventListener("click", runFsck);
-refresh();
+boot();
 </script>
 </body>
 </html>

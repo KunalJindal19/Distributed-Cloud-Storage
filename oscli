@@ -2,6 +2,8 @@
 #
 # oscli - command-line client for the object store.
 #
+#   ./oscli register alice@example.com        (once)
+#   ./oscli login alice@example.com           (the session is kept in .oscli/session)
 #   ./oscli upload report.pdf --meta owner=alice
 #   ./oscli download <object-id> out.pdf
 #   ./oscli where <object-id>
@@ -12,8 +14,11 @@
 #           The project directory is mounted there at /work, so file arguments must be paths
 #           inside the project directory (relative paths work as you would expect).
 #   local   with the JVM on this machine: java -jar client/target/client.jar (after "mvn package").
-#           Any path works. The controller address is $BASE_URL (default http://localhost:8000).
+#           Any path works. The controller address is $BASE_URL (default http://localhost:9000).
 #   auto    (default) docker if the client container is running, otherwise local.
+#
+# Accounts: "login" saves the session in .oscli/session in this directory (both modes share it).
+# OSCLI_TOKEN, or OSCLI_EMAIL with OSCLI_PASSWORD, override it (scripts use these).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -36,7 +41,11 @@ run_in_container() {
             ;;
     esac
     # Run as the calling user so downloaded files belong to them, not to the container's user.
-    exec docker exec -i --user "$(id -u):$(id -g)" --workdir "/work${here#"$ROOT"}" client oscli "$@"
+    # The project directory is /work in the container, so the session file is the same one. The
+    # credential variables are passed on only if they are set here (docker exec -e NAME).
+    exec docker exec -i --user "$(id -u):$(id -g)" --workdir "/work${here#"$ROOT"}" \
+        -e OSCLI_SESSION_FILE=/work/.oscli/session -e OSCLI_TOKEN -e OSCLI_EMAIL -e OSCLI_PASSWORD \
+        client oscli "$@"
 }
 
 run_locally() {
@@ -45,7 +54,7 @@ run_locally() {
         echo "       or start the stack with 'make up' to use the client container instead." >&2
         exit 64
     fi
-    exec java -jar "$JAR" "$@"
+    OSCLI_SESSION_FILE="$ROOT/.oscli/session" exec java -jar "$JAR" "$@"
 }
 
 case "$MODE" in

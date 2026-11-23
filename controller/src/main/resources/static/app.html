@@ -74,7 +74,7 @@
   .btn.small { padding: 4px 9px; font-size: 13px; }
   .btn.icon { padding: 6px; width: 32px; height: 32px; }
   .btn svg { width: 16px; height: 16px; flex: none; }
-  input[type=text], input[type=search], select { border: 1px solid var(--line); background: var(--surface); border-radius: 9px;
+  input[type=text], input[type=search], input[type=email], input[type=password], select { border: 1px solid var(--line); background: var(--surface); border-radius: 9px;
          padding: 7px 10px; min-width: 0; }
   input:focus-visible, select:focus-visible, .btn:focus-visible, .dropzone:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
   input.invalid { border-color: var(--bad); background: var(--bad-bg); }
@@ -185,9 +185,56 @@
   .spin { width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
           animation: spin .7s linear infinite; display: inline-block; vertical-align: -2px; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- accounts ---- */
+  body.signed-out .topbar, body.signed-out .banner, body.signed-out .layout { display: none; }
+  body:not(.signed-out) .auth-wrap { display: none; }
+  .auth-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; }
+  .auth-card { width: 100%; max-width: 400px; padding: 24px; }
+  .auth-card .brand { margin-bottom: 4px; }
+  .auth-tabs { display: flex; gap: 4px; margin: 18px 0 16px; background: var(--surface-2); border: 1px solid var(--line);
+               padding: 4px; border-radius: 10px; }
+  .auth-tabs button { flex: 1; border: 0; background: transparent; padding: 7px; border-radius: 7px; font-weight: 600;
+                      cursor: pointer; color: var(--muted); }
+  .auth-tabs button[aria-selected=true] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+  .field { display: grid; gap: 5px; margin-bottom: 12px; }
+  .field label { font-size: 13px; font-weight: 600; color: var(--muted); }
+  .field input { width: 100%; }
+  .auth-card .btn.primary { width: 100%; margin-top: 4px; }
+  .account { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); min-width: 0; }
+  .account .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .account .badge[hidden] { display: none; }   /* .badge sets display, which would beat [hidden] */
 </style>
 </head>
-<body>
+<body class="signed-out">
+
+<div class="auth-wrap">
+  <form class="card auth-card" id="auth-form" novalidate>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>
+        </svg>
+      </div>
+      <div>Object Store</div>
+    </div>
+    <div class="auth-tabs" role="tablist" aria-label="Account">
+      <button type="button" role="tab" id="tab-login" aria-selected="true">Sign in</button>
+      <button type="button" role="tab" id="tab-register" aria-selected="false">Create account</button>
+    </div>
+    <div class="field">
+      <label for="auth-email">Email</label>
+      <input id="auth-email" type="email" autocomplete="username" required maxlength="254">
+    </div>
+    <div class="field">
+      <label for="auth-password">Password</label>
+      <input id="auth-password" type="password" autocomplete="current-password" required maxlength="128">
+    </div>
+    <div class="error-text" id="auth-error" role="alert" hidden></div>
+    <button class="btn primary" id="auth-submit" type="submit">Sign in</button>
+    <p class="hint" id="auth-hint">The objects you upload are visible only to you.</p>
+  </form>
+</div>
 
 <header class="topbar">
   <div class="topbar-inner">
@@ -202,7 +249,9 @@
     <div class="spacer"></div>
     <span id="status-chip" class="chip" title="cluster status">connecting…</span>
     <span id="status-detail" class="status-detail"></span>
-    <a class="toplink" href="/dashboard" target="_blank" rel="noopener">Cluster dashboard ↗</a>
+    <a class="toplink" id="dashboard-link" href="/dashboard" target="_blank" rel="noopener" hidden>Cluster dashboard ↗</a>
+    <span class="account"><span class="who" id="account-email"></span><span id="account-admin" class="badge idle" hidden>admin</span>
+      <button class="btn small" id="signout-btn" type="button">Sign out</button></span>
   </div>
 </header>
 
@@ -345,6 +394,7 @@ const VERIFY_LIMIT = 256 * 1024 * 1024;     // hashing happens in memory: keep i
 const PREVIEW_LIMIT = 50 * 1024 * 1024;
 const KEY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const $ = (id) => document.getElementById(id);
+let me = null;              // the signed-in account: {user_id, email, admin}
 
 // ---------------------------------------------------------------- helpers
 /** Builds an element; strings become text nodes, so names and metadata can never inject HTML. */
@@ -411,10 +461,13 @@ class ApiError extends Error {
   constructor(status, code, detail) { super(detail || code || ("HTTP " + status)); this.status = status; this.code = code; this.detail = detail; }
 }
 
+/** Sent with every request: with the session cookie, a change is accepted only if it carries this header. */
+const CSRF_HEADER = {"X-Requested-With": "XMLHttpRequest"};
+
 async function api(path, options = {}) {
   let response;
   try {
-    response = await fetch(API + path, options);
+    response = await fetch(API + path, {...options, headers: {...CSRF_HEADER, ...(options.headers || {})}});
   } catch (e) {
     throw new ApiError(0, "unreachable", "the controller cannot be reached");
   }
@@ -423,6 +476,7 @@ async function api(path, options = {}) {
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = null; }
   if (!response.ok) {
+    if (response.status === 401 && me && !path.startsWith("/auth/")) showSignIn("Your session has ended. Sign in again.");
     throw new ApiError(response.status, body?.error, body?.detail || text.slice(0, 200) || response.statusText);
   }
   return body;
@@ -472,12 +526,12 @@ function confirmDialog(title, text, okLabel = "Delete") {
 let cluster = {reachable: false, writable: false, safeMode: false, rf: 2};
 
 async function refreshStatus() {
+  if (!me) return;
   const chip = $("status-chip"), detail = $("status-detail");
   try {
-    const s = await api("/cluster/status");
-    const rf = s.config?.replication_factor ?? 2;
-    const ready = s.workers.filter((w) => w.state === "ALIVE" && w.has_reported).length;
-    const total = s.workers.length;
+    const s = await api("/cluster/health");     // the summary every account may see
+    const rf = s.replication_factor ?? 2;
+    const ready = s.workers_ready, total = s.workers_total;
     cluster = {reachable: true, safeMode: s.safe_mode, rf, writable: !s.safe_mode && ready >= rf};
     let cls = "ok", label = "Healthy";
     if (s.safe_mode) { cls = "warn"; label = "Starting up (safe mode)"; }
@@ -486,12 +540,13 @@ async function refreshStatus() {
     else if (s.under_replicated > 0 || ready < total) { cls = "warn"; label = "Repairing"; }
     chip.className = "chip " + cls;
     chip.textContent = label;
-    detail.textContent = `${ready}/${total} workers · ${s.objects.toLocaleString()} objects · ${rf} copies per chunk`;
+    detail.textContent = `${ready}/${total} workers · ${s.objects.toLocaleString()} ${me?.admin ? "objects" : "of your objects"} · ${rf} copies per chunk`;
     if (s.safe_mode) showBanner("The controller is starting up and waiting for its workers. Downloads work; uploads, changes and deletes are briefly refused, and uploads are retried automatically.", "");
     else if (ready < rf) showBanner(`Only ${ready} worker(s) can take writes; ${rf} are needed for every chunk. Uploads will wait and retry.`, "bad");
     else if (s.missing_chunks > 0) showBanner(`${s.missing_chunks} chunk(s) have no live copy right now: some objects cannot be downloaded until a worker returns.`, "bad");
     else hideBanner();
   } catch (e) {
+    if (e.status === 401) return;
     cluster = {reachable: false, writable: false, safeMode: false, rf: cluster.rf};
     chip.className = "chip bad";
     chip.textContent = "Unreachable";
@@ -688,6 +743,7 @@ function uploadOnce(item, metadata) {
     item.xhr = xhr;
     xhr.open("POST", API + "/objects");
     xhr.setRequestHeader("Idempotency-Key", item.key);
+    xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
     item.state = "uploading";
     item.progress = 0;
     renderQueue();
@@ -750,7 +806,7 @@ function renderObjects() {
             h("div", {class: "file-icon", "aria-hidden": "true"}, ext.slice(0, 4)),
             h("div", {style: "min-width:0"},
                 h("div", {class: "file-name", title: o.name}, o.name),
-                h("div", {class: "file-sub"}, o.content_type || "application/octet-stream")))),
+                h("div", {class: "file-sub"}, (me?.admin && o.owner ? o.owner + " · " : "") + (o.content_type || "application/octet-stream"))))),
         h("td", {class: "num"}, bytes(o.size)),
         h("td", {class: "num"}, String(o.chunk_count)),
         h("td", {title: fullDate(o.created_at)}, when(o.created_at)),
@@ -859,6 +915,7 @@ function renderDetails(o) {
   $("d-facts").replaceChildren(
       fact("Size", `${bytes(o.size)}`, h("div", {class: "muted", style: "font-size:12.5px"}, `${o.size.toLocaleString()} bytes`)),
       fact("Content type", o.content_type),
+      fact("Owner", o.owner || "–"),
       fact("Chunks", `${o.chunk_count} × up to 1 MB`),
       fact("Replication", h("span", {class: "badge " + (o.replication_ok ? "ok" : "warn")}, o.replication_ok ? "every chunk has 2 copies" : "repairing")),
       fact("Created", fullDate(o.created_at)),
@@ -970,14 +1027,87 @@ $("d-verify").addEventListener("click", async () => {
   }
 });
 
+// ---------------------------------------------------------------- accounts
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  $("tab-login").setAttribute("aria-selected", String(mode === "login"));
+  $("tab-register").setAttribute("aria-selected", String(mode === "register"));
+  $("auth-submit").textContent = mode === "login" ? "Sign in" : "Create account";
+  $("auth-password").setAttribute("autocomplete", mode === "login" ? "current-password" : "new-password");
+  $("auth-hint").textContent = mode === "login" ? "The objects you upload are visible only to you."
+      : "Use at least 8 characters for the password.";
+  $("auth-error").hidden = true;
+}
+
+function showSignIn(message) {
+  me = null;
+  document.body.classList.add("signed-out");
+  if ($("details").open) $("details").close();
+  listState.items = []; listState.offset = 0;
+  $("rows").replaceChildren();
+  $("auth-error").hidden = !message;
+  $("auth-error").textContent = message || "";
+  $("auth-email").focus();
+}
+
+async function start() {
+  try {
+    me = await api("/auth/me");
+  } catch (e) {
+    showSignIn(e.status === 401 ? "" : "The object store cannot be reached: " + describe(e));
+    return;
+  }
+  document.body.classList.remove("signed-out");
+  $("account-email").textContent = me.email;
+  $("account-email").title = me.admin ? "The admin sees and may change every object" : "Signed in";
+  $("account-admin").hidden = !me.admin;
+  $("dashboard-link").hidden = !me.admin;       // the dashboard is the admin's
+  refreshStatus();
+  loadObjects();
+  const deepLink = new URLSearchParams(location.search).get("object");
+  if (deepLink) openDetails(deepLink);
+}
+
+$("tab-login").addEventListener("click", () => setAuthMode("login"));
+$("tab-register").addEventListener("click", () => setAuthMode("register"));
+$("auth-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const email = $("auth-email").value.trim(), password = $("auth-password").value;
+  if (!email || !password) {
+    $("auth-error").hidden = false;
+    $("auth-error").textContent = "Enter your email and password.";
+    return;
+  }
+  const button = $("auth-submit"), label = button.textContent;
+  button.disabled = true;
+  button.replaceChildren(h("span", {class: "spin"}), " " + label);
+  const body = {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({email, password})};
+  try {
+    if (authMode === "register") await api("/auth/register", body);
+    await api("/auth/login", body);          // sets the HttpOnly session cookie
+    $("auth-password").value = "";
+    setAuthMode("login");
+    await start();
+  } catch (err) {
+    $("auth-error").hidden = false;
+    $("auth-error").textContent = describe(err);
+  } finally {
+    button.disabled = false;
+    button.textContent = authMode === "login" ? "Sign in" : "Create account";
+  }
+});
+$("signout-btn").addEventListener("click", async () => {
+  try { await api("/auth/logout", {method: "POST"}); } catch {}
+  showSignIn("");
+});
+
 // ---------------------------------------------------------------- start
 uploadMeta.addRow();
 renderQueue();
-refreshStatus();
-loadObjects();
 setInterval(refreshStatus, 10_000);
-const deepLink = new URLSearchParams(location.search).get("object");
-if (deepLink) openDetails(deepLink);
+start();
 </script>
 </body>
 </html>

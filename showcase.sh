@@ -21,13 +21,13 @@
 #   ./showcase.sh               guided, pauses before each step
 #   ./showcase.sh --no-pause    runs straight through
 #
-# Needs: bash, docker, curl, python3. Environment: BASE_URL (default http://localhost:8000),
-# VICTIM (the worker to stop, default worker2).
+# Needs: bash, docker, curl, python3. Environment: BASE_URL (default http://localhost:$CONTROLLER_PORT, i.e. 9000),
+# VICTIM (the worker to stop, default worker2), ADMIN_EMAIL / ADMIN_PASSWORD (the admin account).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-BASE_URL="${BASE_URL:-http://localhost:8000}"
+BASE_URL="${BASE_URL:-http://localhost:${CONTROLLER_PORT:-9000}}"
 API="$BASE_URL/api/v1"
 VICTIM="${VICTIM:-worker2}"
 WORK=".demo/showcase"
@@ -36,6 +36,14 @@ PAUSE=1
 [ "${1:-}" = "--no-pause" ] && PAUSE=0
 [ -t 0 ] || PAUSE=0
 export BASE_URL
+# Every request is made as the admin account, which sees every object: curl reads $CURL_HOME/.curlrc,
+# ./oscli reads OSCLI_EMAIL and OSCLI_PASSWORD (README "Accounts").
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@gmail.com}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
+export OSCLI_EMAIL="$ADMIN_EMAIL" OSCLI_PASSWORD="$ADMIN_PASSWORD"
+export CURL_HOME="$PWD/.demo/curl"
+mkdir -p "$CURL_HOME"
+printf 'user = "%s:%s"\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" > "$CURL_HOME/.curlrc"
 
 for tool in docker curl python3; do
     command -v "$tool" > /dev/null 2>&1 || { echo "showcase.sh needs '$tool' on the PATH" >&2; exit 2; }
@@ -201,7 +209,7 @@ WAIT_FOR=repaired
 if [ "$BEFORE" -gt 100 ]; then
     WAIT_FOR=repaired-files
     tip "Re-copying all $BEFORE copies at the configured rate (MAX_STREAMS=2 copies in flight per source,"
-    tip "a planner tick every 3 s) takes about $((BEFORE / 80 + 1)) minutes, so this step goes on once the"
+    tip "a planner tick every MONITOR_INTERVAL seconds) takes about $((BEFORE / 80 + 1)) minutes, so this step goes on once the"
     tip "showcase files have two live copies again; the rest keeps being copied in the background."
 fi
 SINCE=$(now)

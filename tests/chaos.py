@@ -23,11 +23,12 @@ request when orphan GC becomes allowed.
 
 Standard library only. Usage:
     python3 tests/chaos.py [--minutes 5] [--keep-stack] [--no-fresh]
-Environment: CHAOS_MINUTES, BASE_URL (default http://localhost:8000).
+Environment: CHAOS_MINUTES, BASE_URL (default http://localhost:$CONTROLLER_PORT, i.e. 9000).
 """
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import http.client as httplib
 import json
@@ -44,8 +45,11 @@ import uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if not os.path.exists(os.path.join(ROOT, "docker-compose.yml")) and os.path.exists("docker-compose.yml"):
     ROOT = os.getcwd()  # run from a copy outside the repository: use the current directory
-BASE = os.environ.get("BASE_URL", "http://localhost:8000")
+BASE = os.environ.get("BASE_URL", "http://localhost:" + os.environ.get("CONTROLLER_PORT", "9000"))
 API = BASE + "/api/v1"
+# Every request is made as the admin account (README "Accounts").
+AUTH = "Basic " + base64.b64encode("{}:{}".format(
+    os.environ.get("ADMIN_EMAIL", "admin@gmail.com"), os.environ.get("ADMIN_PASSWORD", "admin123")).encode()).decode()
 WORKERS = ["worker1", "worker2", "worker3", "worker4"]
 NETWORK = os.environ.get("COMPOSE_PROJECT_NAME", "objectstore") + "_objectstore-net"  # follows the Compose project
 COMPOSE = ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.chaos.yml"]
@@ -76,7 +80,7 @@ def problem(message):
 def http(method, url, body=None, headers=None, timeout=60):
     """Returns (status, headers, body bytes). Raises OSError on any transport failure, including a
     body cut off mid-stream (http.client reports that as IncompleteRead, not as an OSError)."""
-    request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    request = urllib.request.Request(url, data=body, method=method, headers={"Authorization": AUTH, **(headers or {})})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, dict(response.headers), response.read()

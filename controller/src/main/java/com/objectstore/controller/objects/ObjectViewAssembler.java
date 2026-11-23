@@ -4,6 +4,7 @@ import com.objectstore.controller.api.dto.ChunkResponse;
 import com.objectstore.controller.api.dto.LocationResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
 import com.objectstore.controller.api.dto.ObjectSummary;
+import com.objectstore.controller.auth.AccountService;
 import com.objectstore.controller.cluster.ClusterState;
 import com.objectstore.controller.cluster.ClusterState.WorkerInfo;
 import com.objectstore.controller.config.ControllerProperties;
@@ -25,18 +26,21 @@ public class ObjectViewAssembler {
     private final ChunkRepository chunks;
     private final ClusterState cluster;
     private final ControllerProperties properties;
+    private final AccountService accounts;
 
     public ObjectViewAssembler(ObjectRepository objects, ChunkRepository chunks, ClusterState cluster,
-                               ControllerProperties properties) {
+                               ControllerProperties properties, AccountService accounts) {
         this.objects = objects;
         this.chunks = chunks;
         this.cluster = cluster;
         this.properties = properties;
+        this.accounts = accounts;
     }
 
     public ObjectResponse describe(StoredObject object) {
         List<Chunk> chunkRows = chunks.findChunksByObject(object.objectId());
         Map<String, String> metadata = objects.metadataOf(object.objectId());
+        String owner = accounts.emailOf(object.ownerId());
         return cluster.read(() -> {
             boolean replicationOk = true;
             List<ChunkResponse> views = new ArrayList<>();
@@ -51,14 +55,15 @@ public class ObjectViewAssembler {
                 views.add(new ChunkResponse(chunk.chunkId(), chunk.index(), chunk.size(), chunk.checksum(), locations));
             }
             return new ObjectResponse(
-                    object.objectId(), object.name(), object.size(), object.contentType(), object.checksum(),
+                    object.objectId(), object.name(), owner, object.size(), object.contentType(), object.checksum(),
                     object.chunkCount(), Timestamps.format(object.createdAt()), Timestamps.format(object.updatedAt()),
                     replicationOk, metadata, views);
         });
     }
 
     public ObjectSummary summarise(StoredObject object) {
-        return new ObjectSummary(object.objectId(), object.name(), object.size(), object.contentType(),
+        return new ObjectSummary(object.objectId(), object.name(), accounts.emailOf(object.ownerId()), object.size(),
+                object.contentType(),
                 object.chunkCount(), Timestamps.format(object.createdAt()), Timestamps.format(object.updatedAt()));
     }
 }

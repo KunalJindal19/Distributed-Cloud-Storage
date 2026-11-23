@@ -73,9 +73,13 @@ already published. Commit the bumped `docker-compose.yml`, so anyone who pulls t
 images. `OBJECTSTORE_REPO` and `OBJECTSTORE_VERSION` can also be set in the environment to use other
 images.
 
-Then open the dashboard at <http://localhost:8000/dashboard>, or store something yourself:
+Then sign in to the web client at <http://localhost:9000/app>: create an account, or use the admin
+account `admin@gmail.com` / `admin123` (change it with `ADMIN_PASSWORD`, see [Accounts](#accounts)).
+Or store something yourself:
 
 ```bash
+./oscli register alice@example.com                       # once; asks for a password (8+ characters)
+./oscli login alice@example.com                          # the session is kept in .oscli/session
 ./oscli upload samples/sample.jpg --meta owner=alice     # prints the new object, including its id
 ./oscli where  <object-id>                               # which workers hold which chunk
 ./oscli download <object-id> .demo/copy.jpg              # verifies the checksum while downloading
@@ -98,13 +102,13 @@ make fsck                                                # end-to-end consistenc
 | `make quarantine W=worker2` | list the copies a worker has quarantined |
 | `make demo` | the seven demonstrations, self-checking (about 2 minutes) |
 | `make showcase` | a guided tour of the inner state: messages, chunk placement, `worker2` stopped and started ([below](#showcase-the-inner-state-on-the-console)) |
-| `make app` | open the web client, <http://localhost:8000/app> |
-| `make test` | 233 unit and in-process system tests (local Maven, or a Maven container) |
+| `make app` | open the web client, <http://localhost:9000/app> |
+| `make test` | 310 unit and in-process system tests (local Maven, or a Maven container) |
 | `make test-scale` | the scale test: 500,000 chunks, 8 workers, no HTTP (about a minute) |
 | `make scenarios` | the acceptance-criteria scripts against Docker (about 15 minutes; wipes data) |
 | `make chaos` | the chaos test: 5 minutes of load and disruption with network faults, then convergence checks |
 
-If port 8000 is taken: `CONTROLLER_PORT=9000 make up` and `BASE=http://localhost:9000 make demo`.
+The controller is published on port 9000. If that port is taken, choose another one for everything at once: `CONTROLLER_PORT=8080 make up`, then `CONTROLLER_PORT=8080 make demo` (the Makefile and the scripts follow `CONTROLLER_PORT`).
 
 ---
 
@@ -117,7 +121,7 @@ flowchart LR
     end
 
     subgraph net["Docker network objectstore-net"]
-        subgraph ctrl["controller :8000 (NameNode) - the only published port"]
+        subgraph ctrl["controller :8000, published as localhost:9000 (NameNode) - the only published port"]
             API["public REST API"]
             NS[("namespace: SQLite<br/>objects, metadata, chunks,<br/>cluster id, idempotency keys")]
             RX["receipt step (brief write lock):<br/>accept, liveness, filter changes,<br/>queue work, take commands, acks"]
@@ -219,11 +223,40 @@ until the controller acknowledges it. It knows nothing about objects.
 | Client → DN1 → DN2 write pipeline | The assignment requires that clients never see workers. The controller acts as the HDFS client and writes both copies in parallel. |
 | Leases, append, per-block generation stamps | Chunks are **immutable and never reused** (ids embed a fresh UUID), so their *contents* have no versions. What can go stale are the *operations* on them (a delayed DELETE, a late copy): those carry versions. |
 | NameNode high availability (standby, journal nodes, ZooKeeper failover) | The assignment fixes one controller. We guarantee no loss and automatic recovery, not availability while it is down. |
-| Balancer, erasure coding, storage policies, security | Out of scope. |
+| Balancer, erasure coding, storage policies, Kerberos security | Out of scope (client accounts with per-owner access exist, [Accounts](#accounts)). |
 
 ---
 
 ## Using the system
+
+### Accounts
+
+Clients register with an email and a password, and every request to `/api/v1` is made with an
+account. **An object belongs to the account that uploaded it**: no other client can list, download,
+read, change or delete it; for them it does not exist (`404`, exactly like an object id that was
+never used). One account is the **admin**, `ADMIN_EMAIL` (default `admin@gmail.com`): it sees and may
+change every object (the listing shows each object's `owner`), and it alone may open the
+[dashboard](#dashboard), read the cluster's inner state (`/api/v1/cluster/status`, `/api/v1/admin/**`)
+and run `fsck`; clients get a summary (`/api/v1/cluster/health`). Its password is `ADMIN_PASSWORD` (Compose default `admin123`), applied at every start-up;
+objects stored before accounts existed belong to it.
+
+This is a layer on the public API only. The worker protocol (`/internal/**`), chunk ids, placement,
+replication and repair are unchanged and know nothing about accounts.
+
+| How a request says who it is | Used by |
+|---|---|
+| `Authorization: Bearer <token>`, the token from `POST /api/v1/auth/login` | the CLI (`oscli login`) |
+| `Authorization: Basic <email:password>` on every request | scripts, `curl -u` |
+| the `os_session` cookie set by the sign-in (HttpOnly, SameSite=Strict) | the web client and the dashboard |
+
+- Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes; session tokens are 256-bit random values
+  of which only the SHA-256 is stored. Sessions last `SESSION_HOURS` (default 168); `logout` ends one.
+- A request authenticated by the cookie that changes something (upload, patch, delete, sign-out)
+  must also carry `X-Requested-With`, which a page on another site cannot add, so another site
+  cannot make your browser delete your objects.
+- `Idempotency-Key`s belong to the account: two clients using the same key get two objects.
+- No TLS: like the rest of the system, this assumes the network between the clients and the
+  controller is trusted (see [Failure model](#failure-model)).
 
 ### With the CLI
 
@@ -235,15 +268,25 @@ the project directory is mounted there, so **file arguments must be paths inside
 ```text
 Usage: oscli [--base URL] <command> [arguments]
 
+  register EMAIL [PASSWORD]  create an account (asks for the password if not given)
+  login EMAIL [PASSWORD]     sign in; the session is kept for the next commands
+  logout                     end the session
+  whoami                     the signed-in account
+
   upload PATH [--name NAME] [--type MIME] [--key KEY] [--meta key=value ...]
   download ID OUT_PATH      fetch an object and verify it against its checksum
   meta ID                   show system + custom metadata and chunk locations
   patch ID [key=value ...] [--remove key ...]
-  list [--limit N] [--offset N]
+  list [--limit N] [--offset N]       your objects (the admin: every object)
   delete ID
   where ID                  table: which workers hold each chunk
-  status                    cluster overview (workers, replication health, repairs)
+  health                    can the cluster take writes; is any data unavailable
+  status                    cluster overview (workers, replication health, repairs; the admin only)
 ```
+
+`login` saves the session token in `.oscli/session` (both modes share it; `OSCLI_SESSION_FILE`
+moves it). `OSCLI_TOKEN`, or `OSCLI_EMAIL` with `OSCLI_PASSWORD`, take precedence; the scripts use
+the latter with the admin account.
 
 The client is built for an unreliable service: every upload carries an `Idempotency-Key` (random,
 or `--key`), and connection errors and 503 answers (safe mode, too few workers, a chunk briefly
@@ -256,7 +299,10 @@ verified against the `ETag`. Exit codes: `0` success · `1` the server answered 
 ### With curl
 
 ```bash
-API=http://localhost:8000/api/v1
+API=http://localhost:9000/api/v1
+curl -X POST -H 'Content-Type: application/json' -d '{"email":"alice@example.com","password":"alice-password"}' $API/auth/register  # 201
+export CURL_HOME=$PWD/.demo/curl-alice; mkdir -p $CURL_HOME                 # every curl below signs in as alice:
+echo 'user = "alice@example.com:alice-password"' > $CURL_HOME/.curlrc      # (or add -u alice@example.com:... to each)
 curl -H "Idempotency-Key: my-upload-1" -F "file=@report.pdf" -F 'metadata={"owner":"alice"}' $API/objects   # 201
 curl -o report.pdf $API/objects/$ID                                         # 200, the original bytes
 curl $API/objects/$ID/metadata                                              # 200, system + custom metadata
@@ -264,14 +310,20 @@ curl -X PATCH -H 'Content-Type: application/json' -d '{"owner":"team","old":null
 curl "$API/objects?limit=50&offset=0"                                       # 200, newest first
 curl -X DELETE $API/objects/$ID                                             # 204
 curl $API/cluster/status                                                    # 200, the cluster at a glance
-curl $API/fsck                                                              # 200, consistency check
+curl $API/fsck                                                              # 403: the admin only
+curl -X POST -H 'Content-Type: application/json' -d '{"email":"alice@example.com","password":"alice-password"}' $API/auth/login
+                                                                            # 200, {"token": ..., "expires_at": ..., "account": ...}
+curl -H "Authorization: Bearer $TOKEN" $API/auth/me                         # 200, the signed-in account
 ```
 
 ### Web client
 
-<http://localhost:8000/app> (also `http://localhost:8000/`, or `make app`) is the object store for
+<http://localhost:9000/app> (also `http://localhost:9000/`, or `make app`) is the object store for
 people: a single page served by the controller on top of the REST API below, so it needs nothing
 else.
+
+- **Sign in or create an account** first. The page then shows only your objects (the admin sees
+  everyone's, with their owner) and your email with a **Sign out** button in the top bar.
 
 - **Upload** several files at once by dropping them or choosing them, with optional custom metadata
   for the batch. Each file shows its progress, then "storing two copies of every chunk…" until the
@@ -294,31 +346,60 @@ Names and metadata are always inserted as text, never as HTML.
 
 ### Dashboard
 
-<http://localhost:8000/dashboard> polls the status every 0.5 s (the chunk grid every 2 s; a 2 s poll ran in step with the 2 s heartbeats and made "last heartbeat" look frozen): a safe-mode banner; KPIs (objects,
+<http://localhost:9000/dashboard> is **for the admin only**: it shows the whole cluster, including
+every client's objects. Anyone else gets a sign-in form (signed out) or an "admin only" page (signed
+in as a client), and its data endpoints answer `403`. The sign-in is shared with the web client.
+
+It polls the status every 0.5 s (a 2 s poll ran in step with the 2 s heartbeats and made "last
+heartbeat" look frozen): a safe-mode banner; KPIs (objects,
 chunks, copies, under-replicated, copies on their way, missing chunks, corrupt and excess copies,
 invariant violations); worker cards (ALIVE green, STALE amber, DEAD red; process id, last
 heartbeat, copies, free space, queued commands, copies being sent, fence and resync attempt,
 quarantined copies, tombstones, pending ops); a **pending operations, resyncs and VERIFY** panel
 (ops by reason and state, VERIFYs outstanding, workers resyncing, term and highest version); the
-chunk-by-worker grid of the newest object (`OK`, `C` quarantine pending, `E` surplus delete
-pending); an **fsck** button with its chunk and worker findings; and the monitor's last 20 events.
+**object inspector**; an **fsck** button with its chunk and worker findings; and the monitor's last
+20 events.
+
+The **object inspector** shows any object, whoever owns it: type or paste its id (or pick one of the
+25 newest from the list; empty = the newest object; `/dashboard?object=<id>` links to it). It is
+refreshed every 2 s and shows
+
+- the object: id, owner, size, content type, SHA-256, times, custom metadata, and how many chunks
+  are OK, under-replicated, surplus or missing;
+- **copies by worker**: each worker's state, how many copies of the object's chunks it holds (OK,
+  corrupt, surplus), the bytes, and the copies on their way to it and the deletes pending on it;
+- **every chunk**: id, size, checksum, good/live copies, health and priority level, and one column
+  per worker with the copy's state (`OK`, `C` corrupt and being quarantined, `E` surplus being
+  deleted, grey on a DEAD worker), its version (`t<term>.<n>`, or "from disk" for a copy the worker
+  found on disk at start-up; ✓ = fresh VERIFY credit), a copy on its way there (`↓ copy`, with its
+  source, state and attempt) or a delete pending there (`✕ reason`). Hover over a mark for details.
+
+The data comes from `GET /api/v1/admin/objects/{object_id}` (the admin only).
 
 ---
 
 ## Client REST API
 
-Base path `/api/v1`. Structured data is JSON with `snake_case` keys; object data is binary.
+Base path `/api/v1`. Structured data is JSON with `snake_case` keys; object data is binary. Every
+endpoint except `register` and `login` needs an account ([Accounts](#accounts)); the object
+endpoints only reach the caller's own objects (the admin's: all of them).
 
 | Method | Endpoint | Purpose | Success |
 |---|---|---|---|
+| `POST` | `/api/v1/auth/register` | Create an account: `{"email", "password"}` | `201` |
+| `POST` | `/api/v1/auth/login` | Sign in: the session token (and cookie) | `200` |
+| `POST` | `/api/v1/auth/logout` | End the session | `204` |
+| `GET` | `/api/v1/auth/me` | The signed-in account | `200` |
 | `POST` | `/api/v1/objects` | Upload an object | `201` (`200` for an idempotent replay) |
 | `GET` | `/api/v1/objects/{object_id}` | Download an object | `200` |
 | `GET` | `/api/v1/objects/{object_id}/metadata` | Retrieve metadata | `200` |
 | `PATCH` | `/api/v1/objects/{object_id}/metadata` | Update custom metadata | `200` |
 | `DELETE` | `/api/v1/objects/{object_id}` | Delete an object | `204` |
 | `GET` | `/api/v1/objects` | List stored objects | `200` |
-| `GET` | `/api/v1/cluster/status` | Cluster overview *(extra)* | `200` |
-| `GET` | `/api/v1/fsck` | Consistency check *(extra)* | `200` |
+| `GET` | `/api/v1/cluster/health` | Can the cluster take writes; is data unavailable; the caller's object count *(extra)* | `200` |
+| `GET` | `/api/v1/cluster/status` | Cluster overview *(extra; the admin only)* | `200` |
+| `GET` | `/api/v1/admin/objects/{object_id}` | Any object with every copy, version and pending operation *(extra; the admin only)* | `200` |
+| `GET` | `/api/v1/fsck` | Consistency check *(extra; the admin only)* | `200` |
 | `GET` | `/health`, `/dashboard`, `/app` | Liveness probe, dashboard page, web client *(extra)*; `/` redirects to `/app` | `200` |
 
 ### Upload — `POST /api/v1/objects`
@@ -400,9 +481,11 @@ Every error is JSON: `{"error": "<code>", "detail": "<sentence>"}`.
 | `200` | download, metadata, list, status, fsck; an idempotent upload replay | |
 | `201` | object created | |
 | `204` | object deleted | |
-| `400` | no `file` part, not multipart, bad `limit`/`offset`, invalid metadata, bad `Idempotency-Key` | `bad_request`, `invalid_metadata` |
-| `404` | object not found; unknown route | `object_not_found`, `not_found` |
-| `409` | an `Idempotency-Key` reused for a file of a different size | `conflict` |
+| `400` | no `file` part, not multipart, bad `limit`/`offset`, invalid metadata, bad `Idempotency-Key`, invalid email or password at registration | `bad_request`, `invalid_metadata` |
+| `401` | no credentials, an expired or signed-out session (with `WWW-Authenticate: Bearer`); a wrong email or password | `unauthorized`, `invalid_credentials` |
+| `403` | cluster status, fsck or `/api/v1/admin/**` by an account that is not the admin; a cookie-authenticated change without `X-Requested-With` | `forbidden` |
+| `404` | object not found, or owned by another account; unknown route | `object_not_found`, `not_found` |
+| `409` | an `Idempotency-Key` reused for a file of a different size; an email that already has an account | `conflict`, `email_taken` |
 | `500` | unexpected server error (stack trace in the log only) | `internal_error` |
 | `503` | safe mode (with `Retry-After: 5`), too few writable workers, a chunk that could not be stored twice, a chunk with no readable copy | `safe_mode`, `insufficient_workers`, `upload_failed`, `chunk_unavailable` |
 
@@ -410,6 +493,9 @@ Also used where they are the precise answer: `405 method_not_allowed`, `413 payl
 `415 unsupported_media_type`.
 
 ### Cluster status — `GET /api/v1/cluster/status`
+
+The admin only (clients: `GET /api/v1/cluster/health` gives `safe_mode`, `workers_ready`,
+`workers_total`, `replication_factor`, `missing_chunks`, `under_replicated` and their own `objects`).
 
 `safe_mode`, `cluster_id`, `config{…, op_resend_initial, resync_interval}`; per worker `state`,
 `boot_id` (8 chars), `has_reported`, `last_seen_s_ago`, `chunk_count`, `queued_commands`,
@@ -713,6 +799,9 @@ Everything is an environment variable, set in [`docker-compose.yml`](docker-comp
 | `RESYNC_STALL_TIMEOUT` | 60 | controller | no segment progress for this long → the next report attempt |
 | `VERIFY_FRESH_FOR_DELETE` | 3600 | controller | how recent a survivor's VERIFY must be before a surplus copy is deleted |
 | `VERIFY_RESEND` | 60 | controller | minimum gap between VERIFYs of one copy |
+| `ADMIN_EMAIL` | admin@gmail.com | controller | the one admin account: sees every object, may run fsck |
+| `ADMIN_PASSWORD` | admin123 (Compose; empty in `controller.yml`: a random one, logged) | controller | the admin's password, applied at every start-up; the Makefile and the scripts read it too |
+| `SESSION_HOURS` | 168 | controller | how long a sign-in session lasts |
 | `DIRECT_OBJECT_DELETES` | true | controller | a client's object delete sends its chunk deletes straight to the holders (`DELETE /internal/chunks/{id}`); `false`: heartbeat replies only |
 | `TARGET_BACKOFF` | 30 | controller | after a failed copy, avoid that (chunk, target) pair for this long |
 | `MAX_STREAMS` | 2 | controller | copies in flight per source worker |
@@ -797,7 +886,7 @@ fence, fail-stop), `[scanner]`, `[diskcheck]`,
 
 Nothing in the script waits for a fixed time: every wait polls until the expected state is reached.
 The sections below show what each demonstration does and how to do it by hand
-(`API=http://localhost:8000/api/v1`, scratch files in `.demo/`).
+(`API=http://localhost:9000/api/v1`, scratch files in `.demo/`).
 
 ### 1. Object storage
 
@@ -1828,7 +1917,8 @@ millisecond timestamps (an update in the same second must show a later `updated_
 - **NameNode high availability**: a standby controller with a shared edit log.
 - **Balancer**: move existing chunks to new or empty workers.
 - Streaming multipart parsing, so an upload does not need to be spooled to the controller's disk.
-- A separate listener for the internal endpoints, and authentication.
+- A separate listener for the internal endpoints, and authentication between the controller and the
+  workers (client accounts exist; the worker protocol trusts the network). TLS for the public API.
 - Upload intents and deletion tombstones are kept for ever; they could be pruned once no worker
   reports chunks of them any more.
 - A hard bound on worker tombstones (today a soft bound: too many → a resync).
@@ -1894,7 +1984,7 @@ Module names from the specification: `cluster.py` → `ClusterState` · `registr
 
 | Symptom | Cause and fix |
 |---|---|
-| `make up` fails with "port is already allocated" | Port 8000 is in use: `CONTROLLER_PORT=9000 make up`, and `BASE=http://localhost:9000` for `make status` / `make demo`. |
+| `make up` fails with "port is already allocated" | Port 9000 is in use: `CONTROLLER_PORT=8080 make up`, and `CONTROLLER_PORT=8080` for `make status` / `make demo` (or `export CONTROLLER_PORT=8080`). |
 | Writes answer `503 safe_mode` | The controller started less than ~10 s ago and is waiting for the workers' resyncs. Retry (`oscli` does). |
 | Workers log `cluster_id_mismatch` and the controller shows no workers | The controller's database was wiped or replaced. The workers protect their data on purpose. To start over: `make down-v && make up`. |
 | A worker is unhealthy with `misconfigured` | Its volume belongs to another worker (`/data/VERSION`). Mount the right volume. |

@@ -78,6 +78,12 @@ objectstore:
   # A client's object delete sends its chunk deletes straight to the holders (DELETE /internal/chunks/{id})
   # instead of waiting for their heartbeats; heartbeat replies remain the fallback. false: replies only.
   direct-object-deletes: ${DIRECT_OBJECT_DELETES:true}
+  # Client accounts (public API only). The admin sees every object; its password is applied at every
+  # start-up (empty: a random one is generated and logged).
+  auth:
+    admin-email: ${ADMIN_EMAIL:admin@gmail.com}
+    admin-password: ${ADMIN_PASSWORD:}
+    session-hours: ${SESSION_HOURS:168}
   # Showcase output (docker-compose.showcase.yml): every message to and from the workers, and the
   # cluster state every N seconds. Off by default.
   trace-messages: ${TRACE_MESSAGES:off}

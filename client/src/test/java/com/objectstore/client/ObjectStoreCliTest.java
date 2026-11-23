@@ -51,6 +51,8 @@ class ObjectStoreCliTest {
     private volatile double retrySeconds = 0;
     private final java.util.concurrent.atomic.AtomicInteger unavailableAnswers = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.List<String> idempotencyKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final AtomicReference<String> lastAuthorization = new AtomicReference<>();
+    private final java.util.Map<String, String> environment = new java.util.HashMap<>();
 
     @BeforeEach
     void startStubController() throws IOException {
@@ -63,6 +65,46 @@ class ObjectStoreCliTest {
     @AfterEach
     void stopStubController() {
         server.stop(0);
+    }
+
+    @Test
+    void loginKeepsTheSessionForLaterCommandsAndLogoutEndsIt() throws Exception {
+        Path session = dir.resolve("conf/session");
+        environment.put("OSCLI_SESSION_FILE", session.toString());
+
+        assertThat(run("login", "alice@example.com", "secret-password")).isZero();
+        assertThat(lastRequest.get()).isEqualTo("POST /api/v1/auth/login");
+        assertThat(new String(lastBody.get(), StandardCharsets.UTF_8))
+                .isEqualTo("{\"email\":\"alice@example.com\",\"password\":\"secret-password\"}");
+        assertThat(Files.readString(session).trim()).isEqualTo("tok-123");
+        assertThat(stdout.toString()).contains("\"email\" : \"alice@example.com\"").doesNotContain("tok-123");
+
+        assertThat(run("list")).isZero();
+        assertThat(lastAuthorization.get()).isEqualTo("Bearer tok-123");
+
+        assertThat(run("logout")).isZero();
+        assertThat(lastRequest.get()).isEqualTo("POST /api/v1/auth/logout");
+        assertThat(lastAuthorization.get()).isEqualTo("Bearer tok-123");
+        assertThat(session).doesNotExist();
+    }
+
+    @Test
+    void emailAndPasswordFromTheEnvironmentAreSentWithEveryRequest() throws Exception {
+        environment.put("OSCLI_EMAIL", "bob@example.com");
+        environment.put("OSCLI_PASSWORD", "pw:with:colons");
+
+        assertThat(run("list")).isZero();
+
+        assertThat(lastAuthorization.get()).isEqualTo("Basic " + java.util.Base64.getEncoder()
+                .encodeToString("bob@example.com:pw:with:colons".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void withoutCredentialsTheErrorSuggestsSigningIn() throws Exception {
+        assertThat(run("whoami")).isEqualTo(1);
+
+        assertThat(lastAuthorization.get()).isNull();
+        assertThat(stderr.toString()).contains("unauthorized").contains("oscli login EMAIL");
     }
 
     @Test
@@ -230,7 +272,9 @@ class ObjectStoreCliTest {
         withBase[0] = "--base";
         withBase[1] = base;
         System.arraycopy(args, 0, withBase, 2, args.length);
-        return new ObjectStoreCli(new PrintStream(stdout), new PrintStream(stderr), null, retrySeconds).run(withBase);
+        environment.putIfAbsent("OSCLI_SESSION_FILE", dir.resolve("no-session").toString());
+        return new ObjectStoreCli(new PrintStream(stdout), new PrintStream(stderr), null, retrySeconds, environment)
+                .run(withBase);
     }
 
     private void handle(HttpExchange exchange) throws IOException {
@@ -240,6 +284,7 @@ class ObjectStoreCliTest {
             lastRequest.set(method + " " + target);
             lastContentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
             lastBody.set(exchange.getRequestBody().readAllBytes());
+            lastAuthorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
             String key = exchange.getRequestHeaders().getFirst("Idempotency-Key");
             if (key != null) {
                 idempotencyKeys.add(key);
@@ -250,7 +295,14 @@ class ObjectStoreCliTest {
                 return;
             }
 
-            if (target.contains("00000000-0000-0000-0000-000000000000")) {
+            if (target.equals("/api/v1/auth/login")) {
+                respond(exchange, 200, "{\"token\":\"tok-123\",\"token_type\":\"Bearer\",\"expires_at\":\"t\","
+                        + "\"account\":{\"user_id\":\"u1\",\"email\":\"alice@example.com\",\"admin\":false}}");
+            } else if (target.equals("/api/v1/auth/logout")) {
+                exchange.sendResponseHeaders(204, -1);
+            } else if (target.equals("/api/v1/auth/me") && lastAuthorization.get() == null) {
+                respond(exchange, 401, "{\"error\":\"unauthorized\",\"detail\":\"sign in first\"}");
+            } else if (target.contains("00000000-0000-0000-0000-000000000000")) {
                 respond(exchange, 404, "{\"error\":\"object_not_found\",\"detail\":\"no such object\"}");
             } else if (method.equals("POST")) {
                 respond(exchange, 201, OBJECT_JSON);

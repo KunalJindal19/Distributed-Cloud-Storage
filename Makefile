@@ -1,5 +1,15 @@
 SHELL := /bin/bash
-BASE  ?= http://localhost:8000
+# The controller's port on this machine: docker-compose.yml publishes it as ${CONTROLLER_PORT:-9000}.
+# Exported, so "make up" and every script below use the same port.
+CONTROLLER_PORT ?= $(shell grep -m1 -oE 'CONTROLLER_PORT:-[0-9]+' docker-compose.yml | cut -d- -f2)
+export CONTROLLER_PORT
+BASE  ?= http://localhost:$(CONTROLLER_PORT)
+# The admin account (sees every object). docker-compose.yml, the scripts and the targets below all
+# use these, so set them here or in the environment to change the admin password everywhere.
+ADMIN_EMAIL    ?= admin@gmail.com
+ADMIN_PASSWORD ?= admin123
+export ADMIN_EMAIL ADMIN_PASSWORD
+ADMIN_CURL := curl -fsS -u "$(ADMIN_EMAIL):$(ADMIN_PASSWORD)"
 
 # Published images: $(REPO)/objectstore-{controller,worker,client}:$(VERSION). The defaults come from
 # docker-compose.yml, so the version lives in one place. Bump it there before every "make publish".
@@ -53,11 +63,11 @@ ps:              ## container status
 logs:            ## follow the logs of all containers
 	docker compose logs -f --tail=100
 
-status:          ## cluster status as JSON
-	@curl -fsS $(BASE)/api/v1/cluster/status | ( jq . 2>/dev/null || cat )
+status:          ## cluster status as JSON (as the admin)
+	@$(ADMIN_CURL) $(BASE)/api/v1/cluster/status | ( jq . 2>/dev/null || cat )
 
 fsck:            ## end-to-end consistency check (disks vs. the controller's block map)
-	@curl -fsS $(BASE)/api/v1/fsck | ( jq . 2>/dev/null || cat )
+	@$(ADMIN_CURL) $(BASE)/api/v1/fsck | ( jq . 2>/dev/null || cat )
 
 app:             ## open the web client in a browser
 	@( open $(BASE)/app || xdg-open $(BASE)/app ) 2>/dev/null || echo "open $(BASE)/app"
@@ -82,9 +92,9 @@ unpause:         ## unfreeze it:                  make unpause W=worker2
 # gone or corrupt, that chunk (and its object) is lost.
 need_wc = @if [ -z "$(W)" ] || [ -z "$(C)" ]; then echo "usage: make $@ W=<worker> C=<chunk_id>   (find them with: make where O=<object_id>)"; exit 2; fi
 
-where:           ## chunks of an object and their holders: make where O=<object_id>
+where:           ## chunks of an object and their holders (as the admin): make where O=<object_id>
 	@if [ -z "$(O)" ]; then echo "usage: make where O=<object_id>   (object ids: ./oscli list)"; exit 2; fi
-	./oscli where $(O)
+	OSCLI_EMAIL="$(ADMIN_EMAIL)" OSCLI_PASSWORD="$(ADMIN_PASSWORD)" ./oscli where $(O)
 
 corrupt:         ## damage a stored chunk:       make corrupt W=worker3 C=<chunk_id>
 	$(need_wc)

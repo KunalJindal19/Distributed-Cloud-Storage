@@ -28,6 +28,16 @@ public final class ErrorCodes {
     /** The same (chunk, version) is being received already. */
     public static final String IN_PROGRESS = "in_progress";
 
+    // Client accounts (the public API only; the worker protocol has no accounts).
+    /** No valid credentials: sign in first. */
+    public static final String UNAUTHORIZED = "unauthorized";
+    /** Signed in, but this request is not allowed for this account. */
+    public static final String FORBIDDEN = "forbidden";
+    /** Wrong email or password at sign-in. */
+    public static final String INVALID_CREDENTIALS = "invalid_credentials";
+    /** Registration with an email that already has an account. */
+    public static final String EMAIL_TAKEN = "email_taken";
+
     // Controller answers to worker messages (see the protocol acceptance rules).
     public static final String STALE_BOOT = "stale_boot";
     public static final String TOO_OLD = "too_old";
@@ -43,6 +53,8 @@ public final class ErrorCodes {
     /** The generic code for a status that was not raised through an {@link ApiException}. */
     public static String forStatus(int status) {
         return switch (status) {
+            case 401 -> UNAUTHORIZED;
+            case 403 -> FORBIDDEN;
             case 404 -> NOT_FOUND;
             case 405 -> METHOD_NOT_ALLOWED;
             case 406 -> NOT_ACCEPTABLE;

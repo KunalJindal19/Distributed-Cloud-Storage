@@ -1,7 +1,7 @@
 # Mini Distributed Cloud Object Store, HDFS-style
 #
-#   1 controller  - the NameNode: namespace on disk, block map in memory; port 8000 is the only
-#                   one published to the host
+#   1 controller  - the NameNode: namespace on disk, block map in memory; its port 8000 is the only
+#                   one published to the host, as localhost:${CONTROLLER_PORT:-9000}
 #   4 workers     - DataNodes: one persistent volume each, reachable only inside the network
 #   1 client      - a ready-to-use CLI container (curl, jq and the oscli command)
 #
@@ -28,7 +28,7 @@ x-common-environment: &common-environment
 
 # All four workers run the same image; they differ only in WORKER_ID, PORT and their volume.
 x-worker: &worker
-  image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-worker:${OBJECTSTORE_VERSION:-5.0.0}
+  image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-worker:${OBJECTSTORE_VERSION:-5.1.0}
   depends_on:
     controller:
       condition: service_healthy
@@ -67,7 +67,7 @@ x-worker-environment: &worker-environment
 
 services:
   controller:
-    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-controller:${OBJECTSTORE_VERSION:-5.0.0}
+    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-controller:${OBJECTSTORE_VERSION:-5.1.0}
     container_name: controller
     hostname: controller
     restart: unless-stopped
@@ -78,6 +78,11 @@ services:
       <<: *common-environment
       PORT: "8000"
       DB_PATH: /data/meta.db
+      # Client accounts: the admin sees every object. Its password is applied at every start-up;
+      # set ADMIN_PASSWORD in the environment (or .env) to choose your own.
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-admin@gmail.com}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin123}"
+      SESSION_HOURS: "168"           # how long a sign-in lasts
       CHUNK_SIZE: "1048576"          # 1 MB chunks
       REPLICATION_FACTOR: "2"        # two copies of every chunk
       STALE_AFTER: "6"               # silence -> STALE (avoided, copies still count)
@@ -173,7 +178,7 @@ services:
   # A client inside the network. It only knows the controller's address.
   # The project directory is mounted at /work so files can be uploaded from / downloaded to it.
   client:
-    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-client:${OBJECTSTORE_VERSION:-5.0.0}
+    image: ${OBJECTSTORE_REPO:-kunaljindal19}/objectstore-client:${OBJECTSTORE_VERSION:-5.1.0}
     container_name: client
     hostname: client
     init: true

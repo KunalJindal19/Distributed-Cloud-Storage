@@ -1,7 +1,10 @@
 package com.objectstore.client;
 
+import java.io.BufferedReader;
+import java.io.Console;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.net.URI;
@@ -16,8 +19,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +38,9 @@ import tools.jackson.databind.node.ObjectNode;
  * Command-line client for the object store's public REST API.
  *
  * <p>It knows exactly one address, the controller's, and never learns where chunks are stored.
+ * Every request is made with an account: {@code login} stores a session token in a file
+ * ({@code $OSCLI_SESSION_FILE}, default {@code ~/.oscli/session}); {@code $OSCLI_TOKEN}, or
+ * {@code $OSCLI_EMAIL} with {@code $OSCLI_PASSWORD}, take precedence (for scripts).
  * Successful commands print JSON to stdout. Exit codes: 0 success, 1 the server answered with an
  * error (its JSON error body goes to stderr), 2 the server could not be reached or the transfer
  * broke, 3 a downloaded file does not match the checksum announced by the server, 64 wrong usage.
@@ -45,9 +53,14 @@ public final class ObjectStoreCli {
     static final int EXIT_INTEGRITY = 3;
     static final int EXIT_USAGE = 64;
 
-    private static final String DEFAULT_BASE_URL = "http://localhost:8000";
+    private static final String DEFAULT_BASE_URL = "http://localhost:9000";
     private static final String USAGE = """
             Usage: oscli [--base URL] <command> [arguments]
+
+              register EMAIL [PASSWORD]  create an account (asks for the password if not given)
+              login EMAIL [PASSWORD]     sign in; the session is kept for the next commands
+              logout                     end the session
+              whoami                     the signed-in account
 
               upload PATH [--name NAME] [--type MIME] [--key KEY] [--meta key=value ...]
                                         store a file; prints the new object's description.
@@ -58,11 +71,16 @@ public final class ObjectStoreCli {
               patch ID [key=value ...] [--remove key ...]
                                         add/update/remove custom metadata
               list [--limit N] [--offset N]
+                                        your objects (the admin: every object)
               delete ID
               where ID                  table: which workers hold each chunk
-              status                    cluster overview (workers, replication health, repairs)
+              health                    can the cluster take writes; is any data unavailable
+              status                    cluster overview (workers, replication health, repairs; the admin only)
 
-            The controller address comes from --base, else $BASE_URL, else http://localhost:8000.
+            The controller address comes from --base, else $BASE_URL, else http://localhost:9000.
+            Credentials: $OSCLI_TOKEN, else $OSCLI_EMAIL + $OSCLI_PASSWORD, else the session saved by
+            'login' in $OSCLI_SESSION_FILE (default ~/.oscli/session). An object is visible only to
+            the account that uploaded it, and to the admin.
             Connection errors and 503 answers (safe mode, too few workers, ...) are retried with
             back-off for up to $OSCLI_RETRY_SECONDS seconds (default 60).
             """;
@@ -70,6 +88,7 @@ public final class ObjectStoreCli {
     private final PrintStream out;
     private final PrintStream err;
     private final String environmentBaseUrl;
+    private final Map<String, String> environment;
     private final JsonMapper json = JsonMapper.builder().build();
     private final HttpClient http = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
@@ -86,16 +105,24 @@ public final class ObjectStoreCli {
     }
 
     ObjectStoreCli(PrintStream out, PrintStream err, String environmentBaseUrl, double retrySeconds) {
+        this(out, err, environmentBaseUrl, retrySeconds, Map.of());
+    }
+
+    /** {@code environment}: where OSCLI_TOKEN, OSCLI_EMAIL, OSCLI_PASSWORD, OSCLI_SESSION_FILE and HOME come from. */
+    ObjectStoreCli(PrintStream out, PrintStream err, String environmentBaseUrl, double retrySeconds,
+                   Map<String, String> environment) {
         this.out = out;
         this.err = err;
         this.environmentBaseUrl = environmentBaseUrl;
         this.retrySeconds = retrySeconds;
+        this.environment = environment;
     }
 
     public static void main(String[] args) {
         String retry = System.getenv("OSCLI_RETRY_SECONDS");
         double retrySeconds = retry == null || retry.isBlank() ? 60 : Double.parseDouble(retry.trim());
-        int exitCode = new ObjectStoreCli(System.out, System.err, System.getenv("BASE_URL"), retrySeconds).run(args);
+        int exitCode = new ObjectStoreCli(System.out, System.err, System.getenv("BASE_URL"), retrySeconds, System.getenv())
+                .run(args);
         System.out.flush();
         System.exit(exitCode);
     }
@@ -110,6 +137,10 @@ public final class ObjectStoreCli {
             }
             String command = remaining.remove(0);
             return switch (command) {
+                case "register" -> register(remaining);
+                case "login" -> login(remaining);
+                case "logout" -> logout(remaining);
+                case "whoami" -> whoami(remaining);
                 case "upload" -> upload(remaining);
                 case "download" -> download(remaining);
                 case "meta" -> meta(remaining);
@@ -118,6 +149,7 @@ public final class ObjectStoreCli {
                 case "delete" -> delete(remaining);
                 case "where" -> where(remaining);
                 case "status" -> status(remaining);
+                case "health" -> health(remaining);
                 case "help", "--help", "-h" -> {
                     out.print(USAGE);
                     yield EXIT_OK;
@@ -135,6 +167,157 @@ public final class ObjectStoreCli {
             err.println(errorJson("interrupted", "the command was interrupted"));
             return EXIT_CONNECTION;
         }
+    }
+
+    // ---- accounts -----------------------------------------------------------------------------
+
+    private int register(List<String> args) throws IOException, InterruptedException {
+        ObjectNode credentials = credentials(args, "register EMAIL [PASSWORD]");
+        HttpResponse<String> response = withRetries("register", () -> http.send(
+                HttpRequest.newBuilder(uri("/api/v1/auth/register"))
+                        .header("Content-Type", "application/json")
+                        .POST(BodyPublishers.ofString(json.writeValueAsString(credentials)))
+                        .build(),
+                BodyHandlers.ofString()));
+        out.println(pretty(expect(response, 201)));
+        err.println("note: account created; sign in with: oscli login " + credentials.get("email").asString());
+        return EXIT_OK;
+    }
+
+    private int login(List<String> args) throws IOException, InterruptedException {
+        ObjectNode credentials = credentials(args, "login EMAIL [PASSWORD]");
+        HttpResponse<String> response = withRetries("login", () -> http.send(
+                HttpRequest.newBuilder(uri("/api/v1/auth/login"))
+                        .header("Content-Type", "application/json")
+                        .POST(BodyPublishers.ofString(json.writeValueAsString(credentials)))
+                        .build(),
+                BodyHandlers.ofString()));
+        JsonNode session = json.readTree(expect(response, 200));
+        Path file = sessionFile();
+        Files.createDirectories(file.toAbsolutePath().getParent());
+        Path temporary = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.writeString(temporary, session.get("token").asString() + "\n", StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(temporary, PosixFilePermissions.fromString("rw-------"));
+        } catch (UnsupportedOperationException notPosix) {
+            // Windows: the file stays readable by its owner's account only by default.
+        }
+        Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        ObjectNode result = json.createObjectNode();
+        result.put("email", session.get("account").get("email").asString());
+        result.put("admin", session.get("account").get("admin").asBoolean());
+        result.put("expires_at", session.get("expires_at").asString());
+        result.put("session_file", file.toString());
+        out.println(pretty(result));
+        if (environment.containsKey("OSCLI_TOKEN") || environment.containsKey("OSCLI_EMAIL")) {
+            err.println("note: OSCLI_TOKEN / OSCLI_EMAIL are set and take precedence over this session");
+        }
+        return EXIT_OK;
+    }
+
+    private int logout(List<String> args) throws IOException, InterruptedException {
+        if (!args.isEmpty()) {
+            throw new CliException(EXIT_USAGE, "usage: logout");
+        }
+        String token = savedToken();
+        if (token != null) {
+            HttpResponse<String> response = withRetries("logout", () -> http.send(
+                    HttpRequest.newBuilder(uri("/api/v1/auth/logout")).header("Authorization", "Bearer " + token)
+                            .POST(BodyPublishers.noBody()).build(),
+                    BodyHandlers.ofString()));
+            if (response.statusCode() != 204 && response.statusCode() != 401) {
+                expect(response, 204);
+            }
+            Files.deleteIfExists(sessionFile());
+        }
+        ObjectNode result = json.createObjectNode();
+        result.put("signed_out", token != null);
+        out.println(pretty(result));
+        return EXIT_OK;
+    }
+
+    private int whoami(List<String> args) throws IOException, InterruptedException {
+        if (!args.isEmpty()) {
+            throw new CliException(EXIT_USAGE, "usage: whoami");
+        }
+        out.println(pretty(expect(get("/api/v1/auth/me"), 200)));
+        return EXIT_OK;
+    }
+
+    /** {"email", "password"} from EMAIL [PASSWORD]; the password may also come from $OSCLI_PASSWORD or a prompt. */
+    private ObjectNode credentials(List<String> args, String usage) throws IOException {
+        if (args.isEmpty() || args.size() > 2) {
+            throw new CliException(EXIT_USAGE, "usage: " + usage);
+        }
+        String password = args.size() == 2 ? args.get(1) : environment.get("OSCLI_PASSWORD");
+        if (password == null || password.isEmpty()) {
+            password = readPassword();
+        }
+        ObjectNode credentials = json.createObjectNode();
+        credentials.put("email", args.get(0));
+        credentials.put("password", password);
+        return credentials;
+    }
+
+    private String readPassword() throws IOException {
+        Console console = System.console();
+        if (console != null) {
+            char[] typed = console.readPassword("password: ");
+            if (typed == null) {
+                throw new CliException(EXIT_USAGE, "no password given");
+            }
+            return new String(typed);
+        }
+        err.print("password: ");
+        err.flush();
+        String line = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)).readLine();
+        if (line == null || line.isEmpty()) {
+            throw new CliException(EXIT_USAGE, "no password given");
+        }
+        return line;
+    }
+
+    /** The Authorization header for API requests, or null if there are no credentials. */
+    private String authorization() throws IOException {
+        String token = environment.get("OSCLI_TOKEN");
+        if (token != null && !token.isBlank()) {
+            return "Bearer " + token.trim();
+        }
+        String email = environment.get("OSCLI_EMAIL");
+        String password = environment.get("OSCLI_PASSWORD");
+        if (email != null && !email.isBlank() && password != null) {
+            return "Basic " + Base64.getEncoder().encodeToString((email.trim() + ":" + password).getBytes(StandardCharsets.UTF_8));
+        }
+        String saved = savedToken();
+        return saved == null ? null : "Bearer " + saved;
+    }
+
+    private String savedToken() throws IOException {
+        Path file = sessionFile();
+        if (!Files.isRegularFile(file)) {
+            return null;
+        }
+        String token = Files.readString(file, StandardCharsets.UTF_8).trim();
+        return token.isEmpty() ? null : token;
+    }
+
+    private Path sessionFile() {
+        String configured = environment.get("OSCLI_SESSION_FILE");
+        if (configured != null && !configured.isBlank()) {
+            return Path.of(configured);
+        }
+        String home = environment.getOrDefault("HOME", System.getProperty("user.home"));
+        return Path.of(home, ".oscli", "session");
+    }
+
+    /** A request to the controller, signed in with the current credentials. */
+    private HttpRequest.Builder request(String path) throws IOException {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(uri(path));
+        String authorization = authorization();
+        if (authorization != null) {
+            builder.header("Authorization", authorization);
+        }
+        return builder;
     }
 
     // ---- commands -----------------------------------------------------------------------------
@@ -170,7 +353,7 @@ public final class ObjectStoreCli {
         // Idempotency-Key is sent on every attempt, so a retry after a lost response returns
         // the object the first attempt created.
         HttpResponse<String> response = withRetries("upload", () -> http.send(
-                HttpRequest.newBuilder(uri("/api/v1/objects"))
+                request("/api/v1/objects")
                         .header("Content-Type", "multipart/form-data; boundary=" + boundary)
                         .header("Idempotency-Key", key)
                         .POST(BodyPublishers.concat(
@@ -204,10 +387,11 @@ public final class ObjectStoreCli {
         long bytes;
         while (true) {
             response = withRetries("download", () -> http.send(
-                    HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).GET().build(), BodyHandlers.ofInputStream()));
+                    request("/api/v1/objects/" + objectId).GET().build(), BodyHandlers.ofInputStream()));
             if (response.statusCode() != 200) {
                 try (InputStream body = response.body()) {
-                    throw new CliException(EXIT_HTTP_ERROR, pretty(new String(body.readAllBytes(), StandardCharsets.UTF_8)));
+                    throw new CliException(EXIT_HTTP_ERROR, pretty(new String(body.readAllBytes(), StandardCharsets.UTF_8))
+                            + signInHint(response.statusCode()));
                 }
             }
             digest = sha256();
@@ -275,7 +459,7 @@ public final class ObjectStoreCli {
         }
         String body = json.writeValueAsString(changes);
         HttpResponse<String> response = withRetries("patch", () -> http.send(
-                HttpRequest.newBuilder(uri("/api/v1/objects/" + positionals.get(0) + "/metadata"))
+                request("/api/v1/objects/" + positionals.get(0) + "/metadata")
                         .header("Content-Type", "application/json")
                         .method("PATCH", BodyPublishers.ofString(body))
                         .build(),
@@ -305,8 +489,7 @@ public final class ObjectStoreCli {
         boolean[] retried = {false};
         HttpResponse<String> response = withRetries("delete", () -> {
             try {
-                return http.send(HttpRequest.newBuilder(uri("/api/v1/objects/" + objectId)).DELETE().build(),
-                        BodyHandlers.ofString());
+                return http.send(request("/api/v1/objects/" + objectId).DELETE().build(), BodyHandlers.ofString());
             } catch (IOException e) {
                 retried[0] = true;
                 throw e;
@@ -331,6 +514,14 @@ public final class ObjectStoreCli {
             throw new CliException(EXIT_USAGE, "usage: status");
         }
         out.println(pretty(expect(get("/api/v1/cluster/status"), 200)));
+        return EXIT_OK;
+    }
+
+    private int health(List<String> args) throws IOException, InterruptedException {
+        if (!args.isEmpty()) {
+            throw new CliException(EXIT_USAGE, "usage: health");
+        }
+        out.println(pretty(expect(get("/api/v1/cluster/health"), 200)));
         return EXIT_OK;
     }
 
@@ -393,7 +584,7 @@ public final class ObjectStoreCli {
     }
 
     private HttpResponse<String> get(String path) throws IOException, InterruptedException {
-        return withRetries("request", () -> http.send(HttpRequest.newBuilder(uri(path)).GET().build(), BodyHandlers.ofString()));
+        return withRetries("request", () -> http.send(request(path).GET().build(), BodyHandlers.ofString()));
     }
 
     @FunctionalInterface
@@ -443,11 +634,15 @@ public final class ObjectStoreCli {
     private String expect(HttpResponse<String> response, int status) {
         if (response.statusCode() != status) {
             String body = response.body();
-            throw new CliException(EXIT_HTTP_ERROR, body == null || body.isBlank()
+            throw new CliException(EXIT_HTTP_ERROR, (body == null || body.isBlank()
                     ? errorJson("http_" + response.statusCode(), "the server answered " + response.statusCode())
-                    : pretty(body));
+                    : pretty(body)) + signInHint(response.statusCode()));
         }
         return response.body();
+    }
+
+    private static String signInHint(int status) {
+        return status == 401 ? "\nhint: sign in with 'oscli login EMAIL' (or set OSCLI_EMAIL and OSCLI_PASSWORD)" : "";
     }
 
     private static String onlyPositional(Arguments arguments, String usage) {
