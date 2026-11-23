@@ -4,6 +4,7 @@ import com.objectstore.common.web.ApiException;
 import com.objectstore.common.web.ErrorCodes;
 import com.objectstore.controller.api.dto.ObjectListResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.controller.auth.AuthUser;
 import com.objectstore.controller.cluster.ApplyQueue;
 import com.objectstore.controller.cluster.ClusterState;
 import com.objectstore.controller.cluster.NamespaceLock;
@@ -87,7 +88,19 @@ public class ObjectService {
         return views.describe(find(objectId));
     }
 
-    public ObjectListResponse list(int limit, long offset) {
+    /**
+     * 404 unless {@code user} may see the object: its owner, or the admin. Another account's object
+     * is answered exactly like one that does not exist, so object ids reveal nothing.
+     */
+    public void checkAccess(AuthUser user, String objectId) {
+        List<String> owner = objects.ownerOf(objectId);
+        if (owner.isEmpty() || !user.mayAccess(owner.get(0))) {
+            throw notFound(objectId);
+        }
+    }
+
+    /** The objects {@code user} may see (the admin: all of them), newest first. */
+    public ObjectListResponse list(int limit, long offset, AuthUser user) {
         if (limit < 1 || limit > MAX_PAGE_SIZE) {
             throw ApiException.badRequest("limit must be between 1 and " + MAX_PAGE_SIZE);
         }
@@ -95,8 +108,8 @@ public class ObjectService {
             throw ApiException.badRequest("offset must be 0 or greater");
         }
         return new ObjectListResponse(
-                objects.list(limit, offset).stream().map(views::summarise).toList(),
-                objects.count(),
+                objects.list(limit, offset, user.listingOwner()).stream().map(views::summarise).toList(),
+                objects.count(user.listingOwner()),
                 limit,
                 offset);
     }

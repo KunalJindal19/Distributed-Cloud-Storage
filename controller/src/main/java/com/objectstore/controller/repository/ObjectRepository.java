@@ -15,7 +15,10 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionOperations;
 
-/** The namespace: {@code objects}, {@code object_metadata} and {@code idempotency_keys}. */
+/**
+ * The namespace: {@code objects}, {@code object_metadata} and {@code idempotency_keys}. Every object
+ * has an owner ({@code owner_id}); listing can be limited to one owner's objects.
+ */
 @Repository
 public class ObjectRepository {
 
@@ -27,7 +30,8 @@ public class ObjectRepository {
             rs.getString("checksum"),
             rs.getInt("chunk_count"),
             Instant.ofEpochMilli(rs.getLong("created_at")),
-            Instant.ofEpochMilli(rs.getLong("updated_at")));
+            Instant.ofEpochMilli(rs.getLong("updated_at")),
+            rs.getString("owner_id"));
 
     public enum PatchOutcome { UPDATED, NOT_FOUND, TOO_MANY_KEYS }
 
@@ -63,11 +67,13 @@ public class ObjectRepository {
             tx.executeWithoutResult(status -> {
                 long createdAt = object.createdAt().toEpochMilli();
                 jdbc.sql("""
-                        INSERT INTO objects (object_id, name, size, content_type, checksum, chunk_count, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO objects (object_id, name, size, content_type, checksum, chunk_count, created_at,
+                                             updated_at, owner_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """)
                         .params(object.objectId(), object.name(), object.size(), object.contentType(),
-                                object.checksum(), object.chunkCount(), createdAt, object.updatedAt().toEpochMilli())
+                                object.checksum(), object.chunkCount(), createdAt, object.updatedAt().toEpochMilli(),
+                                object.ownerId())
                         .update();
                 batch.batchUpdate(
                         "INSERT INTO object_metadata (object_id, meta_key, meta_value) VALUES (?, ?, ?)",
@@ -111,10 +117,42 @@ public class ObjectRepository {
         return jdbc.sql("SELECT COUNT(*) FROM objects").query(Long.class).single();
     }
 
+    /** Objects owned by {@code ownerId}; every object if it is null. */
+    public long count(String ownerId) {
+        if (ownerId == null) {
+            return count();
+        }
+        return jdbc.sql("SELECT COUNT(*) FROM objects WHERE owner_id = ?").param(ownerId).query(Long.class).single();
+    }
+
+    /**
+     * The owner of an object: empty if the object does not exist, otherwise a one-element list
+     * holding its owner id (null for an object no account owns).
+     */
+    public List<String> ownerOf(String objectId) {
+        return jdbc.sql("SELECT owner_id FROM objects WHERE object_id = ?").param(objectId)
+                .query((rs, rowNum) -> rs.getString("owner_id"))
+                .list();
+    }
+
     /** Newest first; the object id breaks ties so paging is stable. */
     public List<StoredObject> list(int limit, long offset) {
         return jdbc.sql("SELECT * FROM objects ORDER BY created_at DESC, object_id ASC LIMIT ? OFFSET ?")
                 .params(limit, offset)
+                .query(OBJECT)
+                .list();
+    }
+
+    /** Like {@link #list(int, long)}, limited to the objects of {@code ownerId}; every object if it is null. */
+    public List<StoredObject> list(int limit, long offset, String ownerId) {
+        if (ownerId == null) {
+            return list(limit, offset);
+        }
+        return jdbc.sql("""
+                        SELECT * FROM objects WHERE owner_id = ?
+                        ORDER BY created_at DESC, object_id ASC LIMIT ? OFFSET ?
+                        """)
+                .params(ownerId, limit, offset)
                 .query(OBJECT)
                 .list();
     }

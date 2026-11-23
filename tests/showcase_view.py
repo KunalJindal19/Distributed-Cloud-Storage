@@ -18,16 +18,19 @@ Views of the object store's inner state for showcase.sh, read from the REST API 
     showcase_view.py copies WORKER            the number of chunk copies the controller records on WORKER
     showcase_view.py objects                  the number of objects stored
 
-Environment: BASE_URL (default http://localhost:8000).
+Environment: BASE_URL (default http://localhost:$CONTROLLER_PORT, i.e. 9000).
 """
 
 import json
+import base64
 import os
 import sys
 import time
 import urllib.request
 
-API = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/") + "/api/v1"
+API = os.environ.get("BASE_URL", "http://localhost:" + os.environ.get("CONTROLLER_PORT", "9000")).rstrip("/") + "/api/v1"
+AUTH = "Basic " + base64.b64encode("{}:{}".format(
+    os.environ.get("ADMIN_EMAIL", "admin@gmail.com"), os.environ.get("ADMIN_PASSWORD", "admin123")).encode()).decode()
 TTY = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 WIDTH = 9
 STATE_COLOR = {"ALIVE": "32", "STALE": "33", "DEAD": "31"}
@@ -44,7 +47,8 @@ def cell(mark, code, width=WIDTH):
 
 
 def get(path, timeout=10):
-    with urllib.request.urlopen(API + path, timeout=timeout) as response:
+    request = urllib.request.Request(API + path, headers={"Authorization": AUTH})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read())
 
 

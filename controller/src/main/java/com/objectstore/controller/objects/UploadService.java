@@ -185,16 +185,25 @@ public class UploadService {
     }
 
     /**
+     * Idempotency-Keys belong to the account that sends them: two clients choosing the same key
+     * never see each other's objects. Stored as {@code <owner id>:<key>}.
+     */
+    static String scopedKey(String ownerId, String idempotencyKey) {
+        return idempotencyKey == null || ownerId == null ? idempotencyKey : ownerId + ":" + idempotencyKey;
+    }
+
+    /**
      * If an earlier upload already used this key, the object it created, provided the new
      * request is for a file of the same size. A different size under the same key is a client
      * error: 409 {@code conflict}. Only the multipart part's size is consulted: nothing is sent
      * to any worker.
      */
-    public java.util.Optional<UploadResult> replay(String idempotencyKey, java.util.function.LongSupplier newSize) {
+    public java.util.Optional<UploadResult> replay(String idempotencyKey, String ownerId,
+                                                   java.util.function.LongSupplier newSize) {
         if (idempotencyKey == null) {
             return java.util.Optional.empty();
         }
-        return objects.findIdempotent(idempotencyKey).map(previous -> {
+        return objects.findIdempotent(scopedKey(ownerId, idempotencyKey)).map(previous -> {
             long size = newSize.getAsLong();
             if (size != previous.size()) {
                 throw ApiException.conflict("Idempotency-Key " + idempotencyKey + " was used for a "
@@ -206,7 +215,8 @@ public class UploadService {
         });
     }
 
-    public UploadResult upload(MultipartFile file, String rawMetadata, String idempotencyKey) {
+    /** Stores an object owned by {@code ownerId} (the uploading account). */
+    public UploadResult upload(MultipartFile file, String rawMetadata, String idempotencyKey, String ownerId) {
         Map<String, String> metadata = metadataValidator.parseForUpload(rawMetadata);
         String name = objectName(file.getOriginalFilename());
         String contentType = contentType(file.getContentType(), name);
@@ -243,14 +253,14 @@ public class UploadService {
 
             Instant now = clock.instant();
             StoredObject object = new StoredObject(objectId, name, size, contentType, Checksums.hex(objectDigest),
-                    stored.size(), now, now);
+                    stored.size(), now, now, ownerId);
             var beforeCommit = beforeCommitForTests;
             if (beforeCommit != null) {
                 beforeCommit.accept(objectId, stored.stream().flatMap(c -> c.holders().stream())
                         .map(h -> h.target().workerId()).distinct().toList());
             }
             try {
-                commit(object, metadata, stored, idempotencyKey);
+                commit(object, metadata, stored, scopedKey(ownerId, idempotencyKey));
             } catch (LostIdempotencyRace race) {
                 // A concurrent request with the same key won. Ours is cleaned up below.
                 if (race.winner.size() != size) {

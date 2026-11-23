@@ -3,6 +3,8 @@ package com.objectstore.controller.api;
 import com.objectstore.common.web.ApiException;
 import com.objectstore.controller.api.dto.ObjectListResponse;
 import com.objectstore.controller.api.dto.ObjectResponse;
+import com.objectstore.controller.auth.AuthInterceptor;
+import com.objectstore.controller.auth.AuthUser;
 import com.objectstore.controller.domain.Chunk;
 import com.objectstore.controller.domain.StoredObject;
 import com.objectstore.controller.objects.DownloadService;
@@ -25,6 +27,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -37,6 +40,10 @@ import org.springframework.web.multipart.MultipartHttpServletRequest;
  *
  * <p>Structured data is JSON. Object data travels as binary: multipart/form-data on the way in,
  * the object's own content type on the way out. Clients never learn or need worker addresses.
+ *
+ * <p>Every request is made with an account ({@link AuthInterceptor}). An object belongs to the
+ * account that uploaded it: other accounts get 404 for it and do not see it in the listing; the
+ * admin sees and may change every object.
  */
 @RestController
 @RequestMapping("/api/v1/objects")
@@ -67,17 +74,18 @@ public class ObjectsController {
      * writable workers are checked before the request body is read.
      */
     @PostMapping
-    public ResponseEntity<ObjectResponse> upload(HttpServletRequest request) {
+    public ResponseEntity<ObjectResponse> upload(HttpServletRequest request,
+                                                 @RequestAttribute(AuthInterceptor.USER) AuthUser user) {
         String key = UploadService.validateIdempotencyKey(request.getHeader(IDEMPOTENCY_KEY_HEADER));
         // A retry of an upload that already succeeded is answered from the namespace, even in safe mode.
-        Optional<UploadService.UploadResult> replay = uploads.replay(key, () -> filePart(request).getSize());
+        Optional<UploadService.UploadResult> replay = uploads.replay(key, user.userId(), () -> filePart(request).getSize());
         if (replay.isPresent()) {
             return respond(replay.get());
         }
         uploads.checkWritable();
         MultipartFile file = filePart(request);
         String metadata = ((MultipartHttpServletRequest) request).getParameter("metadata");
-        return respond(uploads.upload(file, metadata, key));
+        return respond(uploads.upload(file, metadata, key, user.userId()));
     }
 
     private static MultipartFile filePart(HttpServletRequest request) {
@@ -99,12 +107,16 @@ public class ObjectsController {
         return ResponseEntity.created(URI.create("/api/v1/objects/" + object.objectId())).body(object);
     }
 
-    /** List stored objects, newest first. {@code limit} 1-500 (default 50), {@code offset} &ge; 0. */
+    /**
+     * List the caller's objects (the admin: every object), newest first. {@code limit} 1-500
+     * (default 50), {@code offset} &ge; 0.
+     */
     @GetMapping
     public ObjectListResponse list(
             @RequestParam(defaultValue = "" + ObjectService.DEFAULT_PAGE_SIZE) int limit,
-            @RequestParam(defaultValue = "0") long offset) {
-        return objects.list(limit, offset);
+            @RequestParam(defaultValue = "0") long offset,
+            @RequestAttribute(AuthInterceptor.USER) AuthUser user) {
+        return objects.list(limit, offset, user);
     }
 
     /**
@@ -113,8 +125,10 @@ public class ObjectsController {
      * is checked before the response is committed, so those cases are proper JSON errors.
      */
     @GetMapping("/{objectId}")
-    public void download(@PathVariable String objectId, HttpServletResponse response) throws IOException {
+    public void download(@PathVariable String objectId, HttpServletResponse response,
+                         @RequestAttribute(AuthInterceptor.USER) AuthUser user) throws IOException {
         long startedNanos = System.nanoTime();
+        objects.checkAccess(user, objectId);
         DownloadPlan plan = downloads.plan(objectId);
         StoredObject object = plan.object();
         List<Chunk> chunks = plan.chunks();
@@ -153,19 +167,23 @@ public class ObjectsController {
 
     /** System-maintained and custom metadata, without downloading the object's data. */
     @GetMapping("/{objectId}/metadata")
-    public ObjectResponse getMetadata(@PathVariable String objectId) {
+    public ObjectResponse getMetadata(@PathVariable String objectId, @RequestAttribute(AuthInterceptor.USER) AuthUser user) {
+        objects.checkAccess(user, objectId);
         return objects.getMetadata(objectId);
     }
 
     /** Add or update custom metadata; a {@code null} value removes a key. The data is not touched. */
     @PatchMapping("/{objectId}/metadata")
-    public ObjectResponse patchMetadata(@PathVariable String objectId, @RequestBody(required = false) byte[] body) {
+    public ObjectResponse patchMetadata(@PathVariable String objectId, @RequestBody(required = false) byte[] body,
+                                        @RequestAttribute(AuthInterceptor.USER) AuthUser user) {
+        objects.checkAccess(user, objectId);
         return objects.patchMetadata(objectId, body);
     }
 
     /** Delete an object and its stored data. 204 on success. */
     @DeleteMapping("/{objectId}")
-    public ResponseEntity<Void> delete(@PathVariable String objectId) {
+    public ResponseEntity<Void> delete(@PathVariable String objectId, @RequestAttribute(AuthInterceptor.USER) AuthUser user) {
+        objects.checkAccess(user, objectId);
         objects.delete(objectId);
         return ResponseEntity.noContent().build();
     }
